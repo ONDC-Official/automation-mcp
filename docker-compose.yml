@@ -1,0 +1,23 @@
+services:
+  ondc-mcp:
+    build: .
+    # Nothing is shared between replicas — no session store, no sticky routing.
+    # Scale with `docker compose up --scale ondc-mcp=3`.
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      HOST: 0.0.0.0
+      PORT: 3000
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://127.0.0.1:3000/mcp}
+      # Container hostnames differ from the public one; list what clients dial.
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1,localhost}
+      # env.ts refuses to boot with AUTH_MODE=none when NODE_ENV=production.
+      AUTH_MODE: ${AUTH_MODE:-jwt}
+      AUTH_ISSUER: ${AUTH_ISSUER:?set AUTH_ISSUER}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:?set AUTH_AUDIENCE}
+      AUTH_JWKS_URL: ${AUTH_JWKS_URL:?set AUTH_JWKS_URL}
+      AUTH_REQUIRED_SCOPES: ${AUTH_REQUIRED_SCOPES:-mcp}
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    stop_grace_period: 40s

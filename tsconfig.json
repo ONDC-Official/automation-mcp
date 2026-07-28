@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // TypeScript >=6 no longer auto-includes @types/*, and the MCP v2 .d.mts
+    // files reference Buffer. Without this the SDK types fail to resolve.
+    "types": ["node"],
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    // `exactOptionalPropertyTypes` is deliberately off: Node's own
+    // `IncomingMessage.method` is `string | undefined` while the SDK adapter
+    // wants `string`, so enabling it buys casts against library types rather
+    // than catching bugs in ours.
+    "verbatimModuleSyntax": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "sourceMap": true,
+    "declaration": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    // No `baseUrl`: deprecated in TS 6, removed in TS 7. `paths` resolves
+    // relative to this file's directory on its own.
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src"]
+}
