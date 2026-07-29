@@ -34,7 +34,9 @@ const SERVICE = "config-service";
 
 export interface ConfigServiceGateway {
   /** The full domain/version/usecase catalog. */
-  fetchBuilds(): Promise<{ domain: string; versions: { version: string; usecases: string[] }[] }[]>;
+  fetchBuilds(): Promise<
+    { domain: string; versions: { version: string; usecases: string[] }[] }[]
+  >;
   /** Flow definitions for a build. Empty array is a valid answer. */
   fetchFlows(build: BuildRef): Promise<UpstreamFlow[]>;
   /** The mock-runner config, or `undefined` when the flow does not exist. */
@@ -193,7 +195,13 @@ export class HttpConfigServiceGateway implements ConfigServiceGateway {
   }
 
   #parse<T>(
-    schema: { safeParse: (value: unknown) => { success: boolean; data?: T; error?: unknown } },
+    schema: {
+      safeParse: (value: unknown) => {
+        success: boolean;
+        data?: T;
+        error?: unknown;
+      };
+    },
     body: unknown,
     label: string,
   ): T {

@@ -47,7 +47,7 @@ describe("MockEngine", () => {
     const outcome = await engine.runGenerate(runner, "search_1", {
       transaction_id: "txn-42",
       bapId: "mock.local",
-      bapUri: "http://127.0.0.1:3001/rx/s1",
+      bapUri: "http://127.0.0.1:3001/ONDC:RET10/2.0.2/buyer",
       user_inputs: { query: "personal loan" },
     });
 
@@ -61,7 +61,9 @@ describe("MockEngine", () => {
     // Identity must come from the session, not the config's canned fixture —
     // otherwise every generated payload claims to be bap.example.com.
     expect(payload.context.transaction_id).toBe("txn-42");
-    expect(payload.context.bap_uri).toBe("http://127.0.0.1:3001/rx/s1");
+    expect(payload.context.bap_uri).toBe(
+      "http://127.0.0.1:3001/ONDC:RET10/2.0.2/buyer",
+    );
     expect(payload.context.action).toBe("search");
   });
 
@@ -125,7 +127,9 @@ describe("MockEngine", () => {
     const outcome = await engine.runGenerate(runner, "search_1", {});
 
     expect(outcome.ok).toBe(false);
-    expect(outcome.error?.message).toContain("the config author made a mistake");
+    expect(outcome.error?.message).toContain(
+      "the config author made a mistake",
+    );
   });
 
   it("treats a contract-violating return as a failure too", async () => {

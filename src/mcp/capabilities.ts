@@ -3,8 +3,14 @@ import type { Container } from "@/container.js";
 import type { Registerable } from "@/lib/define-tool.js";
 import { createCatalogResources } from "@/modules/catalog/catalog.resource.js";
 import { createCatalogTools } from "@/modules/catalog/catalog.tool.js";
+import { createFlowPrompts } from "@/modules/flow/flow.prompt.js";
+import { createFlowTools } from "@/modules/flow/flow.tool.js";
+import { createFormsTools } from "@/modules/forms/forms.tool.js";
+import { createRecordResources } from "@/modules/record/record.resource.js";
+import { createRecordTools } from "@/modules/record/record.tool.js";
 import { createSessionResources } from "@/modules/session/session.resource.js";
 import { createSessionTools } from "@/modules/session/session.tool.js";
+import { createTransportTools } from "@/modules/transport/transport.tool.js";
 
 /**
  * The one place that knows which capabilities exist.
@@ -14,11 +20,21 @@ import { createSessionTools } from "@/modules/session/session.tool.js";
  * are built from the same factory.
  */
 export function collectCapabilities(container: Container): Registerable[] {
+  const { catalog, session, record, flow, forms } = container.services;
+
   return [
-    ...createSessionTools(container.services.session),
-    ...createCatalogTools(container.services.catalog, container.services.session),
-    ...createSessionResources(container.services.session),
-    ...createCatalogResources(container.services.catalog),
+    ...createTransportTools(container),
+    ...createSessionTools(session),
+    ...createCatalogTools(catalog, session),
+    ...createFlowTools(flow, {
+      maxAwaitMs: container.config.AWAIT_MAX_WAIT_MS,
+    }),
+    ...createFormsTools(forms),
+    ...createRecordTools(record, session),
+    ...createSessionResources(session),
+    ...createCatalogResources(catalog),
+    ...createRecordResources(record, session),
+    ...createFlowPrompts(),
   ];
 }
 

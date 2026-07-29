@@ -131,9 +131,7 @@ describe("health endpoints", () => {
       checks: { name: string; status: string }[];
     }>();
     expect(body.status).toBe("ready");
-    expect(body.checks.map((check) => check.name)).toContain(
-      "config-service",
-    );
+    expect(body.checks.map((check) => check.name)).toContain("config-service");
   });
 });
 

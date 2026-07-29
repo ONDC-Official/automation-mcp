@@ -4,6 +4,7 @@ import type { FastifyInstance } from "fastify";
 import fp from "fastify-plugin";
 import type { Container } from "@/container.js";
 import { createServerFactory } from "@/mcp/server.js";
+import { hostValidation, originValidation } from "@/plugins/security.js";
 
 /**
  * Mounts the MCP Streamable HTTP endpoint.
@@ -47,6 +48,15 @@ async function plugin(
   app.route({
     method: ["GET", "POST", "DELETE"],
     url: MCP_ROUTE,
+    // DNS-rebinding protection, scoped to this route rather than the app.
+    //
+    // It exists because a local MCP server is a fully-privileged tool surface
+    // on loopback with no browser origin policy in front of it. That threat is
+    // specific to *this* endpoint: the receiver is a public protocol endpoint
+    // that a third-party participant must be able to reach from anywhere, and
+    // applying a localhost Host check to it would reject the only traffic it
+    // is for.
+    onRequest: [hostValidation(container.config), originValidation(container.config)],
     preHandler: app.authenticate,
     // Fastify parses the JSON body; hand it over so the handler doesn't try to
     // re-read an already-consumed stream.

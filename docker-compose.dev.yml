@@ -1,0 +1,43 @@
+# Local development infrastructure only. The server itself runs on the host
+# (`npm run dev`); this file exists so REDIS_URL has something to talk to.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml down      # data survives
+#   docker compose -f docker-compose.dev.yml down -v   # data does not
+#
+# Then set REDIS_URL=redis://127.0.0.1:6379 in .env (see .env.example) and
+# sessions outlive both a `tsx watch` reload and a full restart.
+#
+# Why this is not in `docker-compose.yml`: that file describes a deployment and
+# demands AUTH_ISSUER and friends via `${VAR:?}`, so Compose fails to interpolate
+# it — and therefore refuses to start *any* service in it — until those are set.
+# It cannot be used to bring up one local dependency.
+
+# Its own project name, so the named volume cannot collide with another repo's.
+name: ondc-mcp-dev
+
+services:
+  redis:
+    image: redis:8-alpine
+    # appendonly is the whole point. Sessions have a 48h TTL, and RDB snapshots
+    # alone would drop the last few minutes on every restart — precisely the
+    # window you were mid-flow in. `everysec` can still lose up to one second of
+    # writes on a hard kill; that is the right trade here, and it is written
+    # down so nobody debugs it later as a bug.
+    command:
+      ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      # Loopback only. This Redis has no password; it must never bind 0.0.0.0.
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  redis-data:

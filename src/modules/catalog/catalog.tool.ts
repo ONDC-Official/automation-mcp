@@ -95,10 +95,7 @@ export function createCatalogTools(
       },
       handler: async ({ session_id }) => {
         const session = await sessions.requireSession(session_id);
-        const flows = await catalog.listFlows(
-          session.build,
-          session.mock_role,
-        );
+        const flows = await catalog.listFlows(session.build, session.mock_role);
         return {
           session_id: session.session_id,
           build: session.build,
@@ -143,11 +140,7 @@ export function createCatalogTools(
       },
       handler: async ({ session_id, flow_id }) => {
         const session = await sessions.requireSession(session_id);
-        return catalog.describeFlow(
-          session.build,
-          flow_id,
-          session.mock_role,
-        );
+        return catalog.describeFlow(session.build, flow_id, session.mock_role);
       },
     }),
 

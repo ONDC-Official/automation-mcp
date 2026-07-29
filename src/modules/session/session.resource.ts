@@ -1,7 +1,4 @@
-import {
-  ResourceTemplate,
-  type McpServer,
-} from "@modelcontextprotocol/server";
+import { ResourceTemplate, type McpServer } from "@modelcontextprotocol/server";
 import type { Registerable } from "@/lib/define-tool.js";
 import { toAppError } from "@/lib/errors.js";
 import { jsonContents, MIME_JSON } from "@/lib/resource-contents.js";

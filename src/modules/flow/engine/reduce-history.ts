@@ -30,6 +30,7 @@ export function reduceApiDataList(data: EngineHistoryEntry[]): ApiHistory[] {
           timestamp: item.timestamp,
           subStatus: item.error ? "ERROR" : "SUCCESS",
           error: item.error,
+          seq: item.seq,
         });
       }
       continue;
@@ -45,6 +46,7 @@ export function reduceApiDataList(data: EngineHistoryEntry[]): ApiHistory[] {
         timestamp: item.timestamp,
         subStatus: checkPerfectAck(item.response),
         payloads: [{ payloadId: item.payloadId, response: item.response }],
+        seq: item.seq,
       });
     } else if (existing.entryType === "API") {
       existing.payloads.push({
@@ -55,6 +57,32 @@ export function reduceApiDataList(data: EngineHistoryEntry[]): ApiHistory[] {
   }
 
   return Array.from(map.values());
+}
+
+/**
+ * Order the exchanges for replay.
+ *
+ * **`seq` wins whenever both entries have one**, and this is a deliberate
+ * divergence from the workbench, which sorts on `context.timestamp` alone.
+ *
+ * That timestamp is written by whoever produced the payload — for half the
+ * exchanges, the participant under test. A participant whose clock runs a
+ * second fast stamps its `on_search` *later* than the `select` we send in
+ * response to it, and a timestamp sort then replays them backwards: `select`
+ * matches no pending step, gets filed as out-of-order, and the flow never
+ * completes. The symptom is a correct implementation looking non-compliant, for
+ * a reason nothing in the trace points at.
+ *
+ * `seq` is our own append counter. It records the order we genuinely observed
+ * and no counterparty can influence it, so it is strictly the better answer
+ * where it exists. Timestamp remains the fallback for entries built without one
+ * — which is what the ported upstream fixtures are.
+ */
+export function sortForReplay(entries: ApiHistory[]): ApiHistory[] {
+  return [...entries].sort((a, b) => {
+    if (a.seq !== undefined && b.seq !== undefined) return a.seq - b.seq;
+    return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+  });
 }
 
 /**

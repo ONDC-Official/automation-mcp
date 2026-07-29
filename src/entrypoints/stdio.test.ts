@@ -26,7 +26,17 @@ async function exchange(
 ): Promise<Exchange> {
   const child = spawn(process.execPath, ["--import", "tsx", ENTRYPOINT], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, NODE_ENV: "test", LOG_LEVEL: "info", ...env },
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      LOG_LEVEL: "info",
+      // This test inherits the developer's environment, and a REDIS_URL
+      // exported in their shell would have the child dial Redis and hold a
+      // reconnect timer open — turning a stdout assertion into a hang. Empty
+      // reads as unset (see `optionalUrl` in config/env.ts).
+      REDIS_URL: "",
+      ...env,
+    },
   });
 
   let stdout = "";

@@ -1,6 +1,20 @@
 # Flow Loop: make automation-mcp a full mock BAP/BPP that completes transactions
 
-> Status: planned, not yet implemented. Written 2026-07-28. Pick up at Milestone M0.
+> Status: **implemented**. Written 2026-07-28, delivered 2026-07-28.
+> All eight milestones (M0–M7) landed; `npm run typecheck && npm run lint && npm test`
+> is green with 337 tests and coverage above the thresholds.
+> Kept as the design record — `CLAUDE.md` is the current description of the code.
+>
+> Two things ended up different from the plan below, both deliberate and both
+> documented in place:
+>
+> 1. **Replay orders on `seq`, not `context.timestamp`** (`engine/reduce-history.ts`).
+>    The timestamp is written by the counterparty; a participant whose clock runs
+>    fast makes the mapper replay its callback _after_ our reply to it, and the
+>    flow never completes. Caught by the end-to-end loop test.
+> 2. **`StepOutcome` gained a `READY` tag.** The describing calls
+>    (`flow_get_status`, `flow_await`) need a way to say "it is your move" that
+>    the seven planned tags could not express without overloading one of them.
 
 ## Context
 
@@ -133,6 +147,13 @@ apiList entries stay **slim** (`{entryType, action, payloadId, messageId, respon
 4. `chainNext` (auto_advance): loop `proceed` while `SENT`; on anything else persist `attention` on txn record + emit `CHAIN_PAUSED`/`CHAIN_SENT`.
 
 ### ReceiverService + routes
+
+> **Superseded.** The per-session URL below shipped and was then replaced by the
+> network's real shape, `POST /{domain}/{version}/{buyer|seller}/{action}`, with
+> the session recovered from `transaction_id` or an armed expectation. A URL no
+> real participant would ever be handed is not a mock of one. See CLAUDE.md
+> §"The endpoint, and how a call is matched to a session"; the rest of this
+> section's pipeline (steps 1–8) still holds.
 
 **`POST /rx/:sessionId/:action`** — beckn callbacks are `{callback_uri}/{action}`, so advertising `{RECEIVER_PUBLIC_URL}/rx/{sessionId}` as our bap/bpp_uri gets the action as a path param free; sessionId in path resolves config without txn lookup and covers unsolicited-first-inbound (mock-BPP receiving `search`). Form routes match the config-baked shape: `GET /forms/:domain/:formId` + `POST /forms/:domain/:formId/submit` (+`transaction_id`/`session_id` query).
 

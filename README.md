@@ -34,9 +34,14 @@ src/
   container.ts           boot-once singletons + dependency health checks
   config/env.ts          zod env, parsed once, exits non-zero when invalid
   plugins/               security · error-handler · auth · mcp
-  modules/example/       the reference pattern — copy this for new modules
+  modules/catalog/       config-service client: builds, flows, mock configs
+  modules/session/       sessions, NP identity, role inversion
+  modules/flow/          the loop — derived state machine, start/proceed/await
+  modules/record/        exchanges, payloads and business data
+  modules/transport/     inbound receiver routes + outbound signed sender
+  modules/forms/         forms this mock hosts, and forms it has to fill
   modules/health/        /health and /ready
-  lib/                   errors · define-tool · logger · token-verifier
+  lib/                   errors · define-tool · logger · cache · mock-engine · events
   test/harness.ts        in-process client ↔ server (the app.inject() analogue)
 ```
 
@@ -88,14 +93,16 @@ can return half of it.
 
 ```ts
 defineTool({
-  name: "example_get_item",
-  title: "Get item",
-  description: "Fetch a single item by its exact identifier.",
-  inputSchema: GetItemInput,
-  outputSchema: GetItemOutput,
+  name: "session_get",
+  title: "Get session",
+  description: "Fetch a session by id: the participant under test, the role …",
+  inputSchema: GetSessionInput,
+  outputSchema: GetSessionOutput,
   annotations: { readOnlyHint: true, idempotentHint: true },
-  render: ({ item }) => `${item.name} (${item.id})`,
-  handler: async ({ id }) => ({ item: await service.getItem(id) }),
+  render: ({ session }) => renderSession(session),
+  handler: async ({ session_id }) => ({
+    session: await service.requireSession(session_id),
+  }),
 });
 ```
 
@@ -110,8 +117,12 @@ Report a model-fixable failure as a protocol error and the model never learns
 the call failed; it sees a transport fault and retries the identical call.
 
 Argument validation sits on the **tool** channel — which is also what the SDK
-does for `inputSchema` violations it catches itself. `example.tool.test.ts`
+does for `inputSchema` violations it catches itself. `session.tool.test.ts`
 pins that behaviour so the two layers stay consistent.
+
+A protocol NACK is emphatically on the tool channel too: the participant
+rejecting a payload is the most informative result a compliance run produces,
+and the model has to read it.
 
 Each `AppError` subclass declares its own channel; `handleToolError` routes it.
 
@@ -133,6 +144,10 @@ favour of stderr (stdio) and OpenTelemetry (HTTP).
 The point of the stateless revision. Cross-request state goes to the injected
 `ServerEventBus` — in-process by default; pass a Redis-backed implementation to
 `createMcpHandler({ bus })` when running more than one replica.
+
+This server's own domain state (sessions, transactions, payloads) goes through
+the `CacheStore` port in `src/lib/cache/` instead. See
+[State persistence](#state-persistence).
 
 ### 5. Cache hints are free throughput
 
@@ -208,14 +223,58 @@ one-method interface.
 `env.ts` refuses to boot with `AUTH_MODE=none` when `NODE_ENV=production`, so
 an unauthenticated production deploy cannot happen by configuration alone.
 
+## State persistence
+
+Sessions, transactions, stored payloads and business data live behind the
+`CacheStore` port (`src/lib/cache/`). Two implementations ship:
+
+| `REDIS_URL`   | Store                | Behaviour                                          |
+| ------------- | -------------------- | -------------------------------------------------- |
+| unset         | `InMemoryCacheStore` | Zero infrastructure. A restart wipes everything.   |
+| `redis://...` | `RedisCacheStore`    | State survives restarts and is shared by replicas. |
+
+Unset is the default so the server runs with nothing installed. In development
+that has a sharp edge: `npm run dev` is `tsx watch`, so **every file save
+restarts the process and drops the session you were mid-flow in**. Pointing at a
+local Redis fixes that:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d   # redis:8-alpine, loopback only, appendonly
+echo 'REDIS_URL=redis://127.0.0.1:6379' >> .env  # .env is read by npm run dev
+npm run dev
+```
+
+Keys are the workbench's own layout (`session::{id}`, `{txn}::{sub}`) under a
+`REDIS_KEY_PREFIX` namespace, so one local Redis can serve several projects —
+and setting the prefix empty writes the workbench's literal keys, should you
+ever want to share a Redis with it.
+
+Two deliberate choices worth knowing:
+
+- **The flow catalog never goes to Redis.** `FlowService.load()` reads a
+  ~330KB mock-runner config on every `flow_proceed` and every inbound callback.
+  It is derived data, TTL'd at 15 minutes and re-fetched transparently on a
+  miss, so it stays in-process — one 330KB transfer per loop iteration, half of
+  them inside the ACK window, would buy nothing. `createContainer` says so in
+  place.
+- **A failed read throws, it does not return `undefined`.** `undefined` means
+  "no such session", and the model answers that by starting a _new_ transaction
+  against a real participant. An outage has to look like an outage.
+
 ## Testing
 
-| Layer                    | Mechanism                                                                      |
-| ------------------------ | ------------------------------------------------------------------------------ |
-| Service                  | Plain unit test — no MCP involved                                              |
-| Tool / resource / prompt | `test/harness.ts`: a real `Client` ↔ real `McpServer` over `InMemoryTransport` |
-| HTTP                     | `app.inject()` — full stack, no socket                                         |
-| stdio                    | Real subprocess, asserting stdout purity                                       |
+| Layer                    | Mechanism                                                                                   |
+| ------------------------ | ------------------------------------------------------------------------------------------- |
+| Service                  | Plain unit test — no MCP involved                                                           |
+| Tool / resource / prompt | `test/harness.ts`: a real `Client` ↔ real `McpServer` over `InMemoryTransport`              |
+| HTTP                     | `app.inject()` — full stack, no socket                                                      |
+| stdio                    | Real subprocess, asserting stdout purity                                                    |
+| `CacheStore`             | One shared contract suite (`test/cache-store-contract.ts`) run against every implementation |
+
+Redis is exercised two ways: a fake client in the default suite, and a real
+server behind an opt-in gate — `RUN_REDIS_TESTS=1 npm test -- redis-cache-store`,
+which needs `docker-compose.dev.yml` up. Each run namespaces its keys and cleans
+up with `SCAN`, never `FLUSHDB`, because the Redis it finds may not be its own.
 
 Scaffold-level guarantees under test: the factory does no I/O; stdout carries
 only protocol bytes; `/ready` returns 503 when a dependency is down; cache
@@ -224,7 +283,8 @@ challenge is discoverable; a second instance serves a call the first never saw.
 
 ## Adding a module
 
-1. `cp -r src/modules/example src/modules/<name>` and rename.
+1. `src/modules/<name>/` with `*.schema.ts`, `*.service.ts`, `*.tool.ts` —
+   `session/` is the smallest complete example.
 2. Write schemas first — everything else derives from them.
 3. Keep the service free of SDK imports.
 4. Add one line to `src/mcp/capabilities.ts`.

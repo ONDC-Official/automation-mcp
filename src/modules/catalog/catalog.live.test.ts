@@ -77,9 +77,15 @@ describe.skipIf(!LIVE)("live config-service", () => {
       expect(flow?.step_count).toBeGreaterThan(0);
       // If ownership stops arriving, every step would silently become
       // "unknown" and the model could no longer tell send from await.
-      expect((flow?.mock_steps ?? 0) + (flow?.np_steps ?? 0)).toBeGreaterThan(0);
+      expect((flow?.mock_steps ?? 0) + (flow?.np_steps ?? 0)).toBeGreaterThan(
+        0,
+      );
 
-      const detail = await service.describeFlow(BUILD, flow?.flow_id ?? "", "BPP");
+      const detail = await service.describeFlow(
+        BUILD,
+        flow?.flow_id ?? "",
+        "BPP",
+      );
       expect(detail.sequence.every((step) => step.actor !== "unknown")).toBe(
         true,
       );

@@ -40,7 +40,9 @@ export function toEngineFlow(
 
   return {
     id: flow.id,
-    ...(flow.description !== undefined ? { description: flow.description } : {}),
+    ...(flow.description !== undefined
+      ? { description: flow.description }
+      : {}),
     sequence,
     extraSequence,
   };
@@ -60,7 +62,9 @@ function toEngineStep(
     // Upstream leaves both off routinely; the engine reads them on every step.
     unsolicited: step.unsolicited ?? false,
     pair: step.pair ?? null,
-    ...(step.description !== undefined ? { description: step.description } : {}),
+    ...(step.description !== undefined
+      ? { description: step.description }
+      : {}),
     ...(step.input !== undefined
       ? { input: step.input as unknown as StepInputConfig }
       : {}),
@@ -70,9 +74,7 @@ function toEngineStep(
       ? { force_proceed: step.force_proceed }
       : {}),
     ...(step.repeat !== undefined ? { repeat: step.repeat } : {}),
-    ...(typeof step["manual"] === "boolean"
-      ? { manual: step["manual"] }
-      : {}),
+    ...(typeof step["manual"] === "boolean" ? { manual: step["manual"] } : {}),
     ...(typeof step["stackable"] === "boolean"
       ? { stackable: step["stackable"] }
       : {}),

@@ -4,7 +4,10 @@ import { TransactionEvents } from "@/lib/events/transaction-events.js";
 describe("TransactionEvents", () => {
   it("wakes a waiter when a newer event arrives", async () => {
     const events = new TransactionEvents();
-    const pending = events.waitFor("txn::np", { afterSeq: 0, timeoutMs: 5_000 });
+    const pending = events.waitFor("txn::np", {
+      afterSeq: 0,
+      timeoutMs: 5_000,
+    });
 
     expect(events.waiterCount("txn::np")).toBe(1);
     events.notify("txn::np", { seq: 1, kind: "INBOUND", action: "on_search" });

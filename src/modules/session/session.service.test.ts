@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryCacheStore } from "@/lib/cache/in-memory-cache-store.js";
+import { ValidationError } from "@/lib/errors.js";
 import { logger } from "@/lib/logger.js";
 import { CatalogService } from "@/modules/catalog/catalog.service.js";
 import { CacheSessionRepository } from "@/modules/session/session.repository.js";
-import { SessionService } from "@/modules/session/session.service.js";
+import {
+  advertisedUri,
+  SessionService,
+} from "@/modules/session/session.service.js";
 import type { CreateSessionInput } from "@/modules/session/session.schema.js";
 import { createFakeConfigServiceGateway, FIXTURE_BUILD } from "@/test/fakes.js";
 
@@ -33,12 +37,16 @@ function subject(sessionTtlMs = SESSION_TTL_MS): Subject {
       repository: new CacheSessionRepository(cache),
       catalog,
       sessionTtlMs,
+      receiverPublicUrl: "http://127.0.0.1:3001",
+      receiverRoutePrefix: "",
       logger,
     }),
   };
 }
 
-function input(overrides: Partial<CreateSessionInput> = {}): CreateSessionInput {
+function input(
+  overrides: Partial<CreateSessionInput> = {},
+): CreateSessionInput {
   return {
     subscriber_url: "https://bap.example.com",
     np_type: "BAP",
@@ -155,5 +163,44 @@ describe("resolving a session", () => {
 
     expect(session.created_at).toBe("2026-07-27T10:00:00.000Z");
     expect(session.expires_at).toBe("2026-07-27T10:01:00.000Z");
+  });
+});
+
+describe("the URI this mock advertises", () => {
+  const build = { domain: "ONDC:RET10", version: "2.0.2", usecase: "ORDER" };
+
+  it("names our own role: buyer for a BAP, seller for a BPP", () => {
+    // `buyer` is the URI of a BAP and `seller` the URI of a BPP — the endpoint
+    // is ours, so the segment is our role, not the caller's.
+    expect(advertisedUri("https://mock.example.com", build, "BAP")).toBe(
+      "https://mock.example.com/ONDC:RET10/2.0.2/buyer",
+    );
+    expect(advertisedUri("https://mock.example.com", build, "BPP")).toBe(
+      "https://mock.example.com/ONDC:RET10/2.0.2/seller",
+    );
+  });
+
+  it("leaves the domain's colon unescaped", () => {
+    // This string is what the counterparty stores and echoes back to us as
+    // bap_uri/bpp_uri; matching it byte-for-byte is the point. A colon is a
+    // legal path character.
+    expect(advertisedUri("https://mock.example.com", build, "BAP")).toContain(
+      "/ONDC:RET10/",
+    );
+  });
+
+  it("tolerates a trailing slash on the base", () => {
+    expect(advertisedUri("https://mock.example.com/", build, "BAP")).toBe(
+      "https://mock.example.com/ONDC:RET10/2.0.2/buyer",
+    );
+  });
+
+  it("refuses a build that would not survive being a path segment", () => {
+    expect(() =>
+      advertisedUri("https://mock.example.com", { ...build, domain: "a/b" }, "BAP"),
+    ).toThrow(ValidationError);
+    expect(() =>
+      advertisedUri("https://mock.example.com", { ...build, version: "2 0" }, "BAP"),
+    ).toThrow(ValidationError);
   });
 });

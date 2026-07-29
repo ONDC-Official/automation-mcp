@@ -25,11 +25,7 @@
 
 /** What woke a waiter. Mirrors the kinds recorded on the transaction. */
 export type TransactionEventKind =
-  | "INBOUND"
-  | "OUTBOUND"
-  | "FORM_SUBMITTED"
-  | "CHAIN_SENT"
-  | "CHAIN_PAUSED";
+  "INBOUND" | "OUTBOUND" | "FORM_SUBMITTED" | "CHAIN_SENT" | "CHAIN_PAUSED";
 
 export interface TransactionEvent {
   /** Position in the transaction's entry list. Strictly increasing. */

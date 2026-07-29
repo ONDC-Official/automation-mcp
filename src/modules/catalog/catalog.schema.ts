@@ -22,6 +22,17 @@ export const NpType = z.enum(["BAP", "BPP"]);
 export type NpType = z.infer<typeof NpType>;
 
 /**
+ * How an `NpType` is spelled in a subscriber URI's path.
+ *
+ * `buyer` is the URI of a BAP, `seller` the URI of a BPP — so the segment names
+ * the role of whoever *owns* the endpoint, not of whoever is calling it. The
+ * network's own spelling: the workbench publishes
+ * `bap_uri = {base}/{domain}/{version}/buyer` and `bpp_uri = .../seller`.
+ */
+export const ReceiverRole = z.enum(["buyer", "seller"]);
+export type ReceiverRole = z.infer<typeof ReceiverRole>;
+
+/**
  * Who is responsible for a step, once the mock's role is known.
  *
  * `mock` — we must produce it. `np` — we wait for the NP under test to send it.
@@ -224,8 +235,13 @@ export type FlowStep = z.infer<typeof FlowStep>;
 export const FlowSummary = z.object({
   flow_id: z.string().describe("Identifier used to start or describe a flow."),
   description: z.string().describe("What the flow exercises."),
-  tags: z.array(z.string()).describe("Flow labels, e.g. WORKBENCH, REPORTABLE."),
-  step_count: z.number().int().describe("Number of steps in the main sequence."),
+  tags: z
+    .array(z.string())
+    .describe("Flow labels, e.g. WORKBENCH, REPORTABLE."),
+  step_count: z
+    .number()
+    .int()
+    .describe("Number of steps in the main sequence."),
   actions: z
     .array(z.string())
     .describe("Ordered step types — the shape of the sequence at a glance."),

@@ -18,6 +18,19 @@ const csv = z
   )
   .pipe(z.array(z.string()));
 
+/**
+ * An optional URL where blank means "not configured".
+ *
+ * `FOO=` in a `.env` file, or a compose file interpolating a variable nobody
+ * set, is how an unset value usually reaches us — and exiting 1 on an empty
+ * line is a hostile way to say "you left it blank". Anything non-empty still
+ * has to parse as a URL.
+ */
+const optionalUrl = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.url().optional(),
+);
+
 const EnvSchema = z
   .object({
     NODE_ENV: z
@@ -51,24 +64,48 @@ const EnvSchema = z
      * flow definition and mock-runner config is read from here — there is no
      * bundled copy, so a wrong value fails session creation, not startup.
      */
-    CONFIG_SERVICE_URL: z.url().default("https://workbench.ondc.tech/config-service"),
+    CONFIG_SERVICE_URL: z
+      .url()
+      .default("https://workbench.ondc.tech/config-service"),
     CONFIG_SERVICE_TIMEOUT_MS: z.coerce
       .number()
       .int()
       .positive()
       .default(15_000),
     /** TTL for fetched builds/flows/mock configs. Upstream caches ~1h. */
-    CATALOG_CACHE_TTL_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .default(900_000),
+    CATALOG_CACHE_TTL_MS: z.coerce.number().int().positive().default(900_000),
     /** Session lifetime. 48h matches the workbench's own session TTL. */
-    SESSION_TTL_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .default(172_800_000),
+    SESSION_TTL_MS: z.coerce.number().int().positive().default(172_800_000),
+
+    /* ---- Shared state store ---- */
+
+    /**
+     * Where sessions, transactions, payloads and business data live.
+     *
+     * **Unset is the default, and that is the point**: the in-process store
+     * ships with the server so it runs with zero infrastructure. Set this and
+     * the same state survives a restart — including the `tsx watch` reload that
+     * fires on every file save mid-flow. `docker-compose.dev.yml` brings up
+     * something for it to talk to.
+     *
+     * The flow catalog is deliberately *not* stored here; `createContainer`
+     * explains why.
+     */
+    REDIS_URL: optionalUrl,
+    /**
+     * Prepended to every key with `::`, so several projects can share one local
+     * Redis without collision. Set it empty to write the workbench's literal
+     * key layout (`session::{id}`, `{txn}::{sub}`) into a Redis it also uses.
+     */
+    REDIS_KEY_PREFIX: z.string().default("ondc-mcp"),
+    /**
+     * Hard ceiling on a single Redis command, applied before it is even queued.
+     * Deliberately below `/ready`'s own 2s probe timeout, so a degraded report
+     * carries Redis's error rather than "timed out". It also bounds the ACK
+     * window: the receiver reads state before answering, and a dead store must
+     * not hold the participant's connection open.
+     */
+    REDIS_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(1_500),
 
     /* ---- The mock NP's own wire presence ---- */
 
@@ -85,6 +122,15 @@ const EnvSchema = z
      * the NP's callbacks go nowhere. Defaults per transport at container build.
      */
     RECEIVER_PUBLIC_URL: z.url().optional(),
+    /**
+     * Path the receiver and form routes are mounted under.
+     *
+     * Defaults to the pathname of `RECEIVER_PUBLIC_URL`, so a deployment behind
+     * `https://host/api-service` works without further configuration. Set it to
+     * the empty string when a proxy strips the prefix before the request
+     * reaches this process.
+     */
+    RECEIVER_ROUTE_PREFIX: z.string().optional(),
     /** Registry-style id we present as `bap_id` / `bpp_id`. */
     MOCK_SUBSCRIBER_ID: z.string().min(1).default("mock.ondc-mcp.local"),
 
@@ -93,11 +139,22 @@ const EnvSchema = z
     /** Budget for one outbound protocol call to the participant. */
     SEND_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
     /**
-     * Ceiling on a single `flow_await` block. Must stay under
-     * `REQUEST_TIMEOUT_MS` or the HTTP transport kills the request before the
-     * tool can answer `timed_out` and let the model long-poll again.
+     * Ceiling on a single `flow_await` block. 5 minutes: a human-driven
+     * participant under test takes minutes to answer, and every timeout costs
+     * the model a round trip that tells it nothing.
+     *
+     * It is **not** bounded by `REQUEST_TIMEOUT_MS`, despite what the pairing
+     * of the two names suggests. Node's `requestTimeout` bounds *receiving* a
+     * request, not running its handler — it is cleared once the body has
+     * arrived, so a parked handler is never killed by it (verified on the
+     * Fastify options this app is built with).
+     *
+     * The real ceiling is the **client's** tool-call timeout, which is why
+     * `flow_await` emits progress notifications while it is parked: clients
+     * that asked for progress reset their timer on each one. A client that
+     * does not should pass a smaller `timeout_ms` and long-poll instead.
      */
-    AWAIT_MAX_WAIT_MS: z.coerce.number().int().positive().default(25_000),
+    AWAIT_MAX_WAIT_MS: z.coerce.number().int().positive().default(300_000),
     /** Lifetime of a per-step WORKING/AVAILABLE marker. 5h, as the workbench. */
     FLOW_STATUS_TTL_MS: z.coerce.number().int().positive().default(18_000_000),
     /** How long an idle mock-runner instance (and its workers) is kept. */
@@ -110,11 +167,12 @@ const EnvSchema = z
     /** Budget for fetching a counterparty-hosted form. */
     FORM_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     /** Lifetime of a transaction record and its payloads. 48h, as the workbench. */
-    TRANSACTION_TTL_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .default(172_800_000),
+    TRANSACTION_TTL_MS: z.coerce.number().int().positive().default(172_800_000),
+    /**
+     * How long an armed expectation stands. 5 minutes matches the workbench;
+     * longer risks a stale one catching an unrelated call.
+     */
+    EXPECTATION_TTL_MS: z.coerce.number().int().positive().default(300_000),
   })
   // `jwt` mode is useless without somewhere to fetch keys and something to
   // check them against. Catch it at boot, not on the first 401.

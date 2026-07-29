@@ -23,6 +23,11 @@ export function renderSession(session: Session): string {
     `  under test: ${session.np.type} at ${session.np.subscriber_url}`,
     `  mock plays: ${session.mock_role}`,
     `  build:      ${session.build.domain} ${session.build.version} / ${session.build.usecase}`,
+    // Stated on every session read, because a callback URL the participant
+    // cannot reach is the single most common way a run silently goes nowhere.
+    `  callback:   ${session.callback_url}`,
+    `  inputs:     ${session.interaction_mode === "manual" ? "manual — ask the human" : "llm_auto — you supply them"}`,
+    `  advance:    ${session.auto_advance ? "auto" : "step by step"}`,
     `  expires:    ${session.expires_at}`,
   ].join("\n");
 }
@@ -55,7 +60,9 @@ export function createSessionTools(service: SessionService): Registerable[] {
         "automatically takes the opposite role and answers as that counterparty. " +
         "Domain, version and use-case must be a published combination — call " +
         "catalog_list_builds first if unsure, because an unknown use-case is " +
-        "rejected rather than silently returning no flows.",
+        "rejected rather than silently returning no flows. " +
+        "The returned callback_url is what the participant must send its " +
+        "callbacks to; give it to them before starting a flow.",
       inputSchema: CreateSessionInput,
       outputSchema: CreateSessionOutput,
       annotations: {

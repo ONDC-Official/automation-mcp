@@ -7,6 +7,8 @@ import type { Config } from "@/config/env.js";
 import type { Container } from "@/container.js";
 import { logger } from "@/lib/logger.js";
 import { healthRoutes } from "@/modules/health/health.routes.js";
+import { formsRoutes } from "@/modules/forms/forms.routes.js";
+import { receiverRoutes } from "@/modules/transport/receiver.routes.js";
 import { authPlugin } from "@/plugins/auth.js";
 import { errorHandlerPlugin } from "@/plugins/error-handler.js";
 import { mcpPlugin } from "@/plugins/mcp.js";
@@ -33,6 +35,13 @@ export async function buildHttpApp(container: Container, config: Config) {
     // Trust the reverse proxy for client IPs (rate limiting) when not on loopback.
     trustProxy: config.HOST !== "127.0.0.1",
     genReqId: () => crypto.randomUUID(),
+    routerOptions: {
+      // A counterparty that stored our URI with a trailing slash composes
+      // `{uri}//{action}`; one that appends `/{action}/` leaves a trailing
+      // slash. Both are the same call, and neither is worth a 404.
+      ignoreTrailingSlash: true,
+      ignoreDuplicateSlashes: true,
+    },
   });
 
   // zod as the one schema language, for REST routes as well as MCP tools.
@@ -44,6 +53,19 @@ export async function buildHttpApp(container: Container, config: Config) {
   await app.register(authPlugin, config);
   await app.register(mcpPlugin, container);
   await app.register(healthRoutes(container));
+
+  // The ONDC receiver, registered after health and left unauthenticated for
+  // the same reason: it is called by a third-party network participant that has
+  // no MCP credentials. Its authenticity check is the ONDC signature, inside
+  // the receiver — not an MCP bearer token.
+  // Both mount under the public URL's path, or every URI we advertise —
+  // receiver and hosted forms alike — points somewhere this app does not serve.
+  const mountOpts = { prefix: container.receiverRoutePrefix || "/" };
+  await app.register(receiverRoutes(container), mountOpts);
+  // Forms this mock hosts. Same reasoning: the person opening the link is a
+  // tester following a URL out of a beckn payload, not an MCP client.
+  await app.register(formsRoutes(container), mountOpts);
+  container.receiver.markMounted();
 
   return app;
 }

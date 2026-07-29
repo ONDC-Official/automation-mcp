@@ -2,7 +2,9 @@ import { cacheKey, type CacheStore } from "@/lib/cache/cache-store.js";
 import type { FlowStatusCode } from "@/modules/flow/engine/engine-types.js";
 import type {
   Expectation,
+  ExpectationScope,
   PayloadRecord,
+  TransactionLocation,
   TransactionRecord,
 } from "@/modules/record/record.schema.js";
 
@@ -149,32 +151,77 @@ export class RecordRepository {
     subscriberUrl: string,
     stepKeys: readonly string[],
   ): Promise<Map<string, FlowStatusCode>> {
-    const statuses = new Map<string, FlowStatusCode>();
-    for (const key of stepKeys) {
-      statuses.set(
-        key,
-        await this.getFlowStatus(transactionId, subscriberUrl, key),
-      );
-    }
-    return statuses;
+    // Issued together rather than in sequence. Awaited one at a time this is N
+    // serial round trips against a remote store, on a path that runs inside the
+    // ACK window; issued in the same tick, ioredis pipelines them into one.
+    // `map` preserves order, and the in-memory store is indifferent either way.
+    const resolved = await Promise.all(
+      stepKeys.map(
+        async (key) =>
+          [
+            key,
+            await this.getFlowStatus(transactionId, subscriberUrl, key),
+          ] as const,
+      ),
+    );
+    return new Map(resolved);
   }
 
   /* ----------------------------- expectations ----------------------------- */
 
-  findExpectation(sessionId: string): Promise<Expectation | undefined> {
-    return this.#cache.get<Expectation>(expectationKey(sessionId));
+  /**
+   * The expectations armed on one endpoint, **as copies**.
+   *
+   * `InMemoryCacheStore` hands back the reference it stored, so a caller that
+   * edits the returned array would mutate live state before `save` ran — and
+   * would then behave completely differently against a Redis store, which
+   * round-trips through JSON. Copying here makes the two stores agree.
+   */
+  async loadExpectations(scope: ExpectationScope): Promise<Expectation[]> {
+    const stored = await this.#cache.get<Expectation[]>(expectationKey(scope));
+    return (stored ?? []).map((entry) => ({ ...entry }));
   }
 
-  saveExpectation(expectation: Expectation): Promise<void> {
-    return this.#cache.set(
-      expectationKey(expectation.sessionId),
-      expectation,
-      this.#expectationTtl,
+  saveExpectations(
+    scope: ExpectationScope,
+    expectations: readonly Expectation[],
+  ): Promise<void> {
+    return expectations.length === 0
+      ? this.#cache.delete(expectationKey(scope))
+      : this.#cache.set(
+          expectationKey(scope),
+          [...expectations],
+          this.#expectationTtl,
+        );
+  }
+
+  /* ------------------------- transaction locations ------------------------ */
+
+  async findTransactionLocations(
+    transactionId: string,
+  ): Promise<TransactionLocation[]> {
+    const stored = await this.#cache.get<TransactionLocation[]>(
+      transactionIndexKey(transactionId),
     );
+    return (stored ?? []).map((entry) => ({ ...entry }));
   }
 
-  clearExpectation(sessionId: string): Promise<void> {
-    return this.#cache.delete(expectationKey(sessionId));
+  async addTransactionLocation(location: TransactionLocation): Promise<void> {
+    const existing = await this.findTransactionLocations(
+      location.transactionId,
+    );
+    const duplicate = existing.some(
+      (entry) =>
+        entry.sessionId === location.sessionId &&
+        normaliseSubscriberUrl(entry.subscriberUrl) ===
+          normaliseSubscriberUrl(location.subscriberUrl),
+    );
+    if (duplicate) return;
+    await this.#cache.set(
+      transactionIndexKey(location.transactionId),
+      [...existing, location],
+      this.#txnTtl,
+    );
   }
 
   /* -------------------------- transaction index --------------------------- */
@@ -208,18 +255,56 @@ export class RecordRepository {
 /* Key builders — exported so tests can assert the workbench layout holds      */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * One spelling for a counterparty URL, so every key derived from it agrees.
+ *
+ * Half the URLs we key on are ours (`session.np.subscriber_url`, as registered)
+ * and half are the participant's (`context.bap_uri`/`bpp_uri`, as advertised).
+ * They are meant to be the same string and routinely are not — a trailing
+ * slash, a capitalised host, an explicit `:443`. Left alone, that writes one
+ * record and reads another.
+ *
+ * Deliberately conservative: **the path is preserved**, because a subscriber
+ * URL of `https://np.example.com/ondc` is a different participant from
+ * `https://np.example.com`. Only genuinely insignificant differences are
+ * folded away.
+ */
+export function normaliseSubscriberUrl(subscriberUrl: string): string {
+  const trimmed = subscriberUrl.trim();
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    // Not absolute — the participant gave us something odd. Strip what we can
+    // rather than throwing: a bad URL is the receiver's problem to report, not
+    // a key builder's to crash on.
+    return trimmed.replace(/\/+$/, "");
+  }
+  const scheme = url.protocol.toLowerCase();
+  const defaultPort =
+    (scheme === "https:" && url.port === "443") ||
+    (scheme === "http:" && url.port === "80");
+  const host = defaultPort
+    ? url.hostname.toLowerCase()
+    : url.host.toLowerCase();
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${scheme}//${host}${path}`;
+}
+
 export function transactionKey(
   transactionId: string,
   subscriberUrl: string,
 ): string {
-  return `${transactionId.trim()}::${subscriberUrl.trim()}`;
+  return `${transactionId.trim()}::${normaliseSubscriberUrl(subscriberUrl)}`;
 }
 
 export function businessDataKey(
   transactionId: string,
   subscriberUrl: string,
 ): string {
-  return `MOCK_DATA::${transactionId.trim()}::${subscriberUrl.trim()}`;
+  return `MOCK_DATA::${transactionId.trim()}::${normaliseSubscriberUrl(
+    subscriberUrl,
+  )}`;
 }
 
 export function flowStatusKey(
@@ -227,19 +312,68 @@ export function flowStatusKey(
   subscriberUrl: string,
   stepKey?: string,
 ): string {
+  const pair = `${transactionId.trim()}::${normaliseSubscriberUrl(
+    subscriberUrl,
+  )}`;
   return stepKey === undefined
-    ? `FLOW_STATUS_${transactionId}::${subscriberUrl}`
-    : `EXTRA_FLOW_STATUS_${transactionId}::${subscriberUrl}::${stepKey}`;
+    ? `FLOW_STATUS_${pair}`
+    : `EXTRA_FLOW_STATUS_${pair}::${stepKey}`;
 }
 
 export function payloadKey(payloadId: string): string {
   return cacheKey("payload", payloadId);
 }
 
-export function expectationKey(sessionId: string): string {
-  return cacheKey("expect", sessionId);
+/**
+ * Expectations are bucketed by **endpoint**, not by session or subscriber.
+ *
+ * That is the only thing both sides of the lookup can agree on. When a step is
+ * armed we know the session and the URL it registered; when the call lands we
+ * know the path it arrived on and whatever URI the payload chose to advertise.
+ * Keying on the subscriber URL would let those two disagree and never meet —
+ * so the URL is carried *on* the entry as a tie-break instead, and the key is
+ * exactly what the URL can distinguish.
+ *
+ * Scoped by build because one process serves many; the workbench gets away
+ * without it only because each of its deployments serves exactly one.
+ */
+export function expectationKey(scope: ExpectationScope): string {
+  return cacheKey(
+    "expect",
+    scope.domain.trim().toUpperCase(),
+    scope.version.trim(),
+    scope.role,
+  );
+}
+
+/**
+ * Where a transaction lives, found by id alone.
+ *
+ * The pair key needs a subscriber URL we do not yet have when a call arrives —
+ * that is the whole reason this index exists. See `TransactionLocation`.
+ */
+export function transactionIndexKey(transactionId: string): string {
+  return cacheKey("txn_index", transactionId.trim());
 }
 
 export function sessionIndexKey(sessionId: string): string {
   return cacheKey("session_txns", sessionId);
+}
+
+/**
+ * One flow run inside one session — our port of the workbench's `flowMap`.
+ *
+ * It exists because a flow run outlives the window in which it has no
+ * `transaction_id`. The id belongs to whoever sends the flow's first action, so
+ * when that is the participant we do not learn it until their call lands; until
+ * then every key derived from a transaction id is unusable and the caller still
+ * needs something to hold.
+ *
+ * Used for two things that must agree: the stored `FlowBinding`
+ * (`flow.repository.ts`) and the `TransactionEvents` key `flow_await` parks on
+ * while the run is unbound. Deriving both from here is what makes a callback
+ * that binds the run wake the waiter that was parked before it existed.
+ */
+export function flowRunKey(sessionId: string, flowId: string): string {
+  return cacheKey("flow_run", sessionId.trim(), flowId.trim());
 }

@@ -29,7 +29,10 @@ guardStdout();
  */
 
 async function main(): Promise<void> {
-  const container = await createContainer(config);
+  // The transport decides where the ONDC receiver lives — and therefore what
+  // callback URL we advertise. On stdio nothing is listening until
+  // `receiver_start` binds one.
+  const container = await createContainer(config, { transport: "stdio" });
 
   const handle = serveStdio(createServerFactory(container), {
     // Also serve clients still speaking the 2025 protocol.

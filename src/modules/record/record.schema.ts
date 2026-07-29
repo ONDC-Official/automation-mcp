@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { NpType } from "@/modules/catalog/catalog.schema.js";
+import { NpType, ReceiverRole } from "@/modules/catalog/catalog.schema.js";
 
 /**
  * What actually happened on the wire, and what the flow learned from it.
@@ -151,12 +151,67 @@ export type PayloadRecord = z.infer<typeof PayloadRecord>;
 export const Expectation = z.object({
   sessionId: z.string(),
   flowId: z.string(),
+  /**
+   * Our transaction, when one already exists. The strongest signal available
+   * for telling two sessions armed for the same action apart.
+   */
   transactionId: z.string().optional(),
-  expectedAction: z.string().optional(),
+  /** Required: an entry with no action could never be matched against a call. */
+  expectedAction: z.string().min(1),
+  /**
+   * The counterparty URL this session registered.
+   *
+   * A **tie-break, never a key** — see `expectationKey`. The arriving call
+   * advertises its own URI, which is supposed to be this one and often is not.
+   */
+  subscriberUrl: z.string(),
   autoAdvance: z.boolean().default(false),
   expireAt: z.string(),
+  /** Deterministic oldest-first ordering, and a diagnostic when one goes stale. */
+  armedAt: z.string(),
 });
 export type Expectation = z.infer<typeof Expectation>;
+
+/**
+ * The endpoint an expectation is bucketed under: `{domain}/{version}/{role}`,
+ * which is precisely what the receiver can read off the URL a call arrived on.
+ */
+export const ExpectationScope = z.object({
+  domain: z.string(),
+  version: z.string(),
+  role: ReceiverRole,
+});
+export type ExpectationScope = z.infer<typeof ExpectationScope>;
+
+/**
+ * Where a transaction lives, addressable by `transaction_id` alone.
+ *
+ * Records are keyed `{transaction_id}::{subscriber_url}`, but an arriving call
+ * only tells us the URI *it* advertises — which is supposed to equal the
+ * registered `subscriber_url` and, in the field, frequently does not. Looking
+ * the record up under the advertised URI would miss, fall through to the
+ * expectation branch, and open a **second** record under a second key: the
+ * receiver would then write to one while `flow_get_status`, `flow_await` and
+ * `record_get_payload` all read the other, and the flow would stall with
+ * nothing in the trace pointing at why.
+ *
+ * So the id is indexed on its own, and `subscriberUrl` here is always the
+ * canonical `session.np.subscriber_url` the record is actually stored under.
+ *
+ * A list, because the same `transaction_id` against two participants is two
+ * different tests; `domain`/`version`/`role` are carried so the receiver can
+ * filter by the path a call arrived on without loading a session first.
+ */
+export const TransactionLocation = z.object({
+  transactionId: z.string(),
+  sessionId: z.string(),
+  subscriberUrl: z.string(),
+  domain: z.string(),
+  version: z.string(),
+  role: ReceiverRole,
+  createdAt: z.string(),
+});
+export type TransactionLocation = z.infer<typeof TransactionLocation>;
 
 /* -------------------------------------------------------------------------- */
 /* Tool input / output                                                         */

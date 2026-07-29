@@ -11,6 +11,7 @@ import type {
   MockConfigStep,
   MockConfigSummary,
   NpType,
+  ReceiverRole,
   StepActor,
   StepInput,
   UpstreamFlow,
@@ -119,12 +120,15 @@ export class CatalogService {
     return flows.map((flow) => summarizeFlow(flow, mockRole));
   }
 
-  /** One flow's full sequence, every step annotated with its actor. */
-  async describeFlow(
-    build: BuildRef,
-    flowId: string,
-    mockRole: NpType,
-  ): Promise<FlowDetail> {
+  /**
+   * One flow definition, verbatim as published.
+   *
+   * The flow loop needs the raw shape — `expect`, `manual`, `input`, labels —
+   * which the summarised views drop.
+   *
+   * @throws {NotFoundError} naming the flows that do exist.
+   */
+  async requireFlow(build: BuildRef, flowId: string): Promise<UpstreamFlow> {
     const flows = await this.#flows(build);
     const flow = flows.find((entry) => entry.id === flowId);
 
@@ -134,6 +138,16 @@ export class CatalogService {
         available_flows: flows.map((entry) => entry.id),
       });
     }
+    return flow;
+  }
+
+  /** One flow's full sequence, every step annotated with its actor. */
+  async describeFlow(
+    build: BuildRef,
+    flowId: string,
+    mockRole: NpType,
+  ): Promise<FlowDetail> {
+    const flow = await this.requireFlow(build, flowId);
 
     return {
       flow_id: flow.id,
@@ -207,6 +221,30 @@ export class CatalogService {
     return this.#cache.get<UpstreamMockConfig>(key);
   }
 
+  /**
+   * The raw config, fetching it if the cache has dropped it.
+   *
+   * The cache TTL (~15 min) is far shorter than a transaction's life, so a flow
+   * that pauses for a human will routinely come back to a cold entry. Re-fetching
+   * transparently is the difference between "the loop continues" and "the loop
+   * dies halfway through for a reason the model cannot act on".
+   *
+   * @throws {NotFoundError} when the config-service publishes no config for
+   * this flow — a real condition, and one the model resolves by picking a
+   * different flow.
+   */
+  async requireMockConfig(
+    build: BuildRef,
+    flowId: string,
+  ): Promise<{ key: string; config: UpstreamMockConfig }> {
+    const key = mockConfigKey(build, flowId);
+    const cached = await this.#cache.get<UpstreamMockConfig>(key);
+    if (cached) return { key, config: cached };
+
+    const config = await this.#fetchMockConfig(build, flowId, key);
+    return { key, config };
+  }
+
   async #fetchMockConfig(
     build: BuildRef,
     flowId: string,
@@ -261,6 +299,24 @@ export function oppositeRole(npType: NpType): NpType {
   return npType === "BAP" ? "BPP" : "BAP";
 }
 
+/** How `mockRole` is spelled in the subscriber URI this mock advertises. */
+export function receiverRole(mockRole: NpType): ReceiverRole {
+  return mockRole === "BAP" ? "buyer" : "seller";
+}
+
+/**
+ * The inverse: whose URI a `buyer`/`seller` endpoint is.
+ *
+ * The receiver needs this to know which context field carries the *counterparty's*
+ * URI — the endpoint's own role is ours, so the other side's is the opposite.
+ */
+export function roleFromSegment(segment: string): ReceiverRole | undefined {
+  const normalised = segment.trim().toLowerCase();
+  return normalised === "buyer" || normalised === "seller"
+    ? normalised
+    : undefined;
+}
+
 /** Whether a step belongs to the mock, the NP under test, or neither. */
 export function actorFor(
   owner: string | undefined,
@@ -313,7 +369,9 @@ export function toFlowStep(
     ...(step.unsolicited !== undefined
       ? { unsolicited: step.unsolicited }
       : {}),
-    ...(step.pair !== undefined && step.pair !== null ? { pair: step.pair } : {}),
+    ...(step.pair !== undefined && step.pair !== null
+      ? { pair: step.pair }
+      : {}),
     ...(step.repeat !== undefined ? { repeat: step.repeat } : {}),
     ...(step.force_proceed !== undefined
       ? { force_proceed: step.force_proceed }

@@ -9,7 +9,10 @@ import type {
 } from "@/modules/flow/engine/engine-types.js";
 import { buildPendingStep } from "@/modules/flow/engine/pending-step.js";
 import { getReferenceData } from "@/modules/flow/engine/reference-data.js";
-import { reduceApiDataList } from "@/modules/flow/engine/reduce-history.js";
+import {
+  reduceApiDataList,
+  sortForReplay,
+} from "@/modules/flow/engine/reduce-history.js";
 import {
   createEmptyExtrasState,
   createExtrasIndex,
@@ -85,9 +88,8 @@ export class FlowMapBuilder {
   }
 
   build(): FlowMap {
-    const apiList = reduceApiDataList(this.#transactionData.apiList).sort(
-      (a, b) =>
-        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+    const apiList = sortForReplay(
+      reduceApiDataList(this.#transactionData.apiList),
     );
 
     for (const apiData of apiList) {

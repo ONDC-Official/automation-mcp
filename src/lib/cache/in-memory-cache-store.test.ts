@@ -1,11 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { cacheKey } from "@/lib/cache/cache-store.js";
 import { InMemoryCacheStore } from "@/lib/cache/in-memory-cache-store.js";
+import { describeCacheStoreContract } from "@/test/cache-store-contract.js";
 
 function store(clock: { value: number }): InMemoryCacheStore {
   // No sweep timer: these tests drive expiry through the injected clock.
   return new InMemoryCacheStore({ sweepIntervalMs: 0, now: () => clock.value });
 }
+
+// The shared port contract. Runs on the real clock, so no injected `now` here.
+describeCacheStoreContract(
+  "in-memory",
+  () => new InMemoryCacheStore({ sweepIntervalMs: 0 }),
+);
+
+// Everything below is specific to *this* implementation — the injected clock,
+// the sweep, and the `size()` probe that is not part of the port.
 
 describe("in-memory cache store", () => {
   it("round-trips a value within its TTL", async () => {

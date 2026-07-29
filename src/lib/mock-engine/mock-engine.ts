@@ -257,7 +257,10 @@ export class MockEngine {
           execution.validation?.errors.join("; ") ??
           "the config function failed without reporting a reason",
       };
-      this.#logger.warn({ kind, actionId, err: error }, "config function failed");
+      this.#logger.warn(
+        { kind, actionId, err: error },
+        "config function failed",
+      );
       return { ok: false, error, logs };
     }
 

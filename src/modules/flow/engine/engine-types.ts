@@ -100,6 +100,8 @@ export interface EngineApiEntry {
   messageId: string;
   response: unknown;
   timestamp: string;
+  /** Append order. Optional so upstream-shaped fixtures still fit. */
+  seq?: number | undefined;
 }
 
 export interface EngineFormEntry {
@@ -109,6 +111,7 @@ export interface EngineFormEntry {
   submissionId?: string | undefined;
   timestamp: string;
   error?: string | undefined;
+  seq?: number | undefined;
 }
 
 export type EngineHistoryEntry = EngineApiEntry | EngineFormEntry;
@@ -145,6 +148,8 @@ export interface ReducedApiData {
   timestamp: string;
   subStatus: "SUCCESS" | "ERROR";
   payloads: { payloadId: string; response: unknown }[];
+  /** Append order, when the record carried one. See `sortForReplay`. */
+  seq?: number | undefined;
 }
 
 export interface ReducedFormData {
@@ -155,6 +160,7 @@ export interface ReducedFormData {
   timestamp: string;
   subStatus?: "SUCCESS" | "ERROR";
   error?: string | undefined;
+  seq?: number | undefined;
 }
 
 export type ApiHistory = ReducedApiData | ReducedFormData;

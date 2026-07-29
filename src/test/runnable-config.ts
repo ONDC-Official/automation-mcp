@@ -1,5 +1,8 @@
 import { MockRunner } from "@ondc/automation-mock-runner";
-import type { UpstreamFlow, UpstreamMockConfig } from "@/modules/catalog/catalog.schema.js";
+import type {
+  UpstreamFlow,
+  UpstreamMockConfig,
+} from "@/modules/catalog/catalog.schema.js";
 
 /**
  * A flow whose mock-runner config **actually executes**.
@@ -322,13 +325,15 @@ export function validOnSearchPayload(
       message_id: messageId,
       timestamp: new Date().toISOString(),
       bap_id: "mock.ondc-mcp.local",
-      bap_uri: "http://127.0.0.1:3001/rx/session",
+      bap_uri: "http://127.0.0.1:3001/ONDC:RET10/2.0.2/buyer",
       bpp_id: "np.example.com",
       bpp_uri: "https://np.example.com",
       ttl: "PT30S",
     },
     message: {
-      catalog: { providers: [{ id: "provider-1", descriptor: { name: "Bank" } }] },
+      catalog: {
+        providers: [{ id: "provider-1", descriptor: { name: "Bank" } }],
+      },
     },
   };
 }

@@ -57,6 +57,14 @@ export class InMemoryCacheStore implements CacheStore {
   }
 
   set<T>(key: string, value: T, ttlMs: number): Promise<void> {
+    // A non-positive TTL would land on an `expiresAt` already in the past, so
+    // reads would answer `undefined` anyway. Dropping the key outright says the
+    // same thing without parking a tombstone until the next sweep.
+    if (ttlMs <= 0) {
+      this.#entries.delete(key);
+      return Promise.resolve();
+    }
+
     this.#entries.set(key, { value, expiresAt: this.#now() + ttlMs });
     return Promise.resolve();
   }

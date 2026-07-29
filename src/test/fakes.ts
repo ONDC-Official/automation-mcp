@@ -63,7 +63,10 @@ export function createFakeConfigServiceGateway(
   ];
   const mockConfig = UpstreamMockConfig.parse(MOCK_CONFIG_RESPONSE);
   const runnableConfigs = new Map<string, UpstreamMockConfig>([
-    [RUNNABLE_FLOW_ID, UpstreamMockConfig.parse(buildRunnableMockConfig(RUNNABLE_FLOW_ID))],
+    [
+      RUNNABLE_FLOW_ID,
+      UpstreamMockConfig.parse(buildRunnableMockConfig(RUNNABLE_FLOW_ID)),
+    ],
     [
       RUNNABLE_FORM_FLOW_ID,
       UpstreamMockConfig.parse(buildRunnableMockConfig(RUNNABLE_FORM_FLOW_ID)),

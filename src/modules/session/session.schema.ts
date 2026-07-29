@@ -34,15 +34,49 @@ export const NetworkParticipant = z.object({
 });
 export type NetworkParticipant = z.infer<typeof NetworkParticipant>;
 
+/**
+ * Who supplies the values a flow asks for, and who fills its forms.
+ *
+ * `llm_auto` — the caller answers every prompt itself, including fetching a
+ * counterparty-hosted form and filling its fields. The loop runs unattended.
+ *
+ * `manual` — a human is in the loop: the caller relays each request for input
+ * to them, and forms are handed over as links to open rather than parsed and
+ * posted. Slower, and the only honest mode when the values are real.
+ */
+export const InteractionMode = z.enum(["llm_auto", "manual"]);
+export type InteractionMode = z.infer<typeof InteractionMode>;
+
 export const Session = z.object({
   session_id: z.string().describe("Identifier for every later call."),
   created_at: z.string().describe("ISO 8601 creation timestamp."),
-  expires_at: z.string().describe("ISO 8601 expiry; the session is gone after."),
+  expires_at: z
+    .string()
+    .describe("ISO 8601 expiry; the session is gone after."),
   np: NetworkParticipant.describe("The participant under test."),
   mock_role: NpType.describe(
     "The role this server plays — always the opposite of the participant's.",
   ),
   build: BuildRef.describe("Domain, version and use-case under test."),
+  interaction_mode: InteractionMode.describe(
+    "Who supplies inputs and fills forms for flows in this session.",
+  ),
+  auto_advance: z
+    .boolean()
+    .describe(
+      "When true, this server chains its own steps as soon as the participant " +
+        "answers, pausing only for inputs, forms and errors.",
+    ),
+  callback_url: z
+    .string()
+    .describe(
+      "The URI this mock advertises as bap_uri/bpp_uri: " +
+        "{base}/{domain}/{version}/{buyer|seller}. Register it as your " +
+        "counterparty's subscriber URL. The participant appends /{action} " +
+        "itself, as it would for any network participant. Shared by every " +
+        "session on the same build and role — inbound calls are matched by " +
+        "transaction_id, not by this URL.",
+    ),
 });
 export type Session = z.infer<typeof Session>;
 
@@ -69,6 +103,26 @@ export const CreateSessionInput = z.object({
     .string()
     .optional()
     .describe("Registry subscriber id of the participant, when known."),
+  interaction_mode: InteractionMode.optional().describe(
+    "'llm_auto' (default) — you supply every input and fill forms yourself. " +
+      "'manual' — a human supplies them; forms come back as links to hand over.",
+  ),
+  auto_advance: z
+    .boolean()
+    .optional()
+    .describe(
+      "Default false. When true, this server sends its own next step as soon " +
+        "as the participant answers, instead of waiting to be asked — pausing " +
+        "for inputs, forms and errors. Faster, but you see less of the flow.",
+    ),
+  receiver_public_url: z
+    .url()
+    .optional()
+    .describe(
+      "Override the URL advertised for callbacks. Set this to your tunnel " +
+        "address (ngrok, cloudflared) whenever the participant is not on this " +
+        "machine — otherwise its callbacks go somewhere it cannot reach.",
+    ),
 });
 export type CreateSessionInput = z.infer<typeof CreateSessionInput>;
 

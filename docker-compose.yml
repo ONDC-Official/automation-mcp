@@ -1,7 +1,11 @@
 services:
   ondc-mcp:
     build: .
-    # Nothing is shared between replicas — no session store, no sticky routing.
+    # Routing is stateless — no sticky sessions needed. But sessions and
+    # transactions *are* shared state, so scaling past one replica means
+    # pointing REDIS_URL at a Redis all of them can reach. Left unset, each
+    # replica keeps its own state in-process and they will not agree with each
+    # other; the server logs a warning at boot when that happens in production.
     # Scale with `docker compose up --scale ondc-mcp=3`.
     environment:
       NODE_ENV: production
@@ -17,6 +21,9 @@ services:
       AUTH_AUDIENCE: ${AUTH_AUDIENCE:?set AUTH_AUDIENCE}
       AUTH_JWKS_URL: ${AUTH_JWKS_URL:?set AUTH_JWKS_URL}
       AUTH_REQUIRED_SCOPES: ${AUTH_REQUIRED_SCOPES:-mcp}
+      # Shared state store. Empty means unset, which keeps state in-process.
+      REDIS_URL: ${REDIS_URL:-}
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-ondc-mcp}
     ports:
       - "3000:3000"
     restart: unless-stopped

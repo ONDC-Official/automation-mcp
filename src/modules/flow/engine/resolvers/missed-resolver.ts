@@ -24,7 +24,11 @@ export const missedResolver: Resolver = (ctx, state) => {
       return { consumed: true };
     }
 
-    const futureStepIndex = findStepInFlow(apiData.action, flowSequence, cursor);
+    const futureStepIndex = findStepInFlow(
+      apiData.action,
+      flowSequence,
+      cursor,
+    );
     state.mappedFlow.missedSteps.push(
       futureStepIndex !== -1
         ? makeApiMissedStep(apiData, {
@@ -44,7 +48,11 @@ export const missedResolver: Resolver = (ctx, state) => {
     return { consumed: true };
   }
 
-  const futureStepIndex = findStepInFlow(apiData.formType, flowSequence, cursor);
+  const futureStepIndex = findStepInFlow(
+    apiData.formType,
+    flowSequence,
+    cursor,
+  );
   state.mappedFlow.missedSteps.push(
     futureStepIndex !== -1
       ? makeFormMissedStep(apiData, {
