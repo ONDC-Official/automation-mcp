@@ -8,10 +8,13 @@ import { MockEngine } from "@/lib/mock-engine/mock-engine.js";
 import {
   businessDataKey,
   expectationKey,
+  flowRunKey,
   flowStatusKey,
+  journalKey,
   RecordRepository,
   transactionKey,
 } from "@/modules/record/record.repository.js";
+import { EVENTS_DELTA_LIMIT } from "@/modules/record/record.schema.js";
 import { RecordService } from "@/modules/record/record.service.js";
 
 /**
@@ -47,6 +50,7 @@ beforeEach(async () => {
       transactionTtlMs: 172_800_000,
       flowStatusTtlMs: 18_000_000,
       expectationTtlMs: 300_000,
+      sessionTtlMs: 172_800_000,
     }),
     events,
     mockEngine: engine,
@@ -152,6 +156,21 @@ describe("RecordService — appending", () => {
     expect(record.apiList.some((entry) => entry.seq === event?.seq)).toBe(true);
   });
 
+  it("also wakes a waiter parked on the flow run, not the transaction", async () => {
+    // A run whose first action is the participant's has no transaction id to
+    // park on — the participant has not chosen one yet — so `flow_await` parks
+    // on the run instead. Publishing under both keys is what lets the very
+    // event that binds the run wake a waiter that predates the id.
+    const pending = events.waitFor(flowRunKey("sess-1", "flow-1"), {
+      afterSeq: 0,
+      timeoutMs: 2_000,
+    });
+
+    await service.appendApiEntry(apiInput({ direction: "inbound" }));
+
+    expect(await pending).toMatchObject({ seq: 1, kind: "INBOUND" });
+  });
+
   it("records a form submission", async () => {
     const { record, seq } = await service.appendFormEntry({
       transactionId: TXN,
@@ -195,6 +214,204 @@ describe("RecordService — appending", () => {
     );
     expect(mine.apiList).toHaveLength(1);
     expect(theirs.apiList).toHaveLength(0);
+  });
+});
+
+describe("RecordService — the two-phase outbound append", () => {
+  /**
+   * An outbound call is recorded when we commit to sending it, not when the
+   * counterparty answers, because the counterparty may legitimately send its
+   * next request before answering. See `ApiEntry.sendState`.
+   */
+  it("makes the entry visible before its answer is known", async () => {
+    const { record, seq, payloadId } = await service.appendApiEntry(
+      apiInput({ ackBody: undefined, sendState: "in_flight", silent: true }),
+    );
+
+    expect(seq).toBe(1);
+    const [entry] = record.apiList;
+    expect(entry).toMatchObject({ action: "search", sendState: "in_flight" });
+    expect(entry?.entryType === "API" && entry.response).toBeUndefined();
+
+    // The body is already readable — only the answer is outstanding.
+    const payload = await service.requirePayload(payloadId);
+    expect(payload.body).toMatchObject({ context: { action: "search" } });
+    expect(payload.ackBody).toBeUndefined();
+  });
+
+  it("folds the answer onto both the entry and the stored payload", async () => {
+    const { seq, payloadId } = await service.appendApiEntry(
+      apiInput({ ackBody: undefined, sendState: "in_flight", silent: true }),
+    );
+
+    const ackBody = { message: { ack: { status: "ACK" } } };
+    await service.settleApiEntry({
+      transactionId: TXN,
+      subscriberUrl: NP_URL,
+      seq,
+      payloadId,
+      ackBody,
+      httpStatus: 200,
+    });
+
+    const record = await service.requireTransaction(TXN, NP_URL);
+    const [entry] = record.apiList;
+    expect(entry?.entryType === "API" && entry.sendState).toBeUndefined();
+    expect(entry?.entryType === "API" && entry.response).toEqual(ackBody);
+
+    const payload = await service.requirePayload(payloadId);
+    expect(payload.ackBody).toEqual(ackBody);
+    expect(payload.httpStatus).toBe(200);
+  });
+
+  it("publishes once, on settle, not on the silent append", async () => {
+    // A waiter must not be woken by a call that has not been answered yet — it
+    // would report an exchange that has not finished happening.
+    const duringSend = events.waitFor(transactionKey(TXN, NP_URL), {
+      afterSeq: 0,
+      timeoutMs: 50,
+    });
+    const { seq, payloadId } = await service.appendApiEntry(
+      apiInput({ ackBody: undefined, sendState: "in_flight", silent: true }),
+    );
+    expect(await duringSend).toBeUndefined();
+
+    const onSettle = events.waitFor(transactionKey(TXN, NP_URL), {
+      afterSeq: 0,
+      timeoutMs: 500,
+    });
+    await service.settleApiEntry({
+      transactionId: TXN,
+      subscriberUrl: NP_URL,
+      seq,
+      payloadId,
+      ackBody: { message: { ack: { status: "ACK" } } },
+    });
+    expect(await onSettle).toMatchObject({ seq: 1, kind: "OUTBOUND" });
+  });
+
+  it("marks an entry failed without losing it", async () => {
+    const { seq, payloadId } = await service.appendApiEntry(
+      apiInput({ ackBody: undefined, sendState: "in_flight", silent: true }),
+    );
+
+    await service.settleApiEntry({
+      transactionId: TXN,
+      subscriberUrl: NP_URL,
+      seq,
+      payloadId,
+      sendState: "failed",
+      sendError: "headers timeout",
+    });
+
+    const record = await service.requireTransaction(TXN, NP_URL);
+    const [entry] = record.apiList;
+    expect(entry?.entryType === "API" && entry.sendState).toBe("failed");
+    expect(entry?.entryType === "API" && entry.sendError).toBe(
+      "headers timeout",
+    );
+  });
+
+  it("withdraws an entry, and leaves the seq gap where it is", async () => {
+    const { seq, payloadId } = await service.appendApiEntry(
+      apiInput({ ackBody: undefined, sendState: "in_flight", silent: true }),
+    );
+
+    await service.discardApiEntry({
+      transactionId: TXN,
+      subscriberUrl: NP_URL,
+      seq,
+      payloadId,
+    });
+
+    const record = await service.requireTransaction(TXN, NP_URL);
+    expect(record.apiList).toHaveLength(0);
+    // `seq` is a cursor waiters hold, not a count: reissuing 1 would rewind
+    // anyone who had already been shown it.
+    expect(record.seq).toBe(1);
+    await expect(service.requirePayload(payloadId)).rejects.toThrow(
+      NotFoundError,
+    );
+
+    const next = await service.appendApiEntry(apiInput());
+    expect(next.seq).toBe(2);
+  });
+
+  it("restores latestAction from what survives, not from what preceded", async () => {
+    const inFlight = await service.appendApiEntry(
+      apiInput({ ackBody: undefined, sendState: "in_flight", silent: true }),
+    );
+    // A callback lands between the append and the send failing.
+    await service.appendApiEntry(
+      apiInput({
+        action: "on_search",
+        direction: "inbound",
+        messageId: "m-2",
+        body: { context: { action: "on_search" }, message: {} },
+      }),
+    );
+
+    await service.discardApiEntry({
+      transactionId: TXN,
+      subscriberUrl: NP_URL,
+      seq: inFlight.seq,
+      payloadId: inFlight.payloadId,
+    });
+
+    const record = await service.requireTransaction(TXN, NP_URL);
+    expect(record.apiList).toHaveLength(1);
+    expect(record.latestAction).toBe("on_search");
+  });
+
+  it("does not lose a concurrent inbound append", async () => {
+    // The window the per-record lock exists for: the receiver appends an
+    // inbound call while the outbound path is settling. Both writes are a
+    // load-modify-save over the whole record, so unserialised one erases the
+    // other — and an exchange this server never saw is a finding it cannot make.
+    const { seq, payloadId } = await service.appendApiEntry(
+      apiInput({ ackBody: undefined, sendState: "in_flight", silent: true }),
+    );
+
+    await Promise.all([
+      service.settleApiEntry({
+        transactionId: TXN,
+        subscriberUrl: NP_URL,
+        seq,
+        payloadId,
+        ackBody: { message: { ack: { status: "ACK" } } },
+      }),
+      service.appendApiEntry(
+        apiInput({
+          action: "on_search",
+          direction: "inbound",
+          messageId: "m-2",
+          body: { context: { action: "on_search" }, message: {} },
+        }),
+      ),
+    ]);
+
+    const record = await service.requireTransaction(TXN, NP_URL);
+    expect(
+      record.apiList.map((entry) =>
+        entry.entryType === "API" ? entry.action : entry.formType,
+      ),
+    ).toEqual(["search", "on_search"]);
+    const [settled] = record.apiList;
+    expect(settled?.entryType === "API" && settled.sendState).toBeUndefined();
+  });
+
+  it("ignores a settle for an entry that is no longer there", async () => {
+    // A transaction swept mid-send, or an attempt flow_restart cleared. Failing
+    // here would report a delivered call as a transport error.
+    await expect(
+      service.settleApiEntry({
+        transactionId: TXN,
+        subscriberUrl: NP_URL,
+        seq: 99,
+        payloadId: "gone",
+        ackBody: {},
+      }),
+    ).resolves.toBeUndefined();
   });
 });
 
@@ -293,6 +510,7 @@ describe("RecordService — flow status and attention", () => {
       transactionTtlMs: 1_000,
       flowStatusTtlMs: 1_000,
       expectationTtlMs: 1_000,
+      sessionTtlMs: 1_000,
     });
 
     // The safe fallback: a dispatch that crashed without writing AVAILABLE
@@ -327,6 +545,28 @@ describe("RecordService — flow status and attention", () => {
     expect(
       (await service.requireTransaction(TXN, NP_URL)).attention,
     ).toBeUndefined();
+  });
+
+  it("seals an abandoned attempt without touching what it recorded", async () => {
+    // `flow_restart` archives rather than erases: a failed attempt is a
+    // compliance finding, and the report has to be able to read it back.
+    const { payloadId } = await service.appendApiEntry(apiInput());
+
+    const sealed = await service.abandonTransaction(TXN, NP_URL, {
+      at: "2026-01-01T00:05:00.000Z",
+      attempt: 1,
+      reason: "select was NACKed",
+    });
+
+    expect(sealed.abandoned).toMatchObject({ attempt: 1 });
+    expect(sealed.apiList).toHaveLength(1);
+    await expect(service.requirePayload(payloadId)).resolves.toMatchObject({
+      action: "search",
+    });
+
+    const reread = await service.requireTransaction(TXN, NP_URL);
+    expect(reread.abandoned?.reason).toBe("select was NACKed");
+    expect(reread.seq).toBe(1);
   });
 
   it("indexes transactions per session", async () => {
@@ -515,6 +755,26 @@ describe("expectations", () => {
     expect(taken?.sessionId).toBe("sess-first");
   });
 
+  it("clears one run without disarming the session's other flows", async () => {
+    // What `flow_restart` needs. A session may have several flows in flight,
+    // and taking a sibling's expectation down would leave it waiting on an
+    // endpoint that had quietly stopped accepting its callback.
+    await service.armExpectation(SCOPE, armed("sess-1", "on_search"));
+    await service.armExpectation(SCOPE, {
+      ...armed("sess-1", "on_status"),
+      flowId: "flow-2",
+    });
+    await service.armExpectation(SCOPE, armed("sess-2", "on_search"));
+
+    await service.clearExpectationsForFlow(SCOPE, "sess-1", "flow-1");
+
+    const remaining = await service.expectationsForSession(SCOPE, "sess-1");
+    expect(remaining.map((entry) => entry.flowId)).toEqual(["flow-2"]);
+    await expect(
+      service.expectationsForSession(SCOPE, "sess-2"),
+    ).resolves.toHaveLength(1);
+  });
+
   it("hands back copies, so a caller cannot mutate stored state", async () => {
     // InMemoryCacheStore returns the reference it stored. Without a copy this
     // passes here and breaks the day the store is Redis.
@@ -525,5 +785,204 @@ describe("expectations", () => {
 
     const [reread] = await service.expectationsForSession(SCOPE, "sess-1");
     expect(reread?.expectedAction).toBe("search");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The session journal                                                         */
+/* -------------------------------------------------------------------------- */
+
+describe("RecordService — the session journal", () => {
+  const SESSION = "sess-1";
+
+  it("stamps a monotonic session-wide seq and an ISO timestamp", async () => {
+    await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "one" });
+    await service.journal(SESSION, { kind: "OUTBOUND_SENT", summary: "two" });
+
+    const events = await service.readEvents(SESSION);
+
+    expect(events.map((entry) => entry.seq)).toEqual([1, 2]);
+    expect(events.map((entry) => entry.summary)).toEqual(["one", "two"]);
+    expect(Date.parse(events[0]?.at ?? "")).not.toBeNaN();
+  });
+
+  /**
+   * The journal's seq and a transaction's `seq` are different counters, and a
+   * caller that compared them would drain the wrong events. Appending an
+   * exchange must not move the journal at all.
+   */
+  it("keeps its seq space separate from a transaction's", async () => {
+    await service.appendApiEntry({
+      transactionId: TXN,
+      subscriberUrl: NP_URL,
+      action: "search",
+      messageId: "m-1",
+      direction: "inbound",
+      timestamp: new Date().toISOString(),
+      body: { context: {} },
+    });
+    await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "first" });
+
+    const record = await service.requireTransaction(TXN, NP_URL);
+    const [event] = await service.readEvents(SESSION);
+
+    expect(record.seq).toBe(1);
+    expect(event?.seq).toBe(1);
+    // Same number, different counters — they only agree here by coincidence.
+    await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "second" });
+    expect((await service.requireTransaction(TXN, NP_URL)).seq).toBe(1);
+  });
+
+  it("keeps sessions apart", async () => {
+    await service.journal("sess-a", { kind: "INBOUND_ACK", summary: "a" });
+    await service.journal("sess-b", { kind: "INBOUND_ACK", summary: "b" });
+
+    await expect(service.readEvents("sess-a")).resolves.toHaveLength(1);
+    await expect(service.readEvents("sess-b")).resolves.toHaveLength(1);
+    expect((await service.readEvents("sess-b"))[0]?.seq).toBe(1);
+  });
+
+  it("hands every concurrent writer a distinct seq", async () => {
+    await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        service.journal(SESSION, {
+          kind: "CHAIN_SENT",
+          summary: `entry ${String(index)}`,
+        }),
+      ),
+    );
+
+    const seqs = (await service.readEvents(SESSION)).map((entry) => entry.seq);
+    expect(new Set(seqs).size).toBe(12);
+  });
+
+  it("wakes a waiter parked on the session", async () => {
+    const woken = events.waitFor(journalKey(SESSION), {
+      afterSeq: 0,
+      timeoutMs: 1_000,
+    });
+    await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "arrived" });
+
+    // Opaque on purpose: the journal is the truth, the event is only a nudge.
+    await expect(woken).resolves.toMatchObject({ seq: 1, kind: "JOURNAL" });
+  });
+
+  /**
+   * The property the receiver depends on. A journal write happens after the
+   * ACK has been decided, so a store failure here must cost a notification and
+   * nothing else — never the response.
+   */
+  it("never throws, even when the store is broken", async () => {
+    const broken = new RecordService({
+      repository: new RecordRepository({
+        cache: {
+          get: () => Promise.reject(new Error("redis down")),
+          set: () => Promise.reject(new Error("redis down")),
+          delete: () => Promise.reject(new Error("redis down")),
+          has: () => Promise.reject(new Error("redis down")),
+          increment: () => Promise.reject(new Error("redis down")),
+          listAppend: () => Promise.reject(new Error("redis down")),
+          listRange: () => Promise.reject(new Error("redis down")),
+          ping: () => Promise.resolve(false),
+          close: () => Promise.resolve(),
+        },
+        transactionTtlMs: 1_000,
+        flowStatusTtlMs: 1_000,
+        expectationTtlMs: 1_000,
+        sessionTtlMs: 1_000,
+      }),
+      events,
+      mockEngine: engine,
+      expectationTtlMs: 1_000,
+      logger,
+    });
+
+    await expect(
+      broken.journal(SESSION, { kind: "INBOUND_ACK", summary: "lost" }),
+    ).resolves.toBeUndefined();
+    // And a drain riding on someone else's tool call degrades the same way.
+    await expect(broken.drainEvents(SESSION)).resolves.toBeUndefined();
+  });
+
+  describe("draining", () => {
+    it("returns nothing at all when there is nothing new", async () => {
+      await expect(service.drainEvents(SESSION)).resolves.toBeUndefined();
+    });
+
+    it("delivers each event exactly once", async () => {
+      await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "one" });
+
+      const first = await service.drainEvents(SESSION);
+      expect(first?.events.map((entry) => entry.summary)).toEqual(["one"]);
+      expect(first?.cursor).toBe(1);
+
+      await expect(service.drainEvents(SESSION)).resolves.toBeUndefined();
+
+      await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "two" });
+      const second = await service.drainEvents(SESSION);
+      expect(second?.events.map((entry) => entry.summary)).toEqual(["two"]);
+    });
+
+    /** A burst is throttled across calls, never silently discarded. */
+    it("caps the delta and counts what it withheld", async () => {
+      for (let index = 0; index < EVENTS_DELTA_LIMIT + 4; index++) {
+        await service.journal(SESSION, {
+          kind: "CHAIN_SENT",
+          summary: `entry ${String(index)}`,
+        });
+      }
+
+      const first = await service.drainEvents(SESSION);
+      expect(first?.events).toHaveLength(EVENTS_DELTA_LIMIT);
+      expect(first?.more).toBe(4);
+      // The cursor moved past what was *returned*, not past what was withheld.
+      expect(first?.cursor).toBe(EVENTS_DELTA_LIMIT);
+
+      const second = await service.drainEvents(SESSION);
+      expect(second?.events).toHaveLength(4);
+      expect(second?.more).toBe(0);
+    });
+
+    /** The recovery path: re-reading must not consume. */
+    it("readEvents never moves the cursor", async () => {
+      await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "one" });
+
+      await expect(service.readEvents(SESSION)).resolves.toHaveLength(1);
+      await expect(service.readEvents(SESSION)).resolves.toHaveLength(1);
+      await expect(service.eventCursor(SESSION)).resolves.toBe(0);
+
+      // ...and a drain after a read still delivers it.
+      const drained = await service.drainEvents(SESSION);
+      expect(drained?.events).toHaveLength(1);
+      // Which is exactly how a delta lost to a client error is recovered.
+      await expect(service.readEvents(SESSION, 0)).resolves.toHaveLength(1);
+    });
+
+    it("reads from a caller-supplied seq", async () => {
+      await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "one" });
+      await service.journal(SESSION, { kind: "INBOUND_ACK", summary: "two" });
+
+      await expect(service.readEvents(SESSION, 1)).resolves.toEqual([
+        expect.objectContaining({ seq: 2, summary: "two" }),
+      ]);
+    });
+  });
+
+  describe("claimFirst", () => {
+    it("answers true exactly once per name", async () => {
+      await expect(service.claimFirst("complete::txn-1")).resolves.toBe(true);
+      await expect(service.claimFirst("complete::txn-1")).resolves.toBe(false);
+      await expect(service.claimFirst("complete::txn-1")).resolves.toBe(false);
+      await expect(service.claimFirst("complete::txn-2")).resolves.toBe(true);
+    });
+
+    /** The reason it is an atomic increment rather than a flag on the record. */
+    it("answers true to exactly one of many concurrent claimants", async () => {
+      const claims = await Promise.all(
+        Array.from({ length: 10 }, () => service.claimFirst("complete::txn-3")),
+      );
+
+      expect(claims.filter(Boolean)).toHaveLength(1);
+    });
   });
 });

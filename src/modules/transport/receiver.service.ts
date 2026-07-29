@@ -10,19 +10,49 @@ import type { ReceiverRole } from "@/modules/catalog/catalog.schema.js";
 import { normaliseSubscriberUrl } from "@/modules/record/record.repository.js";
 import {
   unwrapSaved,
+  type AppendResult,
   type RecordService,
 } from "@/modules/record/record.service.js";
 import type {
+  Expectation,
   ExpectationScope,
   TransactionLocation,
+  TransactionRecord,
 } from "@/modules/record/record.schema.js";
 import {
   receiverScope,
   type SessionService,
 } from "@/modules/session/session.service.js";
 import type { Session } from "@/modules/session/session.schema.js";
+import {
+  primaryCode,
+  summariseFindings,
+  type ValidationVerdict,
+} from "@/modules/validate/validate.schema.js";
+import type { ValidateService } from "@/modules/validate/validate.service.js";
 
 const FORM_TYPES = new Set(["HTML_FORM", "DYNAMIC_FORM", "HTML_FORM_MULTI"]);
+
+/**
+ * How many sessions one unattributable refusal is announced to.
+ *
+ * This path is reachable by anyone who can POST to the endpoint, and the
+ * endpoint is deliberately unauthenticated — a third-party server has no MCP
+ * credentials and never will. The cap is what keeps a stranger's repeated bad
+ * call from being amplified across every session on a busy build.
+ */
+const UNATTRIBUTED_FANOUT_LIMIT = 10;
+
+/**
+ * Ceiling on a refused body kept as evidence.
+ *
+ * An accepted payload is stored whole, because it is part of a transaction we
+ * are answering for. A *refused* one belongs to nobody we can identify, so it
+ * is stored only far enough to recognise: a real `on_search` catalog runs to
+ * hundreds of kilobytes, and a participant looping on a dead endpoint would
+ * otherwise fill the store with them.
+ */
+const REFUSED_BODY_LIMIT = 32_000;
 
 /**
  * The inbound half: what happens when the participant under test calls us.
@@ -52,6 +82,8 @@ const FORM_TYPES = new Set(["HTML_FORM", "DYNAMIC_FORM", "HTML_FORM_MULTI"]);
  * | Validation failed                   | **200**| `{message:{ack:{status:"NACK"}}, error}` |
  * | Out of sequence                     | **200**| NACK `OUT_OF_SEQUENCE`, recorded |
  * | `context.action` ≠ the URL's action | **200**| NACK `ACTION_MISMATCH`, recorded |
+ * | Wrong `transaction_id` for the flow | **200**| NACK `TRANSACTION_MISMATCH`, recorded |
+ * | Its attempt was restarted away      | **200**| NACK `TRANSACTION_ABANDONED`, recorded |
  * | Malformed context                   | 400    | NACK envelope |
  * | Transaction belongs to another build| 412    | NACK `WRONG_ENDPOINT` |
  * | Its session has expired             | 412    | NACK `SESSION_EXPIRED` |
@@ -83,6 +115,12 @@ export interface InboundResult {
   transactionId?: string;
   /** Set when auto-advance should run once the ACK has been written. */
   chain?: { sessionId: string; transactionId: string };
+  /**
+   * Set when this call may have finished the flow, and nothing else is going
+   * to notice. Checked after the ACK, like chaining — and mutually exclusive
+   * with it, because `chainNext` reaches `COMPLETE` on its own.
+   */
+  complete?: { sessionId: string; transactionId: string };
 }
 
 export interface ReceiverServiceOptions {
@@ -91,6 +129,8 @@ export interface ReceiverServiceOptions {
   flows: FlowService;
   forms: FormsService;
   mockEngine: MockEngine;
+  /** L0 + L1 on what arrives, inside the ACK window. */
+  validate: ValidateService;
   logger: Logger;
 }
 
@@ -109,6 +149,7 @@ export class ReceiverService {
   readonly #flows: FlowService;
   readonly #forms: FormsService;
   readonly #mockEngine: MockEngine;
+  readonly #validate: ValidateService;
   readonly #logger: Logger;
 
   constructor(options: ReceiverServiceOptions) {
@@ -117,6 +158,7 @@ export class ReceiverService {
     this.#flows = options.flows;
     this.#forms = options.forms;
     this.#mockEngine = options.mockEngine;
+    this.#validate = options.validate;
     this.#logger = options.logger;
   }
 
@@ -221,10 +263,24 @@ export class ReceiverService {
       context,
       action,
       advertisedUri,
+      { body, messageId, timestamp },
     );
     if ("failure" in resolved) return resolved.failure;
     const { session, transactionId } = resolved;
     const sessionId = session.session_id;
+
+    /*
+     * 3a. The attempt this call belongs to was written off by `flow_restart`.
+     *     Checked before anything else about the call, because a run we have
+     *     abandoned is not a run whose step sequence is worth assessing.
+     */
+    if (resolved.record.abandoned) {
+      return this.#refuseAbandoned(session, resolved.record, action, {
+        body,
+        messageId,
+        timestamp,
+      });
+    }
 
     /*
      * 3b. The path said one action, the payload another. Resolve first so the
@@ -236,7 +292,7 @@ export class ReceiverService {
         "ACTION_MISMATCH",
         `This call arrived on the "${request.action}" endpoint but its context.action is "${action}".`,
       );
-      await this.#record(
+      const appended = await this.#record(
         session,
         transactionId,
         action,
@@ -245,6 +301,16 @@ export class ReceiverService {
         body,
         ackBody,
       );
+      await this.#journalInbound(session, {
+        flowId: resolved.record.flowId,
+        transactionId,
+        action,
+        nackCode: "ACTION_MISMATCH",
+        ...(appended.payloadId !== undefined
+          ? { payloadId: appended.payloadId }
+          : {}),
+        summary: `NACKed ${action}: it arrived on the "${request.action}" endpoint. Recorded as a finding.`,
+      });
       this.#logger.warn(
         { sessionId, transactionId, pathAction: request.action, action },
         "inbound action does not match the endpoint it arrived on",
@@ -253,7 +319,7 @@ export class ReceiverService {
     }
 
     /* 4. Match the call to a step the flow is actually waiting for. */
-    const runtime = await this.#flows.load(sessionId, transactionId);
+    const runtime = await this.#flows.load(sessionId, { transactionId });
     const flowStatus = await this.#records.getFlowStatus(
       transactionId,
       session.np.subscriber_url,
@@ -281,42 +347,66 @@ export class ReceiverService {
     );
 
     if (!step) {
+      const ackBody = nack(
+        "OUT_OF_SEQUENCE",
+        `This mock is not expecting "${action}" at this point in the flow.`,
+      );
       // Recorded anyway. An unexpected call is one of the most valuable things
       // a compliance run can catch, and dropping it would erase the evidence —
       // the mapper classifies it as out-of-sequence on the next read.
-      await this.#record(
+      const appended = await this.#record(
         session,
         transactionId,
         action,
         messageId,
         timestamp,
         body,
-        nack(
-          "OUT_OF_SEQUENCE",
-          `This mock is not expecting "${action}" at this point in the flow.`,
-        ),
+        ackBody,
       );
+      await this.#journalInbound(session, {
+        flowId: runtime.record.flowId,
+        transactionId,
+        action,
+        nackCode: "OUT_OF_SEQUENCE",
+        ...(appended.payloadId !== undefined
+          ? { payloadId: appended.payloadId }
+          : {}),
+        summary: `NACKed an unexpected ${action} — the flow is not waiting for it. Recorded as a finding.`,
+      });
       this.#logger.warn(
         { sessionId, transactionId, action },
         "inbound request matched no pending step",
       );
-      return {
-        status: 200,
-        body: nack(
-          "OUT_OF_SEQUENCE",
-          `This mock is not expecting "${action}" at this point in the flow.`,
-        ),
-        transactionId,
-      };
+      return { status: 200, body: ackBody, transactionId };
     }
 
-    /* 5. Run the step's own validator. */
-    const verdict = await this.#mockEngine.runValidate(
-      runtime.runner,
-      step.actionId,
-      body,
-      businessData,
-    );
+    /*
+     * 5. Judge it. Two independent validators, run concurrently.
+     *
+     * The flow's own `validate` decides whether this payload is right *for this
+     * step*; protocol validation decides whether it is a legal ONDC message at
+     * all. Neither subsumes the other, and they share no state — so they run
+     * together and the ACK costs the slower of the two rather than the sum.
+     * That matters here and nowhere else: this is the one path with a
+     * counterparty's socket held open while we think.
+     */
+    const [verdict, protocol] = await Promise.all([
+      this.#mockEngine.runValidate(
+        runtime.runner,
+        step.actionId,
+        body,
+        businessData,
+      ),
+      this.#validate.validate({
+        domain: request.domain,
+        version: request.version,
+        action,
+        payload: body,
+        direction: "inbound",
+        session,
+        transactionId,
+      }),
+    ]);
 
     if (!verdict.ok) {
       // The config's validator crashed, or broke its return contract. That is
@@ -326,7 +416,7 @@ export class ReceiverService {
         "VALIDATION_FUNCTION_ERROR",
         verdict.error?.message ?? "The validation function failed to run.",
       );
-      await this.#record(
+      const appended = await this.#record(
         session,
         transactionId,
         action,
@@ -335,15 +425,26 @@ export class ReceiverService {
         body,
         ackBody,
       );
+      await this.#journalInbound(session, {
+        flowId: runtime.record.flowId,
+        transactionId,
+        action,
+        nackCode: "VALIDATION_FUNCTION_ERROR",
+        ...(appended.payloadId !== undefined
+          ? { payloadId: appended.payloadId }
+          : {}),
+        summary: `NACKed ${action}: this flow's own validator failed to run. That is a config defect, not the participant's.`,
+      });
       return { status: 200, body: ackBody, transactionId };
     }
 
     if (verdict.result?.valid === false) {
+      const code = String(verdict.result.code ?? "VALIDATION_ERROR");
       const ackBody = nack(
-        String(verdict.result.code ?? "VALIDATION_ERROR"),
+        code,
         verdict.result.description ?? "Validation failed.",
       );
-      await this.#record(
+      const appended = await this.#record(
         session,
         transactionId,
         action,
@@ -351,13 +452,69 @@ export class ReceiverService {
         timestamp,
         body,
         ackBody,
+      );
+      await this.#journalInbound(session, {
+        flowId: runtime.record.flowId,
+        transactionId,
+        action,
+        nackCode: code,
+        ...(appended.payloadId !== undefined
+          ? { payloadId: appended.payloadId }
+          : {}),
+        summary: `NACKed ${action} (${code}): ${verdict.result.description ?? "validation failed"}`,
+      });
+      return { status: 200, body: ackBody, transactionId };
+    }
+
+    /*
+     * 5b. The step accepted it, but it is not a legal message.
+     *
+     * Second, deliberately: the flow's own validator is step-specific and its
+     * code names the thing the integrator got wrong, so when both refuse, the
+     * more actionable answer should be the one on the wire. This branch is what
+     * catches the payloads a permissive step validator would wave through — a
+     * missing required field, a value outside its enum, a malformed context.
+     */
+    if (protocol.status === "invalid" && this.#validate.enforces) {
+      const code = primaryCode(protocol.findings);
+      const ackBody = nack(code, summariseFindings(protocol.findings));
+      const appended = await this.#record(
+        session,
+        transactionId,
+        action,
+        messageId,
+        timestamp,
+        body,
+        ackBody,
+      );
+      await this.#journalInbound(session, {
+        flowId: runtime.record.flowId,
+        transactionId,
+        action,
+        nackCode: code,
+        ...(appended.payloadId !== undefined
+          ? { payloadId: appended.payloadId }
+          : {}),
+        summary:
+          `NACKed ${action}: it is not spec-compliant (${String(protocol.findings.length)} ` +
+          `finding${protocol.findings.length === 1 ? "" : "s"}). ${summariseFindings(protocol.findings, 2)}`,
+      });
+      this.#logger.info(
+        {
+          sessionId,
+          transactionId,
+          action,
+          findings: protocol.findings.length,
+          code,
+        },
+        "inbound payload failed protocol validation",
       );
       return { status: 200, body: ackBody, transactionId };
     }
 
     /* 6-7. Accepted: record it, then fold it into the business data. */
     const ackBody = ack();
-    await this.#record(
+    const appended = await this.#record(
       session,
       transactionId,
       action,
@@ -366,6 +523,21 @@ export class ReceiverService {
       body,
       ackBody,
     );
+    await this.#journalInbound(session, {
+      flowId: runtime.record.flowId,
+      transactionId,
+      action,
+      ...(appended.payloadId !== undefined
+        ? { payloadId: appended.payloadId }
+        : {}),
+      summary:
+        `ACKed ${action} from the participant, completing step "${step.actionId}".` +
+        // The ACK is the only thing the participant sees, so anything we
+        // noticed and did not act on has to be said here — this journal line is
+        // the only channel that reaches the model for an inbound call it was
+        // not parked on.
+        describeInbound(protocol),
+    });
     await this.#records.saveBusinessData(
       transactionId,
       session.np.subscriber_url,
@@ -390,7 +562,7 @@ export class ReceiverService {
       transactionId,
       ...(runtime.record.autoAdvance
         ? { chain: { sessionId, transactionId } }
-        : {}),
+        : { complete: { sessionId, transactionId } }),
     };
   }
 
@@ -471,7 +643,10 @@ export class ReceiverService {
    * 2. **By armed expectation.** A flow whose first step is the participant's
    *    — a mock BPP waiting for `search` — has no record yet, and its
    *    `transaction_id` is theirs to choose. The expectation is the standing
-   *    permission to create one.
+   *    permission to create one, and this is the *only* place a transaction is
+   *    opened from inbound traffic. Nothing was minted in advance: `flow_start`
+   *    deliberately persists nothing, precisely so the id that ends up on the
+   *    books is the id that was on the wire.
    *
    * Neither ⇒ 412, which is what the workbench answers and says why.
    */
@@ -480,8 +655,11 @@ export class ReceiverService {
     context: BecknContext,
     action: string,
     advertisedUri: string,
+    /** Enough to file the call as evidence when resolution itself refuses it. */
+    call: { body: unknown; messageId: string; timestamp: string },
   ): Promise<
-    { session: Session; transactionId: string } | { failure: InboundResult }
+    | { session: Session; transactionId: string; record: TransactionRecord }
+    | { failure: InboundResult }
   > {
     const transactionId =
       typeof context.transaction_id === "string" &&
@@ -522,7 +700,7 @@ export class ReceiverService {
       );
       if (!record) continue;
       this.#warnOnUriDrift(session, advertisedUri, transactionId);
-      return { session, transactionId };
+      return { session, transactionId, record };
     }
 
     /*
@@ -531,15 +709,22 @@ export class ReceiverService {
      */
     const elsewhere = located[0];
     if (elsewhere !== undefined && onThisEndpoint.length === 0) {
-      return {
-        failure: {
-          status: 412,
-          body: nack(
-            "WRONG_ENDPOINT",
-            `Transaction "${transactionId}" belongs to ${elsewhere.domain}/${elsewhere.version}/${elsewhere.role}, not ${request.domain}/${request.version}/${request.role}.`,
-          ),
-        },
-      };
+      const message = `Transaction "${transactionId}" belongs to ${elsewhere.domain}/${elsewhere.version}/${elsewhere.role}, not ${request.domain}/${request.version}/${request.role}.`;
+      // The one refusal of the three where a session *is* known: the index says
+      // whose transaction this is. Told to that session alone rather than
+      // broadcast — it is their participant that is calling the wrong door, and
+      // every other session on this endpoint is a bystander.
+      await this.#journalUnattributable({
+        scope,
+        sessionId: elsewhere.sessionId,
+        transactionId,
+        action,
+        advertisedUri,
+        code: "WRONG_ENDPOINT",
+        summary: `Refused ${action}: the participant called ${request.domain}/${request.version}/${request.role}, but this transaction lives on ${elsewhere.domain}/${elsewhere.version}/${elsewhere.role}.`,
+        call,
+      });
+      return { failure: { status: 412, body: nack("WRONG_ENDPOINT", message) } };
     }
 
     /* 2. An armed expectation. */
@@ -550,6 +735,20 @@ export class ReceiverService {
     });
 
     if (!expectation) {
+      // Nobody was listening for this action — but somebody on this endpoint is
+      // listening for *something*, and a participant calling an action we are
+      // not expecting is exactly what they would want to know about.
+      await this.#journalUnattributable({
+        scope,
+        transactionId,
+        action,
+        advertisedUri,
+        code: "NO_EXPECTATION",
+        summary:
+          `Refused ${action} from ${advertisedUri} quoting transaction ${transactionId}: ` +
+          "nothing on this endpoint was expecting it. It may belong to your run.",
+        call,
+      });
       return {
         failure: {
           status: 412,
@@ -564,6 +763,20 @@ export class ReceiverService {
 
     const session = await this.#loadSession(expectation.sessionId);
     if (!session) {
+      // The expectation named a session that is gone, so there is nobody left
+      // to tell — except whichever other sessions share this endpoint, one of
+      // which may be the participant's real intended target.
+      await this.#journalUnattributable({
+        scope,
+        transactionId,
+        action,
+        advertisedUri,
+        code: "SESSION_EXPIRED",
+        summary:
+          `Refused ${action}: it matched an expectation belonging to session ` +
+          `"${expectation.sessionId}", which has expired.`,
+        call,
+      });
       return {
         failure: {
           status: 412,
@@ -577,15 +790,40 @@ export class ReceiverService {
 
     this.#warnOnUriDrift(session, advertisedUri, transactionId);
 
-    await this.#records.createTransaction({
-      transactionId,
-      sessionId: session.session_id,
+    /*
+     * An expectation carries a `transactionId` only once its run is bound —
+     * that is, once the flow's first action has already crossed the wire and
+     * fixed the id for the rest of the flow. Arriving here with a *different*
+     * one means the participant changed transaction mid-flow: branch 1 could
+     * not find their id because it belongs to no transaction of ours.
+     *
+     * Adopting it would open a second record for a flow that already has one
+     * and split the transaction in half — the receiver writing to one, every
+     * read tool looking at the other. So it is refused and filed against the
+     * transaction it should have quoted, where a compliance run will find it.
+     */
+    if (
+      expectation.transactionId !== undefined &&
+      expectation.transactionId !== transactionId
+    ) {
+      return {
+        failure: await this.#refuseMismatch(
+          session,
+          scope,
+          expectation,
+          transactionId,
+          action,
+          call,
+        ),
+      };
+    }
+
+    const record = await this.#flows.adoptTransaction({
+      session,
       flowId: expectation.flowId,
-      subscriberType: session.np.type,
-      // The registered URL, never the advertised one — see CreateTransactionInput.
-      subscriberUrl: session.np.subscriber_url,
-      scope,
+      transactionId,
       autoAdvance: expectation.autoAdvance,
+      scope,
     });
 
     this.#logger.info(
@@ -595,10 +833,178 @@ export class ReceiverService {
         flowId: expectation.flowId,
         action,
       },
-      "opened a transaction from an armed expectation",
+      "opened a transaction from an armed expectation; the participant chose the id",
     );
 
-    return { session, transactionId };
+    return { session, transactionId, record };
+  }
+
+  /**
+   * Refuse a call that quotes the wrong transaction, and keep listening.
+   *
+   * Three things have to happen besides the NACK.
+   *
+   * The expectation is **put back** — `consumeExpectation` already took it, and
+   * a stray call must not be able to stop us listening for the real one.
+   *
+   * The body is stored **out of line**, not appended to the transaction. This
+   * call typically carries the action the flow is waiting for, so appending it
+   * would match the pending step and mark it `COMPLETE` — the flow would
+   * advance on a call we just refused. It is also, by its own `context`, part
+   * of a different transaction: replaying it as history of this one would be a
+   * lie about what this transaction contains.
+   *
+   * And the reason is written to `attention`, because a payload nothing points
+   * at is not evidence. That is what puts it in front of the caller on the next
+   * `flow_get_status`, alongside the handle to read it.
+   */
+  async #refuseMismatch(
+    session: Session,
+    scope: ExpectationScope,
+    expectation: Expectation,
+    quoted: string,
+    action: string,
+    call: { body: unknown; messageId: string; timestamp: string },
+  ): Promise<InboundResult> {
+    const expected = expectation.transactionId as string;
+
+    await this.#records.armExpectation(scope, {
+      sessionId: expectation.sessionId,
+      flowId: expectation.flowId,
+      transactionId: expected,
+      expectedAction: expectation.expectedAction,
+      subscriberUrl: expectation.subscriberUrl,
+      autoAdvance: expectation.autoAdvance,
+    });
+
+    const message =
+      `This flow is transaction "${expected}", but "${action}" quoted "${quoted}". ` +
+      "Every call after a flow's first action must carry the same transaction_id.";
+    const ackBody = nack("TRANSACTION_MISMATCH", message);
+
+    const payloadId = await this.#records.storePayload({
+      transactionId: expected,
+      subscriberUrl: session.np.subscriber_url,
+      direction: "inbound",
+      action,
+      messageId: call.messageId,
+      timestamp: call.timestamp,
+      body: call.body,
+      ackBody,
+    });
+
+    await this.#records.setAttention(expected, session.np.subscriber_url, {
+      kind: "TRANSACTION_MISMATCH",
+      message: `${message} Refused; read the payload with record_get_payload (${payloadId}).`,
+      at: new Date().toISOString(),
+    });
+
+    await this.#journalInbound(session, {
+      flowId: expectation.flowId,
+      transactionId: expected,
+      action,
+      nackCode: "TRANSACTION_MISMATCH",
+      payloadId,
+      // Attention rather than a plain NACK: the body is stored out of line, so
+      // it appears in no transaction's history and this line is the only thing
+      // that points at it.
+      attention: true,
+      summary: `Refused ${action}: it quoted transaction ${quoted}, but this flow is ${expected}. Body kept out of line.`,
+    });
+
+    this.#logger.warn(
+      {
+        sessionId: session.session_id,
+        transactionId: expected,
+        quoted,
+        action,
+        payloadId,
+      },
+      "inbound call quotes a different transaction_id than the flow it belongs to",
+    );
+
+    return { status: 200, body: ackBody, transactionId: expected };
+  }
+
+  /**
+   * Refuse a call for an attempt `flow_restart` wrote off.
+   *
+   * The id is still resolvable on purpose — `txn_index` outlives the restart so
+   * late traffic can be filed rather than bounced at the transport — so this is
+   * the branch that decides what "filed" means for a run we have abandoned.
+   *
+   * Recorded **out of line**, not appended, for both of `#refuseMismatch`'s
+   * reasons and one more. Appending would advance the abandoned attempt's
+   * derived map, marking a step complete on a run we just refused; it would
+   * also publish an event on `flow_run::{session}::{flow}`, which is the key a
+   * `flow_await` on the *current* attempt is parked on — waking it with a
+   * callback that belongs to the previous try is precisely the confusion the
+   * restart existed to clear up.
+   *
+   * The NACK is honest about what happened: the participant is calling about a
+   * test run that has been superseded, and ACKing it would say the opposite.
+   */
+  async #refuseAbandoned(
+    session: Session,
+    record: TransactionRecord,
+    action: string,
+    call: { body: unknown; messageId: string; timestamp: string },
+  ): Promise<InboundResult> {
+    const { transactionId, flowId } = record;
+    const attempt = record.abandoned?.attempt ?? 1;
+
+    const message =
+      `Transaction "${transactionId}" was attempt ${String(attempt)} of flow ` +
+      `"${flowId}" and has been abandoned. That run has been restarted; a new ` +
+      "attempt carries a new transaction_id.";
+    const ackBody = nack("TRANSACTION_ABANDONED", message);
+
+    const payloadId = await this.#records.storePayload({
+      transactionId,
+      subscriberUrl: session.np.subscriber_url,
+      direction: "inbound",
+      action,
+      messageId: call.messageId,
+      timestamp: call.timestamp,
+      body: call.body,
+      ackBody,
+    });
+
+    await this.#records.setAttention(
+      transactionId,
+      session.np.subscriber_url,
+      {
+        kind: "TRANSACTION_ABANDONED",
+        message: `${message} Refused; read the payload with record_get_payload (${payloadId}).`,
+        at: new Date().toISOString(),
+      },
+    );
+
+    await this.#journalInbound(session, {
+      flowId,
+      transactionId,
+      action,
+      nackCode: "TRANSACTION_ABANDONED",
+      payloadId,
+      attention: true,
+      summary:
+        `Refused ${action}: it belongs to attempt ${String(attempt)} of "${flowId}", which was restarted away. ` +
+        "The participant may still be driving the old run.",
+    });
+
+    this.#logger.warn(
+      {
+        sessionId: session.session_id,
+        transactionId,
+        flowId,
+        attempt,
+        action,
+        payloadId,
+      },
+      "inbound call arrived for an attempt that has been abandoned",
+    );
+
+    return { status: 200, body: ackBody, transactionId };
   }
 
   /**
@@ -657,7 +1063,7 @@ export class ReceiverService {
     timestamp: string,
     body: unknown,
     ackBody: unknown,
-  ): Promise<unknown> {
+  ): Promise<AppendResult> {
     return this.#records.appendApiEntry({
       transactionId,
       subscriberUrl: session.np.subscriber_url,
@@ -669,6 +1075,133 @@ export class ReceiverService {
       ackBody,
     });
   }
+
+  /**
+   * Note an inbound call in the session journal.
+   *
+   * Every call this endpoint takes a view on gets a line, because an inbound
+   * call is the one thing that happens entirely outside the model's control:
+   * unless it is parked in `flow_await` on precisely the right run at precisely
+   * the right moment, this is the only way it ever learns the call happened.
+   *
+   * Ordinary refusals are `INBOUND_NACK`; the two that leave a body the model
+   * should read are `ATTENTION`, so a busy journal still distinguishes "we
+   * refused it and the flow is unaffected" from "we refused it and there is
+   * something here for you". Never both for one call.
+   */
+  #journalInbound(
+    session: Session,
+    entry: {
+      flowId?: string;
+      transactionId: string;
+      action: string;
+      nackCode?: string;
+      payloadId?: string;
+      attention?: boolean;
+      summary: string;
+    },
+  ): Promise<void> {
+    return this.#records.journal(session.session_id, {
+      kind:
+        entry.attention === true
+          ? "ATTENTION"
+          : entry.nackCode === undefined
+            ? "INBOUND_ACK"
+            : "INBOUND_NACK",
+      ...(entry.flowId !== undefined ? { flow_id: entry.flowId } : {}),
+      transaction_id: entry.transactionId,
+      action: entry.action,
+      ack: entry.nackCode === undefined ? "ACK" : "NACK",
+      ...(entry.nackCode !== undefined ? { nack_code: entry.nackCode } : {}),
+      ...(entry.payloadId !== undefined ? { payload_id: entry.payloadId } : {}),
+      summary: entry.summary,
+    });
+  }
+
+  /**
+   * Tell whoever might care about a call we refused without knowing whose it was.
+   *
+   * ## The gap this fills
+   *
+   * `NO_EXPECTATION` and `SESSION_EXPIRED` are refusals made *before* a session
+   * is in hand — that is the definition of them — so there is no session to
+   * journal against and, until now, no trace of them anywhere but the log. Yet
+   * they are among the most diagnostic things this server sees: a participant
+   * calling back late, or on a transaction we never opened, or after its test
+   * session lapsed. A model driving a flow that has gone quiet has no other way
+   * to discover that its counterparty *is* calling — just not acceptably.
+   *
+   * So the entry goes to **every session armed on this endpoint**, and its kind
+   * says exactly what it is worth: `POSSIBLY_RELATED`. The endpoint is shared
+   * by every session on a build, and the wire genuinely cannot say more than
+   * that. Naming one session would be a guess presented as a fact.
+   *
+   * ## Bounded, because this path is reachable by an unauthenticated stranger
+   *
+   * The body is stored out of line and size-capped, the fan-out is capped, and
+   * the journal trims itself — so a participant hammering a dead endpoint costs
+   * a bounded amount of storage rather than an unbounded one. Best-effort
+   * throughout: this runs on a request that is already being refused, and
+   * nothing here may turn a clean 412 into a 500.
+   */
+  async #journalUnattributable(args: {
+    /** The endpoint the call arrived on; its armed sessions are the audience. */
+    scope: ExpectationScope;
+    /** Journal to exactly this session instead, when the call named one. */
+    sessionId?: string;
+    transactionId: string;
+    action: string;
+    advertisedUri: string;
+    code: string;
+    summary: string;
+    call: { body: unknown; messageId: string; timestamp: string };
+  }): Promise<void> {
+    try {
+      // Every live session on the endpoint, not just the ones with an armed
+      // expectation. A run that has *sent* its request and is waiting for the
+      // callback arms nothing at all — the receiver files that callback by
+      // `transaction_id` — and it is precisely the run whose participant is
+      // most likely to be the one calling badly.
+      const audience =
+        args.sessionId !== undefined
+          ? [args.sessionId]
+          : await this.#sessions.sessionsOnEndpoint(
+              args.scope,
+              UNATTRIBUTED_FANOUT_LIMIT,
+            );
+      if (audience.length === 0) return;
+
+      const payloadId = await this.#records.storePayload({
+        transactionId: args.transactionId,
+        // The URI it advertised, not one we registered — we do not know which
+        // participant this is, and pretending otherwise would mis-key it.
+        subscriberUrl: args.advertisedUri,
+        direction: "inbound",
+        action: args.action,
+        messageId: args.call.messageId,
+        timestamp: args.call.timestamp,
+        body: capBody(args.call.body),
+        ackBody: nack(args.code, args.summary),
+      });
+
+      for (const sessionId of audience) {
+        await this.#records.journal(sessionId, {
+          kind: "POSSIBLY_RELATED",
+          transaction_id: args.transactionId,
+          action: args.action,
+          ack: "NACK",
+          nack_code: args.code,
+          payload_id: payloadId,
+          summary: args.summary,
+        });
+      }
+    } catch (error) {
+      this.#logger.warn(
+        { err: error, ...args.scope, action: args.action },
+        "could not journal an unattributable refusal",
+      );
+    }
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -679,10 +1212,65 @@ export function ack(): unknown {
   return { message: { ack: { status: "ACK" } } };
 }
 
+/**
+ * What to add to an ACK's journal line about protocol validation.
+ *
+ * Empty when the payload passed cleanly — the overwhelmingly common case, and
+ * one where a sentence saying so on every callback would bury the lines that
+ * matter. The two states that speak are the ones the model would otherwise
+ * never learn: findings we chose not to act on (`advisory`), and a payload
+ * nobody checked (`unavailable`).
+ *
+ * Note that an ACK carrying findings is *not* a contradiction. Under `advisory`
+ * we accept the call and record what was wrong with it; the compliance report is
+ * where that lands. Refusing would be the alternative, and it is exactly what
+ * `enforce` does.
+ */
+export function describeInbound(verdict: ValidationVerdict): string {
+  if (verdict.status === "valid") return "";
+
+  if (verdict.status === "unavailable") {
+    return (
+      " Protocol validation did not run: " +
+      (verdict.unchecked[0]?.reason ?? "no layer could be checked") +
+      "."
+    );
+  }
+
+  return (
+    ` It has ${String(verdict.findings.length)} validation ` +
+    `finding${verdict.findings.length === 1 ? "" : "s"}, recorded but not enforced: ` +
+    `${summariseFindings(verdict.findings, 2)}.`
+  );
+}
+
 export function nack(code: string, message: string): unknown {
   return {
     message: { ack: { status: "NACK" } },
     error: { code, message },
+  };
+}
+
+/**
+ * A refused body, trimmed to what is worth keeping.
+ *
+ * Returns the body untouched when it is small enough — the common case, and the
+ * one where the model wants the whole thing. Over the limit it is replaced by a
+ * description plus a prefix: enough to see the context and recognise the call,
+ * without storing a catalog for a transaction that is not ours.
+ */
+export function capBody(body: unknown): unknown {
+  const serialised = JSON.stringify(body ?? null);
+  if (serialised === undefined) return null;
+
+  const bytes = Buffer.byteLength(serialised, "utf8");
+  if (bytes <= REFUSED_BODY_LIMIT) return body;
+
+  return {
+    _truncated: true,
+    _bytes: bytes,
+    _note: `This call was refused and its body exceeded ${String(REFUSED_BODY_LIMIT)} bytes, so only a prefix was kept.`,
+    _prefix: serialised.slice(0, REFUSED_BODY_LIMIT),
   };
 }
 

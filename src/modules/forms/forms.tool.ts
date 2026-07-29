@@ -7,6 +7,8 @@ import {
   SubmitFormOutput,
 } from "@/modules/forms/forms.schema.js";
 import type { FormsService } from "@/modules/forms/forms.service.js";
+import { eventsFor, renderEvents } from "@/modules/record/record.tool.js";
+import type { RecordService } from "@/modules/record/record.service.js";
 
 /**
  * The two tools a form step needs — and only when the participant hosts it.
@@ -38,11 +40,14 @@ export function renderForm(output: FetchFormOutput): string {
   }
 
   for (const warning of output.warnings) lines.push(`  ! ${warning}`);
-  lines.push("", output.instructions);
+  lines.push("", output.instructions, ...renderEvents(output.events));
   return lines.join("\n");
 }
 
-export function createFormsTools(service: FormsService): Registerable[] {
+export function createFormsTools(
+  service: FormsService,
+  records: RecordService,
+): Registerable[] {
   return [
     defineTool({
       name: "form_fetch",
@@ -64,12 +69,14 @@ export function createFormsTools(service: FormsService): Registerable[] {
         openWorldHint: true,
       },
       render: renderForm,
-      handler: (input) =>
-        service.fetchForm(
+      handler: async (input) => ({
+        ...(await service.fetchForm(
           input.session_id,
           input.transaction_id,
           input.step_key,
-        ),
+        )),
+        ...(await eventsFor(records, input.session_id)),
+      }),
     }),
 
     defineTool({
@@ -95,15 +102,18 @@ export function createFormsTools(service: FormsService): Registerable[] {
           `form ${output.step_key} submitted — submission_id ${output.submission_id}`,
           "",
           renderOutcome(output.outcome),
+          ...renderEvents(output.events),
         ].join("\n"),
-      handler: (input) =>
-        service.submitForm({
+      handler: async (input) => ({
+        ...(await service.submitForm({
           sessionId: input.session_id,
           transactionId: input.transaction_id,
           stepKey: input.step_key,
           fields: input.fields,
           submissionId: input.submission_id,
-        }),
+        })),
+        ...(await eventsFor(records, input.session_id)),
+      }),
     }),
   ];
 }

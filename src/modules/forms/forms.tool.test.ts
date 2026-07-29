@@ -6,7 +6,10 @@ import { createContainer, type Container } from "@/container.js";
 import { buildMcpServer } from "@/mcp/server.js";
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
-import { createFakeConfigServiceGateway } from "@/test/fakes.js";
+import {
+  createFakeConfigServiceGateway,
+  createFakeValidationGateway,
+} from "@/test/fakes.js";
 import type { Session } from "@/modules/session/session.schema.js";
 import {
   acceptsAction,
@@ -62,6 +65,7 @@ beforeEach(async () => {
   agent.disableNetConnect();
   container = await createContainer(config, {
     configServiceGateway: createFakeConfigServiceGateway(),
+    validationGateway: createFakeValidationGateway(),
     senderDispatcher: agent,
   });
   app = await buildHttpApp(container, config);
@@ -96,11 +100,13 @@ beforeEach(async () => {
     .reply(200, FORM_HTML)
     .persist();
 
-  const started = await container.services.flow.start({
+  await container.services.flow.start({
     sessionId,
     flowId: RUNNABLE_FORM_FLOW_ID,
   });
-  transactionId = started.runtime.record.transactionId;
+  // Unassigned until a payload crosses: this mock sends the flow's first
+  // action, so `reachFormStep` is what mints it.
+  transactionId = "";
 });
 
 afterEach(async () => {
@@ -126,8 +132,22 @@ function post(action: string, message: Record<string, unknown>) {
   });
 }
 
+/**
+ * Send the flow's first action.
+ *
+ * Named by flow rather than by transaction, because this call is what mints
+ * the transaction id — before it there is nothing to name.
+ */
+async function sendFirstAction(): Promise<void> {
+  const sent = await container.services.flow.proceed({
+    sessionId,
+    flowId: RUNNABLE_FORM_FLOW_ID,
+  });
+  transactionId = sent.transaction_id as string;
+}
+
 async function reachFormStep(): Promise<void> {
-  await container.services.flow.proceed({ sessionId, transactionId });
+  await sendFirstAction();
   await post("on_search", { catalog: { providers: [{ id: "provider-1" }] } });
   await container.services.flow.proceed({
     sessionId,
@@ -249,7 +269,7 @@ describe("form_submit over MCP", () => {
 
 describe("flow_await over MCP", () => {
   it("caps the wait and reports a timeout without erroring", async () => {
-    await container.services.flow.proceed({ sessionId, transactionId });
+    await sendFirstAction();
 
     const started = Date.now();
     const result = await client.callTool({
@@ -275,7 +295,7 @@ describe("flow_await over MCP", () => {
     // The wait is now measured in minutes, which is longer than most clients
     // will hold a tool call open unless the server keeps telling them it is
     // still working. A client that asked for progress must get some.
-    await container.services.flow.proceed({ sessionId, transactionId });
+    await sendFirstAction();
 
     const progress: number[] = [];
     const result = await client.callTool(
@@ -299,7 +319,7 @@ describe("flow_await over MCP", () => {
   }, 20_000);
 
   it("reports an event that already arrived, with what to do next", async () => {
-    await container.services.flow.proceed({ sessionId, transactionId });
+    await sendFirstAction();
     await post("on_search", { catalog: { providers: [{ id: "p1" }] } });
 
     const result = await client.callTool({

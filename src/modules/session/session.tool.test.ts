@@ -99,7 +99,11 @@ describe("session tools over MCP", () => {
     };
 
     expect(session.interaction_mode).toBe("llm_auto");
-    expect(session.auto_advance).toBe(false);
+    // Follows the interaction mode. An `llm_auto` caller has already said it
+    // supplies everything itself, so asking it to approve a step that needs
+    // nothing is a question it can only answer one way — and everything sent
+    // this way comes back as a CHAIN_SENT event, so nothing happens unseen.
+    expect(session.auto_advance).toBe(true);
     // The network's shape, not ours, and shared across sessions on this build:
     // a participant integrates against an endpoint, not a test run. np_type is
     // BAP here, so the mock is a BPP and advertises the `seller` URI.

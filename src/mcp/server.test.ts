@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import { parseConfig } from "@/config/env.js";
 import { createContainer } from "@/container.js";
 import { buildMcpServer, createServerFactory } from "@/mcp/server.js";
-import { createFakeConfigServiceGateway } from "@/test/fakes.js";
+import {
+  createFakeConfigServiceGateway,
+  createFakeValidationGateway,
+} from "@/test/fakes.js";
 
 /**
  * Guard tests for the scaffold's central invariant.
@@ -20,7 +23,10 @@ function boot() {
   const gateway = createFakeConfigServiceGateway();
   return {
     gateway,
-    container: createContainer(config, { configServiceGateway: gateway }),
+    container: createContainer(config, {
+      configServiceGateway: gateway,
+      validationGateway: createFakeValidationGateway(),
+    }),
   };
 }
 

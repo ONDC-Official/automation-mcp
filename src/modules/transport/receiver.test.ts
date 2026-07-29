@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildHttpApp, type App } from "@/app.js";
 import { parseConfig } from "@/config/env.js";
 import { createContainer, type Container } from "@/container.js";
-import { createFakeConfigServiceGateway } from "@/test/fakes.js";
+import {
+  createFakeConfigServiceGateway,
+  createFakeValidationGateway,
+  invalidFrom,
+  type FakeValidationGateway,
+} from "@/test/fakes.js";
+import { L1_MULTI_RULE } from "@/test/validation-fixtures.js";
 import type { Session } from "@/modules/session/session.schema.js";
 import { acceptsAction, receiverPath } from "@/test/mock-participant.js";
 import { RUNNABLE_BUILD, RUNNABLE_FLOW_ID } from "@/test/runnable-config.js";
@@ -24,6 +30,7 @@ const config = parseConfig({ NODE_ENV: "test", LOG_LEVEL: "silent" });
 let app: App;
 let container: Container;
 let agent: MockAgent;
+let validation: FakeValidationGateway;
 let sessionId: string;
 let session: Session;
 let transactionId: string;
@@ -86,8 +93,10 @@ function onSearch(
 beforeEach(async () => {
   agent = new MockAgent();
   agent.disableNetConnect();
+  validation = createFakeValidationGateway();
   container = await createContainer(config, {
     configServiceGateway: createFakeConfigServiceGateway(),
+    validationGateway: validation,
     senderDispatcher: agent,
   });
   app = await buildHttpApp(container, config);
@@ -104,11 +113,10 @@ beforeEach(async () => {
   session = created.session;
 
   acceptsAction(agent, NP, "search");
-  const started = await container.services.flow.start({
-    sessionId,
-    flowId: RUNNABLE_FLOW_ID,
-  });
-  transactionId = started.runtime.record.transactionId;
+  await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+  // No id yet, and deliberately so: this mock is the BAP here, so the flow's
+  // first action is ours to send and `sendSearch` is what mints it.
+  transactionId = "";
 });
 
 afterEach(async () => {
@@ -117,9 +125,21 @@ afterEach(async () => {
   await agent.close();
 });
 
-/** Send `search` so the flow is waiting on `on_search`. */
+/**
+ * Send `search` so the flow is waiting on `on_search`.
+ *
+ * Driven by `flowId`, because until this call lands there is no transaction to
+ * name — sending the flow's first action is what mints its id.
+ */
 async function sendSearch(): Promise<void> {
-  await container.services.flow.proceed({ sessionId, transactionId });
+  const outcome = await container.services.flow.proceed({
+    sessionId,
+    flowId: RUNNABLE_FLOW_ID,
+  });
+  if (outcome.transaction_id === undefined) {
+    throw new Error(`search did not go out: ${outcome.message}`);
+  }
+  transactionId = outcome.transaction_id;
 }
 
 describe("receiver — accepting a callback", () => {
@@ -131,10 +151,9 @@ describe("receiver — accepting a callback", () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ message: { ack: { status: "ACK" } } });
 
-    const status = await container.services.flow.status(
-      sessionId,
+    const status = await container.services.flow.status(sessionId, {
       transactionId,
-    );
+    });
     expect(status.sequence.map((step) => [step.key, step.status])).toEqual([
       ["search_1", "COMPLETE"],
       ["on_search_1", "COMPLETE"],
@@ -318,10 +337,9 @@ describe("receiver — refusing a callback", () => {
       error: { code: "OUT_OF_SEQUENCE" },
     });
 
-    const status = await container.services.flow.status(
-      sessionId,
+    const status = await container.services.flow.status(sessionId, {
       transactionId,
-    );
+    });
     // Recorded as a finding, and the flow did NOT advance past on_search.
     expect(status.missed_steps).toHaveLength(1);
     expect(status.missed_steps[0]?.action).toBe("on_confirm");
@@ -330,10 +348,15 @@ describe("receiver — refusing a callback", () => {
 });
 
 describe("receiver — opening a transaction from an expectation", () => {
-  it("creates the transaction when the participant moves first", async () => {
-    // A mock BPP waiting for `search` has no transaction yet: the participant
-    // chooses the transaction_id. The armed expectation is what permits us to
-    // create the record on arrival rather than answering 412.
+  /**
+   * A mock BPP waiting for `search` has no transaction yet, and the
+   * `transaction_id` is the participant's to choose. The armed expectation is
+   * what permits us to create the record on arrival rather than answering 412.
+   */
+  async function startBuyerFlow(): Promise<{
+    session: Session;
+    sessionId: string;
+  }> {
     const created = (await callTool("session_create", {
       subscriber_url: NP,
       np_type: "BAP",
@@ -341,33 +364,40 @@ describe("receiver — opening a transaction from an expectation", () => {
       version: RUNNABLE_BUILD.version,
       usecase: RUNNABLE_BUILD.usecase,
     })) as { session: Session };
-    const buyerSession = created.session.session_id;
 
     const started = await container.services.flow.start({
-      sessionId: buyerSession,
+      sessionId: created.session.session_id,
       flowId: RUNNABLE_FLOW_ID,
     });
     // Mock is BPP here, so `search` is the participant's — the loop waits.
     expect(started.outcome.outcome).toBe("WAITING");
-    await container.services.flow.proceed({
-      sessionId: buyerSession,
-      transactionId: started.runtime.record.transactionId,
-    });
+    return { session: created.session, sessionId: created.session.session_id };
+  }
+
+  function search(
+    transactionId: string,
+    messageId = "m-first",
+  ): Record<string, unknown> {
+    return {
+      context: {
+        action: "search",
+        transaction_id: transactionId,
+        message_id: messageId,
+        timestamp: new Date().toISOString(),
+        // Mock is BPP here, so the caller is the BAP and says so.
+        bap_uri: NP,
+      },
+      message: { intent: {} },
+    };
+  }
+
+  it("adopts the participant's transaction id, and opens exactly one record", async () => {
+    const { session: buyer, sessionId: buyerSession } = await startBuyerFlow();
 
     const response = await callback(
       "search",
-      {
-        context: {
-          action: "search",
-          transaction_id: "np-chosen-txn",
-          message_id: "m-first",
-          timestamp: new Date().toISOString(),
-          // Mock is BPP here, so the caller is the BAP and says so.
-          bap_uri: NP,
-        },
-        message: { intent: {} },
-      },
-      receiverPath(created.session, "search"),
+      search("np-chosen-txn"),
+      receiverPath(buyer, "search"),
     );
 
     expect(response.status).toBe(200);
@@ -378,6 +408,142 @@ describe("receiver — opening a transaction from an expectation", () => {
       NP,
     );
     expect(record.flowId).toBe(RUNNABLE_FLOW_ID);
+
+    // The whole point. `flow_start` used to mint an id of its own and file a
+    // record under it, so this call opened a *second* one and left the caller
+    // holding a handle that named nothing.
+    const ids = await container.services.record.listTransactionIds(
+      buyerSession,
+    );
+    expect(ids).toEqual(["np-chosen-txn"]);
+  });
+
+  it("reports the adopted id against the flow the caller started", async () => {
+    const { session: buyer, sessionId: buyerSession } = await startBuyerFlow();
+
+    await callback(
+      "search",
+      search("np-chosen-txn"),
+      receiverPath(buyer, "search"),
+    );
+
+    // The caller only ever knew the flow id; this is how it learns the rest.
+    const status = await container.services.flow.status(buyerSession, {
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    expect(status.transaction_id).toBe("np-chosen-txn");
+    expect(status.sequence[0]).toMatchObject({
+      key: "search_1",
+      status: "COMPLETE",
+    });
+  });
+
+  it("arms from flow_start alone, with no flow_proceed in between", async () => {
+    // A model that does what a WAITING outcome tells it calls flow_await, not
+    // flow_proceed. Arming only in `proceed` meant the participant's very first
+    // callback was refused 412 for a flow the caller had correctly started.
+    const { session: buyer } = await startBuyerFlow();
+
+    const response = await callback(
+      "search",
+      search("np-chosen-txn"),
+      receiverPath(buyer, "search"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ message: { ack: { status: "ACK" } } });
+  });
+
+  it("wakes a flow_await that parked before the id existed", async () => {
+    const { session: buyer, sessionId: buyerSession } = await startBuyerFlow();
+
+    const waiting = container.services.flow.awaitEvent({
+      sessionId: buyerSession,
+      flowId: RUNNABLE_FLOW_ID,
+      timeoutMs: 2_000,
+    });
+
+    await callback(
+      "search",
+      search("np-chosen-txn"),
+      receiverPath(buyer, "search"),
+    );
+
+    const result = await waiting;
+    expect(result.timedOut).toBe(false);
+    expect(result.transactionId).toBe("np-chosen-txn");
+    expect(result.event?.action).toBe("search");
+  });
+
+  it("refuses a later call that quotes a different transaction, and keeps listening", async () => {
+    const { session: buyer, sessionId: buyerSession } = await startBuyerFlow();
+
+    await callback(
+      "search",
+      search("np-chosen-txn"),
+      receiverPath(buyer, "search"),
+    );
+    // `on_search` is ours to send; the call after it arms the wait for
+    // `select`, and that expectation now carries the bound transaction id.
+    acceptsAction(agent, NP, "on_search");
+    await container.services.flow.proceed({
+      sessionId: buyerSession,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    const waiting = await container.services.flow.proceed({
+      sessionId: buyerSession,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    expect(waiting.outcome).toBe("WAITING");
+
+    const wrong = await callback(
+      "select",
+      {
+        context: {
+          action: "select",
+          transaction_id: "some-other-txn",
+          message_id: "m-wrong",
+          timestamp: new Date().toISOString(),
+          bap_uri: NP,
+        },
+        message: { order: {} },
+      },
+      receiverPath(buyer, "select"),
+    );
+
+    expect(wrong.status).toBe(200);
+    expect(wrong.body).toMatchObject({
+      message: { ack: { status: "NACK" } },
+      error: { code: "TRANSACTION_MISMATCH" },
+    });
+
+    // Filed as evidence against the transaction it should have quoted, without
+    // advancing the step it was pretending to be.
+    const status = await container.services.flow.status(buyerSession, {
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    expect(status.transaction_id).toBe("np-chosen-txn");
+    expect(status.attention?.kind).toBe("TRANSACTION_MISMATCH");
+    expect(
+      status.sequence.find((step) => step.key === "select_1")?.status,
+    ).toBe("LISTENING");
+
+    // ...and the expectation was put back, so the correct call still lands.
+    const right = await callback(
+      "select",
+      {
+        context: {
+          action: "select",
+          transaction_id: "np-chosen-txn",
+          message_id: "m-right",
+          timestamp: new Date(Date.now() + 1_000).toISOString(),
+          bap_uri: NP,
+        },
+        message: { order: {} },
+      },
+      receiverPath(buyer, "select"),
+    );
+    expect(right.body).toEqual({ message: { ack: { status: "ACK" } } });
   });
 });
 
@@ -494,6 +660,7 @@ describe("receiver — reachability surface", () => {
     });
     const guarded = await createContainer(authed, {
       configServiceGateway: createFakeConfigServiceGateway(),
+      validationGateway: createFakeValidationGateway(),
     });
     const guardedApp = await buildHttpApp(guarded, authed);
     await guardedApp.ready();
@@ -529,5 +696,278 @@ describe("receiver — reachability surface", () => {
     });
 
     expect(response.statusCode).toBe(200);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Refusals nobody can be told about directly                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The three refusals made *before* a session is in hand.
+ *
+ * Note the action every test uses: `on_status`, which nothing in the runnable
+ * flow is armed for. A stray `on_search` would match the expectation this
+ * session already has and take the mismatch path instead — a different branch
+ * entirely, and one that already knows whose call it is.
+ */
+describe("POSSIBLY_RELATED", () => {
+  const SCOPE = {
+    domain: RUNNABLE_BUILD.domain,
+    version: RUNNABLE_BUILD.version,
+    role: "buyer" as const,
+  };
+
+  /** Everything journaled for a session; piggyback has consumed none of it. */
+  const journalOf = (id: string) => container.services.record.readEvents(id);
+
+  const relatedFor = async (id: string) =>
+    (await journalOf(id)).filter((event) => event.kind === "POSSIBLY_RELATED");
+
+  function stray(
+    action: string,
+    transactionId = "belongs-to-nobody",
+    message: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      context: {
+        action,
+        transaction_id: transactionId,
+        message_id: "m-stray",
+        timestamp: new Date().toISOString(),
+        bpp_uri: NP,
+      },
+      message,
+    };
+  }
+
+  it("tells a session listening on the endpoint about a call it refused", async () => {
+    await sendSearch(); // now armed for on_search — but not for on_status
+
+    const response = await callback("on_status", stray("on_status"));
+    expect(response.status).toBe(412);
+    expect(response.body).toMatchObject({ error: { code: "NO_EXPECTATION" } });
+
+    const related = await relatedFor(sessionId);
+    expect(related).toHaveLength(1);
+    expect(related[0]).toMatchObject({
+      nack_code: "NO_EXPECTATION",
+      action: "on_status",
+      transaction_id: "belongs-to-nobody",
+      ack: "NACK",
+    });
+    // The kind is the honest part: it may be this session's call, and it may
+    // not. The endpoint is shared, and the wire cannot say more than that.
+    expect(related[0]?.summary).toContain("may belong to your run");
+  });
+
+  it("keeps the refused body readable behind the handle", async () => {
+    await sendSearch();
+    await callback(
+      "on_status",
+      stray("on_status", "belongs-to-nobody", { order: { id: "evidence" } }),
+    );
+
+    const [related] = await relatedFor(sessionId);
+    const payload = await container.services.record.requirePayload(
+      related?.payload_id ?? "",
+    );
+
+    // The whole call, context included — the point is to be able to recognise
+    // it, and the context is the half that says who was calling.
+    expect(payload.body).toMatchObject({
+      context: { action: "on_status", transaction_id: "belongs-to-nobody" },
+      message: { order: { id: "evidence" } },
+    });
+    expect(payload.direction).toBe("inbound");
+  });
+
+  it("journals nowhere when no session lives on the endpoint", async () => {
+    // A build this server has no session for. Nobody could plausibly own this
+    // call, so nobody is told about it.
+    const response = await callback(
+      "on_status",
+      stray("on_status"),
+      "/ONDC:NOBODY/9.9.9/buyer/on_status",
+    );
+
+    expect(response.status).toBe(412);
+    await expect(journalOf(sessionId)).resolves.toEqual([]);
+  });
+
+  it("reaches both sessions when two share the endpoint", async () => {
+    await sendSearch();
+
+    const otherNp = "https://other-np.example.com";
+    const other = (await callTool("session_create", {
+      subscriber_url: otherNp,
+      np_type: "BPP",
+      domain: RUNNABLE_BUILD.domain,
+      version: RUNNABLE_BUILD.version,
+      usecase: RUNNABLE_BUILD.usecase,
+    })) as { session: Session };
+    acceptsAction(agent, otherNp, "search");
+    await container.services.flow.start({
+      sessionId: other.session.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    await container.services.flow.proceed({
+      sessionId: other.session.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+
+    await callback("on_status", stray("on_status"));
+
+    for (const id of [sessionId, other.session.session_id]) {
+      const related = await relatedFor(id);
+      expect(related).toHaveLength(1);
+      expect(related[0]?.nack_code).toBe("NO_EXPECTATION");
+    }
+  });
+
+  it("tells the owning session alone when the call hit the wrong endpoint", async () => {
+    // Here the id *is* known — the index says whose transaction it is — so this
+    // is told to that session rather than broadcast. Their participant is the
+    // one calling the wrong door; everyone else is a bystander.
+    await sendSearch();
+
+    await callback(
+      "on_search",
+      onSearch(),
+      "/ONDC:OTHER/9.9.9/buyer/on_search",
+    );
+
+    const related = await relatedFor(sessionId);
+    expect(related).toHaveLength(1);
+    expect(related[0]).toMatchObject({
+      nack_code: "WRONG_ENDPOINT",
+      transaction_id: transactionId,
+    });
+  });
+
+  it("reports an expired session's refusal to whoever else is listening", async () => {
+    await sendSearch();
+
+    // An expectation naming a session that is not there — what a session TTL
+    // expiring mid-run leaves behind on a shared endpoint.
+    await container.services.record.armExpectation(SCOPE, {
+      sessionId: "00000000-0000-0000-0000-000000000000",
+      flowId: RUNNABLE_FLOW_ID,
+      expectedAction: "on_status",
+      subscriberUrl: NP,
+      autoAdvance: false,
+    });
+
+    const response = await callback("on_status", stray("on_status"));
+
+    expect(response.status).toBe(412);
+    expect(response.body).toMatchObject({ error: { code: "SESSION_EXPIRED" } });
+
+    const related = await relatedFor(sessionId);
+    expect(related).toHaveLength(1);
+    expect(related[0]?.nack_code).toBe("SESSION_EXPIRED");
+  });
+
+  /**
+   * This endpoint is unauthenticated by design — a third-party server has no
+   * MCP credentials and never will — so a stranger must not be able to park an
+   * unbounded body in the store by POSTing one.
+   */
+  it("caps the body it keeps for a refused call", async () => {
+    await sendSearch();
+
+    await callback(
+      "on_status",
+      stray("on_status", "belongs-to-nobody", {
+        catalog: {
+          providers: Array.from({ length: 2_000 }, (_, index) => ({
+            id: `provider-${String(index)}`,
+            descriptor: { long_desc: "x".repeat(200) },
+          })),
+        },
+      }),
+    );
+
+    const [related] = await relatedFor(sessionId);
+    const payload = await container.services.record.requirePayload(
+      related?.payload_id ?? "",
+    );
+
+    expect(payload.body).toMatchObject({ _truncated: true });
+    const stored = JSON.stringify(payload.body);
+    expect(stored.length).toBeLessThan(64_000);
+  });
+});
+
+describe("receiver — protocol validation", () => {
+  it("NACKs a callback that is not spec-compliant, and records it", async () => {
+    await sendSearch();
+    validation.setResult(invalidFrom(L1_MULTI_RULE));
+
+    const response = await callback("on_search", onSearch());
+
+    // 200, because a protocol refusal is a successful HTTP exchange carrying a
+    // NACK — the same rule the rest of this receiver follows.
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      message: { ack: { status: "NACK" } },
+      error: { code: "REQUIRED_CONTEXT_CODE_1" },
+    });
+
+    // Recorded as evidence, carrying the refusal — same shape the step
+    // validator's own NACK leaves behind, which is the point: a protocol
+    // refusal and a step refusal have to be equally visible to the report.
+    const record = await container.services.record.requireTransaction(
+      transactionId,
+      NP,
+    );
+    expect(record.apiList[1]).toMatchObject({
+      action: "on_search",
+      response: { message: { ack: { status: "NACK" } } },
+    });
+  });
+
+  it("ACKs when the oracle is unreachable, rather than blaming the participant", async () => {
+    // The test that matters. NACKing a compliant participant because *our*
+    // dependency was down writes our infrastructure failure into their
+    // compliance report, which is exactly what this must never do.
+    await sendSearch();
+    validation.setResult({ status: "unavailable", reason: "oracle was down" });
+
+    const response = await callback("on_search", onSearch());
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ message: { ack: { status: "ACK" } } });
+
+    const status = await container.services.flow.status(sessionId, {
+      transactionId,
+    });
+    expect(
+      status.sequence.find((step) => step.key === "on_search_1")?.status,
+    ).toBe("COMPLETE");
+  });
+
+  it("says in the journal that a callback went unvalidated", async () => {
+    await sendSearch();
+    validation.setResult({ status: "unavailable", reason: "oracle was down" });
+    await callback("on_search", onSearch());
+
+    const events = await container.services.record.readEvents(sessionId);
+    const ack = events.find((event) => event.kind === "INBOUND_ACK");
+
+    // The ACK is all the participant sees, so the journal is the only place
+    // this can be said — and for an inbound call the model was not parked on,
+    // the journal is its only channel.
+    expect(ack?.summary).toContain("Protocol validation did not run");
+  });
+
+  it("does not throw the callback away when the check itself breaks", async () => {
+    await sendSearch();
+    validation.setThrows(new Error("gateway exploded"));
+
+    const response = await callback("on_search", onSearch());
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ message: { ack: { status: "ACK" } } });
   });
 });

@@ -23,6 +23,11 @@ import {
   SenderService,
   type RequestSigner,
 } from "@/modules/transport/sender.service.js";
+import {
+  HttpValidationGateway,
+  type ValidationGateway,
+} from "@/modules/validate/validate.gateway.js";
+import { ValidateService } from "@/modules/validate/validate.service.js";
 
 /**
  * Boot-once singletons.
@@ -61,6 +66,16 @@ export interface HealthCheck {
   readonly name: string;
   /** Resolve for healthy; throw or resolve `false` for unhealthy. */
   check(): Promise<boolean | void>;
+  /**
+   * Whether this dependency being down should stop traffic reaching us.
+   *
+   * `true` means it should not: the probe still runs and still reports `down`,
+   * because knowing is the point, but `/ready` stays 200. For a dependency the
+   * server degrades gracefully without — validation, which fails open — pulling
+   * the instance out of rotation would turn a partial loss of function into a
+   * total outage.
+   */
+  readonly optional?: boolean;
 }
 
 export interface Container {
@@ -72,6 +87,7 @@ export interface Container {
     readonly record: RecordService;
     readonly flow: FlowService;
     readonly forms: FormsService;
+    readonly validate: ValidateService;
   };
   /** Where a participant reaches this server's inbound receiver. */
   readonly receiverPublicUrl: string;
@@ -120,6 +136,11 @@ export interface CreateContainerOptions {
    * participant's callbacks never arrive.
    */
   transport?: "http" | "stdio";
+  /**
+   * Override the L0/L1 validation oracle. **Tests must always pass one** — the
+   * default reaches the real api-service over the network.
+   */
+  validationGateway?: ValidationGateway;
   /** Override the outbound HTTP dispatcher, e.g. undici's `MockAgent`. */
   senderDispatcher?: ConstructorParameters<
     typeof SenderService
@@ -215,6 +236,8 @@ export async function createContainer(
     transactionTtlMs: config.TRANSACTION_TTL_MS,
     flowStatusTtlMs: config.FLOW_STATUS_TTL_MS,
     expectationTtlMs: config.EXPECTATION_TTL_MS,
+    // The journal is scoped to the session, so it lives and dies with one.
+    sessionTtlMs: config.SESSION_TTL_MS,
   });
 
   const flowRepository = new FlowRepository({
@@ -254,6 +277,28 @@ export async function createContainer(
     logger,
   });
 
+  // Protocol validation. The gateway shares the process-wide agent because the
+  // ~80ms TCP handshake it saves is paid inside the inbound ACK window.
+  const validationGateway =
+    options.validationGateway ??
+    new HttpValidationGateway({
+      baseUrl: config.VALIDATION_SERVICE_URL,
+      timeoutMs: config.VALIDATION_TIMEOUT_MS,
+      dispatcher: httpAgent,
+      logger,
+    });
+
+  const validate = new ValidateService({
+    gateway: validationGateway,
+    // The catalog cache, for the same reason it holds flow configs: a verdict is
+    // derived, re-computable, and keyed on a payload hash that a second replica
+    // would simply miss and re-fetch.
+    cache: catalogCache,
+    cacheTtlMs: config.VALIDATION_CACHE_TTL_MS,
+    mode: config.VALIDATION_MODE,
+    logger,
+  });
+
   const sender = new SenderService({
     logger,
     timeoutMs: config.SEND_TIMEOUT_MS,
@@ -271,6 +316,7 @@ export async function createContainer(
     sender,
     mockEngine,
     events,
+    validate,
     logger,
     receiverPublicUrl,
     mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
@@ -287,7 +333,7 @@ export async function createContainer(
       : {}),
   });
 
-  const services = { catalog, session, record, flow, forms } as const;
+  const services = { catalog, session, record, flow, forms, validate } as const;
 
   const inbound = new ReceiverService({
     sessions: session,
@@ -295,6 +341,7 @@ export async function createContainer(
     flows: flow,
     forms,
     mockEngine,
+    validate,
     logger,
   });
 
@@ -323,6 +370,15 @@ export async function createContainer(
       // nothing.
       name: "cache-store",
       check: () => stateStore.ping(),
+    },
+    {
+      // Optional on purpose. Validation fails open: an unreachable oracle means
+      // payloads go unjudged, not that flows stop. Degrading readiness would
+      // pull this instance out of rotation and turn a partial loss of function
+      // into a total one — while the participant under test is mid-transaction.
+      name: "validation-service",
+      optional: true,
+      check: () => validationGateway.ping(),
     },
   ];
 

@@ -5,8 +5,12 @@ import type { RecordService } from "@/modules/record/record.service.js";
 import {
   GetDataInput,
   GetDataOutput,
+  GetEventsInput,
+  GetEventsOutput,
   GetPayloadInput,
   GetPayloadOutput,
+  type EventsDelta,
+  type SessionEvent,
 } from "@/modules/record/record.schema.js";
 import type { SessionService } from "@/modules/session/session.service.js";
 
@@ -26,6 +30,63 @@ const DEFAULT_MAX_BYTES = 20_000;
 
 /** Business-data values above this are described rather than returned. */
 const DATA_VALUE_LIMIT = 4_000;
+
+/** Default page size for an explicit journal read. */
+const DEFAULT_EVENT_LIMIT = 50;
+
+/* -------------------------------------------------------------------------- */
+/* Piggyback delivery                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Drain the session's journal into the shape every tool result spreads.
+ *
+ * Called **after** a tool's real work, never before — so a `flow_proceed` that
+ * sends a payload reports its own send, and a `flow_await` that unblocks on a
+ * callback reports the callback it unblocked on. Draining first would deliver
+ * every result one call late, which for the tool that exists to tell you
+ * something arrived is the same as not delivering it.
+ *
+ * Lives here, next to the journal it reads, and is imported by the other tool
+ * modules the way they already import `renderOutcome` from `flow.tool.ts`.
+ * Never throws: `drainEvents` swallows its own failures, because a journal
+ * problem must not become a failed `flow_proceed`.
+ */
+export async function eventsFor(
+  records: RecordService,
+  sessionId: string,
+): Promise<{ events?: EventsDelta }> {
+  const delta = await records.drainEvents(sessionId);
+  return delta ? { events: delta } : {};
+}
+
+/** One journal line, as the model reads it. */
+export function renderEvent(event: SessionEvent): string {
+  const tail = [
+    ...(event.nack_code !== undefined ? [event.nack_code] : []),
+    ...(event.payload_id !== undefined
+      ? [`payload ${event.payload_id}`]
+      : []),
+  ].join(" · ");
+  return `  • ${event.kind}${tail === "" ? "" : ` [${tail}]`} — ${event.summary}`;
+}
+
+/**
+ * The events block appended to every rendered tool result.
+ *
+ * Returns an empty array rather than an empty string so callers can splice it
+ * into their own line list without deciding whether a blank line is wanted.
+ */
+export function renderEvents(delta: EventsDelta | undefined): string[] {
+  if (delta === undefined || delta.events.length === 0) return [];
+  return [
+    "",
+    `since your last call (${String(delta.events.length)} event${
+      delta.events.length === 1 ? "" : "s"
+    }${delta.more > 0 ? `, ${String(delta.more)} more — call record_get_events` : ""}):`,
+    ...delta.events.map(renderEvent),
+  ];
+}
 
 export function renderPayload(
   output: GetPayloadOutput,
@@ -66,7 +127,10 @@ export function createRecordTools(
         openWorldHint: false,
       },
       render: (output) =>
-        renderPayload(output, JSON.stringify(output.payload, null, 2)),
+        [
+          renderPayload(output, JSON.stringify(output.payload, null, 2)),
+          ...renderEvents(output.events),
+        ].join("\n"),
       handler: async (input) => {
         // Resolving the session is the authorisation check: a payload handle
         // is a bare uuid, and without this any session could read any other's.
@@ -109,6 +173,7 @@ export function createRecordTools(
             ? `${serialised.slice(0, limit)}… [truncated at ${String(limit)} bytes]`
             : selected,
           ...(payload.ackBody !== undefined ? { ack: payload.ackBody } : {}),
+          ...(await eventsFor(records, input.session_id)),
         };
       },
     }),
@@ -129,7 +194,7 @@ export function createRecordTools(
         idempotentHint: true,
         openWorldHint: false,
       },
-      render: ({ transaction_id, data, omitted }) => {
+      render: ({ transaction_id, data, omitted, events }) => {
         const entries = Object.entries(data);
         const lines = [`business data for ${transaction_id}`];
         if (entries.length === 0) {
@@ -143,6 +208,7 @@ export function createRecordTools(
             `  ${entry.key} — ${String(entry.size_bytes)} bytes, omitted (request it by name)`,
           );
         }
+        lines.push(...renderEvents(events));
         return lines.join("\n");
       },
       handler: async (input) => {
@@ -175,7 +241,60 @@ export function createRecordTools(
           data[key] = value;
         }
 
-        return { transaction_id: input.transaction_id, data, omitted };
+        return {
+          transaction_id: input.transaction_id,
+          data,
+          omitted,
+          ...(await eventsFor(records, input.session_id)),
+        };
+      },
+    }),
+
+    defineTool({
+      name: "record_get_events",
+      title: "Re-read the session event journal",
+      description:
+        "Read this session's event journal without consuming it. You do not " +
+        "normally need this: every session-scoped tool result already carries " +
+        "the events since your last call, delivered once each. Reach for it " +
+        "when a result said `more` was outstanding, when you want to re-read " +
+        "something already delivered, or to recover a delta lost to an error — " +
+        "reading here never moves the delivery cursor, so it cannot consume " +
+        "what piggyback has not yet shown you.",
+      inputSchema: GetEventsInput,
+      outputSchema: GetEventsOutput,
+      annotations: {
+        // Genuinely read-only: cursor-neutral by design, which is the entire
+        // reason this tool can be used to recover from a lost delta.
+        readOnlyHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      render: ({ events, more, delivered_through }) => {
+        if (events.length === 0) {
+          return `no events past seq ${String(delivered_through)} in this session's journal`;
+        }
+        return [
+          `${String(events.length)} event(s)${more > 0 ? `, ${String(more)} more` : ""} · delivered through seq ${String(delivered_through)}`,
+          ...events.map(
+            (event) => `${String(event.seq).padStart(4)} ${event.at}\n${renderEvent(event)}`,
+          ),
+        ].join("\n");
+      },
+      handler: async (input) => {
+        await sessions.requireSession(input.session_id);
+
+        const matching = await records.readEvents(
+          input.session_id,
+          input.since_seq ?? 0,
+        );
+        const limit = input.limit ?? DEFAULT_EVENT_LIMIT;
+
+        return {
+          events: matching.slice(0, limit),
+          more: Math.max(0, matching.length - limit),
+          delivered_through: await records.eventCursor(input.session_id),
+        };
       },
     }),
   ];

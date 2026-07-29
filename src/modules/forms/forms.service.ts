@@ -98,7 +98,7 @@ export class FormsService {
     transactionId: string,
     stepKey?: string,
   ): Promise<FetchFormOutput> {
-    const runtime = await this.#flows.load(sessionId, transactionId);
+    const runtime = await this.#flows.load(sessionId, { transactionId });
     const step = await this.#resolveFormStep(runtime, stepKey);
 
     // WAITING-SUBMISSION means we are the host — there is nothing to fetch.
@@ -184,7 +184,9 @@ export class FormsService {
     fields?: Record<string, string> | undefined;
     submissionId?: string | undefined;
   }): Promise<SubmitFormOutput> {
-    const runtime = await this.#flows.load(args.sessionId, args.transactionId);
+    const runtime = await this.#flows.load(args.sessionId, {
+        transactionId: args.transactionId,
+      });
     const step = await this.#resolveFormStep(runtime, args.stepKey);
 
     let submissionId = args.submissionId;
@@ -272,10 +274,9 @@ export class FormsService {
     args: RenderHostedFormArgs,
   ): Promise<{ status: number; html: string }> {
     try {
-      const runtime = await this.#flows.load(
-        args.sessionId,
-        args.transactionId,
-      );
+      const runtime = await this.#flows.load(args.sessionId, {
+        transactionId: args.transactionId,
+      });
       const config = findConfigStep(runtime.config, args.formId);
       const encoded = config?.mock?.formHtml;
 
@@ -324,15 +325,20 @@ export class FormsService {
    * The id is minted here because we are the issuing side — the participant
    * quotes it back in its next payload, which is how the flow proves the form
    * was really completed.
+   *
+   * Auto-advance needs no hook here: `proceed` answers `SENT` for a completed
+   * form step and schedules the chain itself (`FlowService#scheduleChain`), so
+   * a hosted submission carries on down the flow exactly as an inbound callback
+   * does. The submitter still gets its page immediately — the chain is
+   * scheduled, not awaited.
    */
   async acceptSubmission(
     args: AcceptSubmissionArgs,
   ): Promise<{ status: number; html: string; json: unknown }> {
     try {
-      const runtime = await this.#flows.load(
-        args.sessionId,
-        args.transactionId,
-      );
+      const runtime = await this.#flows.load(args.sessionId, {
+        transactionId: args.transactionId,
+      });
       const submissionId = randomUUID();
 
       const data = await this.#records.getBusinessData(

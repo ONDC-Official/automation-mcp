@@ -77,6 +77,51 @@ const EnvSchema = z
     /** Session lifetime. 48h matches the workbench's own session TTL. */
     SESSION_TTL_MS: z.coerce.number().int().positive().default(172_800_000),
 
+    /* ---- Protocol validation (L0 + L1) ---- */
+
+    /**
+     * The api-service instance used as an L0 + L1 oracle.
+     *
+     * `POST {base}/{domain}/{version}/test/{action}` is ONIX's
+     * `standaloneValidator` module: the same JSON Schemas and the same compiled
+     * `x-validations` the live network enforces, with no side effects — nothing
+     * is proxied onward, nothing is stored, no session or transaction is
+     * created. Domain and version are baked into each instance at build time,
+     * so an instance that does not serve a build answers 404 and validation
+     * reports `unavailable` rather than failing the payload.
+     */
+    VALIDATION_SERVICE_URL: z
+      .url()
+      .default("https://workbench.ondc.tech/api-service"),
+    /**
+     * Ceiling on one validation call.
+     *
+     * Deliberately far below `SEND_TIMEOUT_MS`, for the same reason
+     * `REDIS_COMMAND_TIMEOUT_MS` is small: this runs inside the inbound ACK
+     * window, and a dependency that has stopped answering must not hold the
+     * participant's connection open. On timeout the verdict is `unavailable`
+     * and the call is let through — see `VALIDATION_MODE`.
+     */
+    VALIDATION_TIMEOUT_MS: z.coerce.number().int().positive().default(2_000),
+    /**
+     * How hard a verdict bites.
+     *
+     * - `enforce` — an invalid payload is NACKed inbound and blocked outbound.
+     * - `advisory` — findings are recorded and journaled, nothing is blocked.
+     *   The honest setting while confirming the oracle agrees with the network.
+     * - `off` — no call is made at all.
+     *
+     * None of these change the *verdict*, only what the gates do with it, so a
+     * transaction's recorded findings never depend on a deployment flag.
+     */
+    VALIDATION_MODE: z.enum(["off", "advisory", "enforce"]).default("enforce"),
+    /** TTL for a cached verdict. Keyed on the payload's own bytes. */
+    VALIDATION_CACHE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(900_000),
+
     /* ---- Shared state store ---- */
 
     /**

@@ -4,7 +4,10 @@ import { buildHttpApp, type App } from "@/app.js";
 import { parseConfig, type Config } from "@/config/env.js";
 import { createContainer, type Container } from "@/container.js";
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
-import { createFakeConfigServiceGateway } from "@/test/fakes.js";
+import {
+  createFakeConfigServiceGateway,
+  createFakeValidationGateway,
+} from "@/test/fakes.js";
 
 /**
  * HTTP-level tests through `app.inject()` — the full stack (security hooks,
@@ -101,6 +104,7 @@ async function boot(config: Config, gateway?: ConfigServiceGateway) {
   container = await createContainer(config, {
     // Never let a readiness probe reach the real config-service.
     configServiceGateway: gateway ?? createFakeConfigServiceGateway(),
+    validationGateway: createFakeValidationGateway(),
   });
   app = await buildHttpApp(container, config);
   await app.ready();
@@ -247,6 +251,7 @@ describe("statelessness", () => {
 
     const containerA = await createContainer(config, {
       configServiceGateway: createFakeConfigServiceGateway(),
+      validationGateway: createFakeValidationGateway(),
     });
     const instanceA = await buildHttpApp(containerA, config);
     await instanceA.ready();

@@ -118,6 +118,59 @@ export const RUNNABLE_FORM_FLOW: UpstreamFlow = {
   ],
 };
 
+/**
+ * A flow with **two consecutive mock-owned steps**, neither needing input.
+ *
+ * `RUNNABLE_FLOW` alternates strictly — ours, theirs, ours, theirs — so it
+ * cannot show the thing auto-advance is for: carrying on past a step of our own
+ * without being asked. The `status` pair here exists purely so a chain has
+ * somewhere to go after a send that was not a callback.
+ *
+ * Note what is *absent*: `input`. A step that declares none is `RESPONDING`
+ * rather than `INPUT-REQUIRED`, which is exactly the condition auto-advance
+ * fires on.
+ */
+export const RUNNABLE_CHAIN_FLOW_ID = "Runnable_Loop_Chain";
+
+export const RUNNABLE_CHAIN_FLOW: UpstreamFlow = {
+  ...RUNNABLE_FLOW,
+  id: RUNNABLE_CHAIN_FLOW_ID,
+  description: "A loan flow with two mock-owned steps back to back.",
+  sequence: [
+    {
+      key: "search_1",
+      type: "search",
+      owner: "BAP",
+      description: "The buyer app searches for loan offers.",
+      expect: true,
+      unsolicited: false,
+      pair: null,
+      repeat: 1,
+    },
+    {
+      key: "status_1",
+      type: "status",
+      owner: "BAP",
+      description: "The buyer app asks for status, needing nothing to do it.",
+      expect: false,
+      unsolicited: false,
+      pair: "on_status_1",
+      repeat: 1,
+    },
+    {
+      key: "on_status_1",
+      type: "on_status",
+      owner: "BPP",
+      description: "The seller app answers.",
+      expect: false,
+      unsolicited: false,
+      pair: null,
+      repeat: 1,
+    },
+  ],
+  extraSequence: [],
+};
+
 /* -------------------------------------------------------------------------- */
 /* The executable half                                                         */
 /* -------------------------------------------------------------------------- */
@@ -142,8 +195,21 @@ async function generate(defaultPayload, sessionData) {
 }
 `);
 
+/**
+ * Rewrites `context` on its way out — including `transaction_id`.
+ *
+ * Published configs really do this, and it is why the loop asserts the
+ * transaction id after `generate` rather than trusting it. Left uncorrected,
+ * this step would put a foreign id on the wire, the participant would file its
+ * reply under that id, and the transaction would come apart on both sides. A
+ * fixture that generated clean payloads would never catch a regression there.
+ */
 const GENERATE_SELECT = b64(`
 async function generate(defaultPayload, sessionData) {
+  defaultPayload.context = {
+    ...defaultPayload.context,
+    transaction_id: "config-rewrote-this",
+  };
   defaultPayload.message = {
     order: {
       provider: { id: sessionData.providerId?.[0] ?? "unknown-provider" },
@@ -303,6 +369,19 @@ export function buildRunnableMockConfig(flowId: string): UpstreamMockConfig {
         validate: VALIDATE_OK,
         requirements: REQUIREMENTS_OK,
         formHtml: FORM_HTML,
+      }),
+      // The `RUNNABLE_CHAIN_FLOW` pair. Requirements deliberately unconditional:
+      // this step exists to be sendable the instant the one before it lands.
+      step("status", "status_1", "BAP", null, {
+        generate: GENERATE_ON,
+        validate: VALIDATE_OK,
+        requirements: REQUIREMENTS_OK,
+      }),
+      step("on_status", "on_status_1", "BPP", "status_1", {
+        generate: GENERATE_ON,
+        validate: VALIDATE_OK,
+        requirements: REQUIREMENTS_OK,
+        saveData: { orderState: "$.message.order.state" },
       }),
     ],
     transaction_history: [],

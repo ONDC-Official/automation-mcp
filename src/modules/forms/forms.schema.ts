@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { StepOutcome } from "@/modules/flow/flow.schema.js";
+import { EventsField } from "@/modules/record/record.schema.js";
 
 /**
  * Forms, which cut both ways.
@@ -89,6 +90,7 @@ export const FetchFormOutput = z.object({
   instructions: z
     .string()
     .describe("What to do next, given the mode and the role."),
+  ...EventsField,
 });
 export type FetchFormOutput = z.infer<typeof FetchFormOutput>;
 
@@ -131,5 +133,6 @@ export const SubmitFormOutput = z.object({
         "{success, submission_id} shape. Read it if the id looks wrong.",
     ),
   outcome: StepOutcome.describe("Where the flow stands now the form is done."),
+  ...EventsField,
 });
 export type SubmitFormOutput = z.infer<typeof SubmitFormOutput>;

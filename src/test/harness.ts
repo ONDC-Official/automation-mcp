@@ -7,7 +7,10 @@ import {
   type CreateContainerOptions,
 } from "@/container.js";
 import { buildMcpServer } from "@/mcp/server.js";
-import { createFakeConfigServiceGateway } from "@/test/fakes.js";
+import {
+  createFakeConfigServiceGateway,
+  createFakeValidationGateway,
+} from "@/test/fakes.js";
 
 /**
  * In-process client ↔ server harness — the MCP analogue of `app.inject()`.
@@ -45,6 +48,10 @@ export async function createHarness(
   const config = parseConfig({ NODE_ENV: "test", LOG_LEVEL: "silent" });
   const container = await createContainer(config, {
     configServiceGateway: createFakeConfigServiceGateway(),
+    // Like the config-service fake: the default must never reach the network.
+    // A suite whose result depends on a remote validator is a suite that fails
+    // for reasons unrelated to the change under test.
+    validationGateway: createFakeValidationGateway(),
     ...options,
   });
   const server = buildMcpServer(container);

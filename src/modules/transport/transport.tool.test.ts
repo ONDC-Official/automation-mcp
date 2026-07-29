@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseConfig } from "@/config/env.js";
 import { createContainer, type Container } from "@/container.js";
-import { createFakeConfigServiceGateway } from "@/test/fakes.js";
+import {
+  createFakeConfigServiceGateway,
+  createFakeValidationGateway,
+} from "@/test/fakes.js";
 import { createHarness, type Harness } from "@/test/harness.js";
 import { RUNNABLE_BUILD } from "@/test/runnable-config.js";
 
@@ -127,6 +130,7 @@ describe("the standalone receiver (stdio transport)", () => {
     });
     container = await createContainer(config, {
       configServiceGateway: createFakeConfigServiceGateway(),
+      validationGateway: createFakeValidationGateway(),
       transport: "stdio",
     });
 

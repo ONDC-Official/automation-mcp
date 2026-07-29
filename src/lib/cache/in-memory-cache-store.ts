@@ -1,4 +1,8 @@
-import type { CacheStore } from "@/lib/cache/cache-store.js";
+import {
+  sliceListRange,
+  type CacheStore,
+  type ListAppendOptions,
+} from "@/lib/cache/cache-store.js";
 
 /**
  * The default `CacheStore`: a `Map` with per-entry expiry.
@@ -45,15 +49,7 @@ export class InMemoryCacheStore implements CacheStore {
   }
 
   get<T>(key: string): Promise<T | undefined> {
-    const entry = this.#entries.get(key);
-    if (!entry) return Promise.resolve(undefined);
-
-    if (entry.expiresAt <= this.#now()) {
-      this.#entries.delete(key);
-      return Promise.resolve(undefined);
-    }
-
-    return Promise.resolve(entry.value as T);
+    return Promise.resolve(this.#live(key) as T | undefined);
   }
 
   set<T>(key: string, value: T, ttlMs: number): Promise<void> {
@@ -72,6 +68,58 @@ export class InMemoryCacheStore implements CacheStore {
   delete(key: string): Promise<void> {
     this.#entries.delete(key);
     return Promise.resolve();
+  }
+
+  /*
+   * The append family. Atomic here for free: a `Map` read and write in the same
+   * synchronous block cannot be interleaved by anything on this event loop, so
+   * these are one operation without doing anything to make them one. The
+   * Redis implementation has to spend a `MULTI` to buy the same property.
+   */
+
+  increment(key: string, ttlMs: number, by = 1): Promise<number> {
+    const current = this.#live(key);
+    // A non-numeric entry counts as absent rather than throwing: two shapes on
+    // one key is a defect, and refusing here would surface it as an outage in
+    // whichever unrelated call happened to run first.
+    const next = (typeof current === "number" ? current : 0) + by;
+    // `set` already turns a non-positive TTL into a delete, so the caller still
+    // gets the value it would have had and nothing lingers.
+    void this.set(key, next, ttlMs);
+    return Promise.resolve(next);
+  }
+
+  listAppend<T>(
+    key: string,
+    value: T,
+    options: ListAppendOptions,
+  ): Promise<void> {
+    const current = this.#live(key);
+    const list = Array.isArray(current) ? [...(current as T[]), value] : [value];
+    const trimmed =
+      options.maxLength !== undefined && list.length > options.maxLength
+        ? list.slice(-options.maxLength)
+        : list;
+    return this.set(key, trimmed, options.ttlMs);
+  }
+
+  listRange<T>(key: string, start = 0, end = -1): Promise<T[]> {
+    const current = this.#live(key);
+    if (!Array.isArray(current)) return Promise.resolve([]);
+    // Sliced into a fresh array so a caller cannot mutate stored state — the
+    // Redis store parses a new one every read, and the two must agree.
+    return Promise.resolve(sliceListRange(current as T[], start, end));
+  }
+
+  /** The stored value, or `undefined` if absent or expired. */
+  #live(key: string): unknown {
+    const entry = this.#entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.#now()) {
+      this.#entries.delete(key);
+      return undefined;
+    }
+    return entry.value;
   }
 
   async has(key: string): Promise<boolean> {

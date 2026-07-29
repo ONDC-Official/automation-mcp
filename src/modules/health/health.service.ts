@@ -10,6 +10,8 @@ export interface DependencyReport {
   readonly status: "up" | "down";
   readonly durationMs: number;
   readonly error?: string;
+  /** Reported so a `down` that did not degrade the verdict explains itself. */
+  readonly optional?: boolean;
 }
 
 export interface ReadinessReport {
@@ -32,6 +34,8 @@ async function runCheck(
     ).unref();
   });
 
+  const optional = check.optional === true ? { optional: true } : {};
+
   try {
     const result = await Promise.race([check.check(), timeout]);
     // A check may resolve `false` instead of throwing.
@@ -40,6 +44,7 @@ async function runCheck(
       name: check.name,
       status: "up",
       durationMs: Math.round(performance.now() - started),
+      ...optional,
     };
   } catch (error) {
     return {
@@ -47,6 +52,7 @@ async function runCheck(
       status: "down",
       durationMs: Math.round(performance.now() - started),
       error: error instanceof Error ? error.message : String(error),
+      ...optional,
     };
   }
 }
@@ -57,14 +63,23 @@ export class HealthService {
     private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
   ) {}
 
-  /** Runs every probe concurrently; one failure degrades the whole report. */
+  /**
+   * Runs every probe concurrently. One **required** failure degrades the report.
+   *
+   * An optional dependency that is down is still reported as down — a report
+   * that hid it would make a degraded server indistinguishable from a healthy
+   * one — but it does not change the verdict, and so does not cost the instance
+   * its traffic.
+   */
   async readiness(): Promise<ReadinessReport> {
     const checks = await Promise.all(
       this.checks.map((check) => runCheck(check, this.timeoutMs)),
     );
 
     return {
-      status: checks.some((check) => check.status === "down")
+      status: checks.some(
+        (check) => check.status === "down" && check.optional !== true,
+      )
         ? "degraded"
         : "ready",
       checks,

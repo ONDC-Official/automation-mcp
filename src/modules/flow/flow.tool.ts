@@ -8,14 +8,19 @@ import {
   AwaitOutput,
   ProceedInput,
   ProceedOutput,
+  RestartFlowInput,
+  RestartFlowOutput,
   StartFlowInput,
   StartFlowOutput,
   FlowStatusInput,
   FlowStatusOutput,
   type FlowStepState,
+  type RunSummary,
   type StepOutcome,
 } from "@/modules/flow/flow.schema.js";
 import type { FlowService } from "@/modules/flow/flow.service.js";
+import { eventsFor, renderEvents } from "@/modules/record/record.tool.js";
+import type { RecordService } from "@/modules/record/record.service.js";
 
 /**
  * The protocol edge of the loop — no business rules, no data access.
@@ -76,13 +81,54 @@ export function renderStep(step: FlowStepState): string {
   return `  ${mark} ${step.action.padEnd(18)} ${who}  ${step.key}${suffix}`;
 }
 
+/**
+ * Where every run stands, for a wait that named none of them.
+ *
+ * Ordered by how much they want attention, not by flow id: a session-scope wait
+ * ends with the model choosing what to do next, and the choice should be the
+ * first thing it reads rather than something it has to hunt for.
+ */
+export function renderRuns(runs: RunSummary[]): string[] {
+  if (runs.length === 0) return ["no runs open in this session — call flow_start"];
+
+  const rank: Record<string, number> = {
+    INPUT_REQUIRED: 0,
+    FORM_PENDING: 1,
+    READY: 2,
+    BLOCKED: 3,
+    WAITING: 4,
+    COMPLETE: 5,
+  };
+  const ordered = [...runs].sort(
+    (a, b) => (rank[a.outcome] ?? 9) - (rank[b.outcome] ?? 9),
+  );
+
+  return [
+    "runs in this session:",
+    ...ordered.map(
+      (run) =>
+        `  ${run.outcome.padEnd(15)} ${run.flow_id}` +
+        `${run.attempt > 1 ? ` (attempt ${String(run.attempt)})` : ""} — ${run.message}`,
+    ),
+  ];
+}
+
 export function renderStatus(status: FlowStatusOutput): string {
   const lines = [
-    `flow ${status.flow_id} · txn ${status.transaction_id} · ${status.flow_status}`,
-    `  mock plays ${status.mock_role} · seq ${String(status.seq)}`,
+    `flow ${status.flow_id} · txn ${status.transaction_id ?? "unassigned"} · ${status.flow_status}`,
+    `  mock plays ${status.mock_role} · attempt ${String(status.attempt)} · seq ${String(status.seq)}`,
     "",
     ...status.sequence.map(renderStep),
   ];
+
+  if (status.abandoned) {
+    lines.push(
+      "",
+      `abandoned: attempt ${String(status.abandoned.attempt)} was written off at ${status.abandoned.at}` +
+        `${status.abandoned.reason !== undefined ? ` — ${status.abandoned.reason}` : ""}`,
+      "  kept as evidence; the run has moved on to a later attempt.",
+    );
+  }
 
   if (status.extra_steps.length > 0) {
     lines.push("", "extra steps:", ...status.extra_steps.map(renderStep));
@@ -103,7 +149,7 @@ export function renderStatus(status: FlowStatusOutput): string {
     lines.push("", `attention: ${status.attention.message}`);
   }
 
-  lines.push("", renderOutcome(status.next));
+  lines.push("", renderOutcome(status.next), ...renderEvents(status.events));
   return lines.join("\n");
 }
 
@@ -172,6 +218,7 @@ function startAwaitHeartbeat(
 
 export function createFlowTools(
   service: FlowService,
+  records: RecordService,
   options: FlowToolOptions,
 ): Registerable[] {
   return [
@@ -179,13 +226,16 @@ export function createFlowTools(
       name: "flow_start",
       title: "Start a flow",
       description:
-        "Open a transaction for one flow and report what its first step needs. " +
+        "Open a run of one flow and report what its first step needs. " +
         "Returns the callback URL the participant under test must be able to " +
         "reach — every payload this server sends advertises it as bap_uri or " +
         "bpp_uri, so a participant that cannot reach it will never call back. " +
         "Fails immediately if the flow has no mock config or any step with no " +
         "owner, so a flow that cannot be driven is rejected before anything is " +
-        "sent. Drive the flow from here with flow_proceed and flow_await.",
+        "sent. `transaction_id` comes back null: it belongs to whoever sends " +
+        "the flow's first action, so when that is the participant it is theirs " +
+        "to choose and does not exist yet. Drive the run by flow_id with " +
+        "flow_proceed and flow_await, which report the id once it exists.",
       inputSchema: StartFlowInput,
       outputSchema: StartFlowOutput,
       annotations: {
@@ -198,12 +248,16 @@ export function createFlowTools(
       render: (output) =>
         [
           `flow ${output.flow_id} started`,
-          `  transaction: ${output.transaction_id}`,
+          `  transaction: ${
+            output.transaction_id ??
+            "not yet — minted by whoever sends the first action"
+          }`,
           `  mock plays:  ${output.mock_role}`,
           `  callback:    ${output.callback_url}`,
           `  auto-advance: ${output.auto_advance ? "on" : "off"}`,
           "",
           renderOutcome(output.outcome),
+          ...renderEvents(output.events),
         ].join("\n"),
       handler: async (input) => {
         const { runtime, outcome, autoAdvance } = await service.start({
@@ -215,12 +269,77 @@ export function createFlowTools(
 
         return {
           session_id: input.session_id,
-          transaction_id: runtime.record.transactionId,
+          transaction_id: runtime.bound ? runtime.record.transactionId : null,
           flow_id: input.flow_id,
           mock_role: runtime.session.mock_role,
           callback_url: service.callbackUrl(runtime.session),
           auto_advance: autoAdvance,
+          attempt: runtime.binding.attempt,
           outcome,
+          ...(await eventsFor(records, input.session_id)),
+        };
+      },
+    }),
+
+    defineTool({
+      name: "flow_restart",
+      title: "Restart a flow",
+      description:
+        "Abandon this run's current attempt and open a fresh one of the same " +
+        "flow, in the same session. Use it when a run has gone wrong and you " +
+        "want another go: a flow's state is derived by replaying what was " +
+        "exchanged, so a NACKed step or an out-of-sequence callback stays part " +
+        "of the history and flow_start would only resume it. " +
+        "**Nothing recorded is destroyed** — the abandoned attempt keeps its " +
+        "payloads and stays readable with record_get_payload, because a failed " +
+        "attempt is a compliance finding, not a mistake to erase. The new " +
+        "attempt starts unbound: transaction_id comes back null and the next " +
+        "action mints a fresh one. Prefer this over creating a second session; " +
+        "an abandoned session keeps competing for the participant's callbacks " +
+        "on the endpoint every session shares.",
+      inputSchema: RestartFlowInput,
+      outputSchema: RestartFlowOutput,
+      annotations: {
+        // Rewrites the binding and may arm an expectation, but destroys no
+        // recorded evidence and never puts a payload on the wire.
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+      render: (output) =>
+        [
+          `flow ${output.flow_id} restarted — attempt ${String(output.attempt)}`,
+          `  abandoned:   ${
+            output.abandoned_transaction_id ?? "nothing had been sent yet"
+          }`,
+          `  transaction: not yet — minted by whoever sends the first action`,
+          `  mock plays:  ${output.mock_role}`,
+          `  callback:    ${output.callback_url}`,
+          `  auto-advance: ${output.auto_advance ? "on" : "off"}`,
+          "",
+          renderOutcome(output.outcome),
+          ...renderEvents(output.events),
+        ].join("\n"),
+      handler: async (input) => {
+        const result = await service.restart({
+          sessionId: input.session_id,
+          flowId: input.flow_id,
+          reason: input.reason,
+        });
+
+        return {
+          session_id: input.session_id,
+          // Always null: a restarted run is unbound by definition.
+          transaction_id: null,
+          abandoned_transaction_id: result.abandonedTransactionId,
+          flow_id: input.flow_id,
+          mock_role: result.runtime.session.mock_role,
+          callback_url: service.callbackUrl(result.runtime.session),
+          auto_advance: result.autoAdvance,
+          attempt: result.attempt,
+          outcome: result.outcome,
+          ...(await eventsFor(records, input.session_id)),
         };
       },
     }),
@@ -229,11 +348,12 @@ export function createFlowTools(
       name: "flow_get_status",
       title: "Get flow status",
       description:
-        "Where a transaction has got to: every step with its status and who " +
-        "owes it, any exchanges that arrived off-sequence, and what the loop " +
-        "needs next. State is derived from the recorded exchanges on every " +
-        "call, so this is always current. Read it whenever you lose track; " +
-        "`next` says exactly which tool to call.",
+        "Where a run has got to: every step with its status and who owes it, " +
+        "any exchanges that arrived off-sequence, and what the loop needs " +
+        "next. State is derived from the recorded exchanges on every call, so " +
+        "this is always current. Name the run by flow_id (or transaction_id " +
+        "once it has one). Read it whenever you lose track; `next` says " +
+        "exactly which tool to call.",
       inputSchema: FlowStatusInput,
       outputSchema: FlowStatusOutput,
       annotations: {
@@ -242,8 +362,13 @@ export function createFlowTools(
         openWorldHint: false,
       },
       render: renderStatus,
-      handler: (input) =>
-        service.status(input.session_id, input.transaction_id),
+      handler: async (input) => ({
+        ...(await service.status(input.session_id, {
+          transactionId: input.transaction_id,
+          flowId: input.flow_id,
+        })),
+        ...(await eventsFor(records, input.session_id)),
+      }),
     }),
 
     defineTool({
@@ -258,7 +383,9 @@ export function createFlowTools(
         "declarations; call again with `inputs`. If the next move is the " +
         "participant's it comes back WAITING; call flow_await. Pass " +
         "`dry_run: true` to generate and inspect a payload without sending it, " +
-        "or `trigger_extra` to fire a named side-channel step.",
+        "or `trigger_extra` to fire a named side-channel step. " +
+        "Sending the flow's first action is what mints its transaction_id, " +
+        "which the answer then reports.",
       inputSchema: ProceedInput,
       outputSchema: ProceedOutput,
       annotations: {
@@ -269,27 +396,39 @@ export function createFlowTools(
         idempotentHint: false,
         openWorldHint: true,
       },
-      render: renderOutcome,
-      handler: (input) =>
-        service.proceed({
+      render: (output) =>
+        [renderOutcome(output), ...renderEvents(output.events)].join("\n"),
+      handler: async (input) => ({
+        ...(await service.proceed({
           sessionId: input.session_id,
           transactionId: input.transaction_id,
+          flowId: input.flow_id,
           inputs: input.inputs,
           triggerExtra: input.trigger_extra,
           dryRun: input.dry_run,
-        }),
+        })),
+        ...(await eventsFor(records, input.session_id)),
+      }),
     }),
 
     defineTool({
       name: "flow_await",
       title: "Wait for the participant",
       description:
-        "Block until the participant under test calls back, then report what " +
-        "arrived and what the loop needs next. Returns immediately if " +
-        "something already arrived after `after_seq` — pass the `seq` from your " +
-        "last call so nothing is seen twice and nothing is missed. " +
-        "`timed_out: true` just means nothing happened yet; call again to keep " +
-        "waiting. This is the tool to use instead of polling flow_get_status.",
+        "Block until something happens, then report it. Two scopes: " +
+        "**Name a flow_id (or transaction_id)** and it waits on that one run, " +
+        "returning as soon as the participant calls back — pass the `seq` from " +
+        "your last call as `after_seq` so nothing is seen twice. When the " +
+        "participant sends the flow's first action this is where you learn the " +
+        "transaction_id, because it was theirs to choose. " +
+        "**Name neither** and it waits on the whole session: any callback on " +
+        "any run, a step auto-advance sent, a refused call, a form submitted. " +
+        "That is the one to use when you have nothing to do — it needs no seq " +
+        "bookkeeping, and it comes back with `runs` telling you where every " +
+        "flow stands. Narrow what wakes it with `kinds` / `flow_ids`; anything " +
+        "filtered out is still reported, it just does not end the wait. " +
+        "`timed_out: true` means nothing happened yet — call again. Always " +
+        "prefer this over polling flow_get_status.",
       inputSchema: AwaitInput,
       outputSchema: AwaitOutput,
       annotations: {
@@ -299,22 +438,33 @@ export function createFlowTools(
         openWorldHint: true,
       },
       render: (output) => {
-        if (output.timed_out) {
-          return [
-            `nothing arrived (seq ${String(output.seq)}) — call flow_await again to keep waiting`,
-            "",
-            renderOutcome(output.next),
-          ].join("\n");
-        }
-        const event = output.event;
+        const head =
+          output.scope === "session"
+            ? output.timed_out
+              ? "nothing happened in this session — call flow_await again to keep watching"
+              : "something happened in this session"
+            : output.timed_out
+              ? `nothing arrived (seq ${String(output.seq)}) — call flow_await again to keep waiting`
+              : `${output.event?.kind ?? "EVENT"} ${output.event?.action ?? ""} (seq ${String(output.seq)})`;
+
+        const detail =
+          output.scope === "run" && !output.timed_out
+            ? [
+                ...(output.event?.payload_id !== undefined
+                  ? [`  payload: ${output.event.payload_id}`]
+                  : []),
+                ...(output.event?.detail !== undefined
+                  ? [`  ${output.event.detail}`]
+                  : []),
+              ]
+            : [];
+
         return [
-          `${event?.kind ?? "EVENT"} ${event?.action ?? ""} (seq ${String(output.seq)})`,
-          ...(event?.payload_id !== undefined
-            ? [`  payload: ${event.payload_id}`]
-            : []),
-          ...(event?.detail !== undefined ? [`  ${event.detail}`] : []),
-          "",
-          renderOutcome(output.next),
+          head,
+          ...detail,
+          ...renderEvents(output.events),
+          ...(output.runs !== undefined ? ["", ...renderRuns(output.runs)] : []),
+          ...(output.next !== undefined ? ["", renderOutcome(output.next)] : []),
         ].join("\n");
       },
       handler: async (input, tools) => {
@@ -332,8 +482,11 @@ export function createFlowTools(
           result = await service.awaitEvent({
             sessionId: input.session_id,
             transactionId: input.transaction_id,
+            flowId: input.flow_id,
             afterSeq: input.after_seq,
             timeoutMs,
+            kinds: input.kinds,
+            flowIds: input.flow_ids,
           });
         } finally {
           stopHeartbeat();
@@ -341,6 +494,8 @@ export function createFlowTools(
 
         return {
           timed_out: result.timedOut,
+          scope: result.scope,
+          transaction_id: result.transactionId,
           seq: result.seq,
           ...(result.event
             ? {
@@ -359,7 +514,16 @@ export function createFlowTools(
                 },
               }
             : {}),
-          next: result.next,
+          ...(result.next !== undefined ? { next: result.next } : {}),
+          ...(result.runs !== undefined ? { runs: result.runs } : {}),
+          // A session-scope wait drained the journal as its own exit condition,
+          // so its delta comes back on the result; draining again here would
+          // find nothing and lose the very events it blocked for. A run-scoped
+          // wait has not drained, and does so now — after the wait, so the
+          // callback it unblocked on is in the delta rather than one call late.
+          ...(result.events !== undefined
+            ? { events: result.events }
+            : await eventsFor(records, input.session_id)),
         };
       },
     }),

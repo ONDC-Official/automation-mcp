@@ -162,6 +162,204 @@ export function describeCacheStoreContract(
       });
     });
 
+    /* ------------------------- the append family ------------------------- */
+
+    /**
+     * These are the primitives the session journal is built on, and the
+     * property that matters is not "it counts" but "it counts *atomically*".
+     * A `get`-mutate-`set` would pass most of what follows and still lose
+     * entries under concurrency — so the concurrency test below is the one
+     * that carries the weight.
+     */
+    describe("increment", () => {
+      it("starts at one and accumulates", async () => {
+        await withStore(async (cache) => {
+          await expect(cache.increment("seq", 60_000)).resolves.toBe(1);
+          await expect(cache.increment("seq", 60_000)).resolves.toBe(2);
+          await expect(cache.increment("seq", 60_000)).resolves.toBe(3);
+        });
+      });
+
+      it("adds an explicit step", async () => {
+        await withStore(async (cache) => {
+          await expect(cache.increment("seq", 60_000, 5)).resolves.toBe(5);
+          await expect(cache.increment("seq", 60_000, 3)).resolves.toBe(8);
+        });
+      });
+
+      it("keeps counters on different keys independent", async () => {
+        await withStore(async (cache) => {
+          await cache.increment("a", 60_000);
+          await cache.increment("a", 60_000);
+          await expect(cache.increment("b", 60_000)).resolves.toBe(1);
+          await expect(cache.increment("a", 60_000)).resolves.toBe(3);
+        });
+      });
+
+      /**
+       * The whole point. Fired in the same tick, a read-modify-write hands both
+       * callers the same number; an atomic one cannot.
+       */
+      it("hands every concurrent caller a distinct number", async () => {
+        await withStore(async (cache) => {
+          const issued = await Promise.all(
+            Array.from({ length: 20 }, () => cache.increment("seq", 60_000)),
+          );
+
+          expect(new Set(issued).size).toBe(20);
+          expect([...issued].sort((a, b) => a - b)).toEqual(
+            Array.from({ length: 20 }, (_, index) => index + 1),
+          );
+        });
+      });
+
+      it("restarts once the counter has expired", async () => {
+        await withStore(async (cache) => {
+          await expect(cache.increment("seq", 50)).resolves.toBe(1);
+          await sleep(120);
+
+          await expect(cache.increment("seq", 60_000)).resolves.toBe(1);
+        });
+      });
+
+      it("treats a non-positive TTL as a delete", async () => {
+        await withStore(async (cache) => {
+          await cache.increment("seq", 60_000);
+          await cache.increment("seq", 0);
+
+          await expect(cache.has("seq")).resolves.toBe(false);
+          await expect(cache.increment("seq", 60_000)).resolves.toBe(1);
+        });
+      });
+    });
+
+    describe("listAppend / listRange", () => {
+      it("returns an absent list as empty rather than undefined", async () => {
+        await withStore(async (cache) => {
+          await expect(cache.listRange("never-written")).resolves.toEqual([]);
+        });
+      });
+
+      it("appends in order and reads the whole list by default", async () => {
+        await withStore(async (cache) => {
+          for (const seq of [1, 2, 3]) {
+            await cache.listAppend("log", { seq }, { ttlMs: 60_000 });
+          }
+
+          await expect(cache.listRange("log")).resolves.toEqual([
+            { seq: 1 },
+            { seq: 2 },
+            { seq: 3 },
+          ]);
+        });
+      });
+
+      it("round-trips nested entries", async () => {
+        await withStore(async (cache) => {
+          const entry = {
+            seq: 1,
+            kind: "INBOUND_NACK",
+            nested: { code: "OUT_OF_SEQUENCE", ids: ["a", "b"] },
+          };
+          await cache.listAppend("log", entry, { ttlMs: 60_000 });
+
+          await expect(cache.listRange("log")).resolves.toEqual([entry]);
+        });
+      });
+
+      /** `LRANGE` semantics: zero-based, end inclusive, negatives from the tail. */
+      it("slices with Redis index semantics", async () => {
+        await withStore(async (cache) => {
+          for (const seq of [1, 2, 3, 4, 5]) {
+            await cache.listAppend("log", seq, { ttlMs: 60_000 });
+          }
+
+          await expect(cache.listRange("log", 0, 2)).resolves.toEqual([1, 2, 3]);
+          await expect(cache.listRange("log", 2)).resolves.toEqual([3, 4, 5]);
+          await expect(cache.listRange("log", -2)).resolves.toEqual([4, 5]);
+          await expect(cache.listRange("log", 1, -2)).resolves.toEqual([2, 3, 4]);
+          // Out of range clamps; inverted is empty. Neither is an error.
+          await expect(cache.listRange("log", 0, 99)).resolves.toHaveLength(5);
+          await expect(cache.listRange("log", 3, 1)).resolves.toEqual([]);
+          await expect(cache.listRange("log", 99, 120)).resolves.toEqual([]);
+        });
+      });
+
+      it("trims to maxLength, keeping the newest", async () => {
+        await withStore(async (cache) => {
+          for (const seq of [1, 2, 3, 4, 5]) {
+            await cache.listAppend("log", seq, { ttlMs: 60_000, maxLength: 3 });
+          }
+
+          await expect(cache.listRange("log")).resolves.toEqual([3, 4, 5]);
+        });
+      });
+
+      /** Concurrent appends must all survive — that is what the cap is for. */
+      it("keeps every concurrent append", async () => {
+        await withStore(async (cache) => {
+          await Promise.all(
+            Array.from({ length: 20 }, (_, index) =>
+              cache.listAppend("log", index, { ttlMs: 60_000, maxLength: 50 }),
+            ),
+          );
+
+          const stored = await cache.listRange<number>("log");
+          expect(stored).toHaveLength(20);
+          expect([...stored].sort((a, b) => a - b)).toEqual(
+            Array.from({ length: 20 }, (_, index) => index),
+          );
+        });
+      });
+
+      /**
+       * A list that expired mid-flow would silently truncate the journal, so
+       * every append restarts the clock rather than letting the first one
+       * decide how long the whole log lives.
+       */
+      it("restarts the TTL on every append", async () => {
+        await withStore(async (cache) => {
+          await cache.listAppend("log", 1, { ttlMs: 250 });
+          await sleep(150);
+          await cache.listAppend("log", 2, { ttlMs: 250 });
+          await sleep(150);
+
+          // 300ms since the first write, but only 150ms since the refresh.
+          await expect(cache.listRange("log")).resolves.toEqual([1, 2]);
+        });
+      });
+
+      it("reports an expired list as empty", async () => {
+        await withStore(async (cache) => {
+          await cache.listAppend("log", 1, { ttlMs: 50 });
+          await sleep(120);
+
+          await expect(cache.listRange("log")).resolves.toEqual([]);
+        });
+      });
+
+      it("treats a non-positive TTL as a delete", async () => {
+        await withStore(async (cache) => {
+          await cache.listAppend("log", 1, { ttlMs: 60_000 });
+          await cache.listAppend("log", 2, { ttlMs: 0 });
+
+          await expect(cache.listRange("log")).resolves.toEqual([]);
+        });
+      });
+
+      /** A caller must never be able to edit stored state through a read. */
+      it("hands back a slice the caller owns", async () => {
+        await withStore(async (cache) => {
+          await cache.listAppend("log", { seq: 1 }, { ttlMs: 60_000 });
+
+          const first = await cache.listRange<{ seq: number }>("log");
+          first.push({ seq: 99 });
+
+          await expect(cache.listRange("log")).resolves.toEqual([{ seq: 1 }]);
+        });
+      });
+    });
+
     it("reports a healthy dependency through ping", async () => {
       await withStore(async (cache) => {
         await expect(cache.ping()).resolves.toBe(true);

@@ -1,11 +1,13 @@
 import { cacheKey, type CacheStore } from "@/lib/cache/cache-store.js";
 import type { FlowStatusCode } from "@/modules/flow/engine/engine-types.js";
-import type {
-  Expectation,
-  ExpectationScope,
-  PayloadRecord,
-  TransactionLocation,
-  TransactionRecord,
+import {
+  JOURNAL_LIMIT,
+  type Expectation,
+  type ExpectationScope,
+  type PayloadRecord,
+  type SessionEvent,
+  type TransactionLocation,
+  type TransactionRecord,
 } from "@/modules/record/record.schema.js";
 
 /**
@@ -37,6 +39,14 @@ export interface RecordRepositoryOptions {
   flowStatusTtlMs: number;
   /** Lifetime of an armed expectation. */
   expectationTtlMs: number;
+  /**
+   * Lifetime of the session journal and its cursor.
+   *
+   * The session's own TTL, not the transaction's: the journal outlives every
+   * transaction in it, and an entry the model has not read yet must not vanish
+   * because the run it describes expired.
+   */
+  sessionTtlMs: number;
 }
 
 export class RecordRepository {
@@ -44,12 +54,14 @@ export class RecordRepository {
   readonly #txnTtl: number;
   readonly #statusTtl: number;
   readonly #expectationTtl: number;
+  readonly #sessionTtl: number;
 
   constructor(options: RecordRepositoryOptions) {
     this.#cache = options.cache;
     this.#txnTtl = options.transactionTtlMs;
     this.#statusTtl = options.flowStatusTtlMs;
     this.#expectationTtl = options.expectationTtlMs;
+    this.#sessionTtl = options.sessionTtlMs;
   }
 
   /* ------------------------------ transaction ----------------------------- */
@@ -108,6 +120,18 @@ export class RecordRepository {
       payload,
       this.#txnTtl,
     );
+  }
+
+  /**
+   * Drop a stored body.
+   *
+   * The one caller is `RecordService#discardApiEntry`, undoing an outbound entry
+   * for a call that provably never left. Nothing that *did* cross the wire is
+   * ever deleted — this is a compliance server, and the payloads are the
+   * evidence.
+   */
+  deletePayload(payloadId: string): Promise<void> {
+    return this.#cache.delete(payloadKey(payloadId));
   }
 
   /* ----------------------------- flow status ------------------------------ */
@@ -249,6 +273,81 @@ export class RecordRepository {
       this.#txnTtl,
     );
   }
+
+  /* ------------------------------- journal -------------------------------- */
+
+  /**
+   * The next journal seq for a session, reserved before the entry is written.
+   *
+   * Atomic, and that is not a nicety: this is the one number every reader sorts
+   * and compares against its delivery cursor. A read-modify-write here would
+   * hand two concurrent writers the same seq, and the second entry would be
+   * invisible to any cursor that had already passed the first.
+   */
+  nextJournalSeq(sessionId: string): Promise<number> {
+    return this.#cache.increment(journalSeqKey(sessionId), this.#sessionTtl);
+  }
+
+  /**
+   * Append one entry, dropping the oldest past `JOURNAL_LIMIT`.
+   *
+   * Deliberately **not** read-modify-write — see `CLAUDE.md` on the three
+   * existing races and the standing rule against a fourth. The trim and the
+   * expiry ride the same atomic append.
+   */
+  appendJournal(sessionId: string, entry: SessionEvent): Promise<void> {
+    return this.#cache.listAppend(journalKey(sessionId), entry, {
+      ttlMs: this.#sessionTtl,
+      maxLength: JOURNAL_LIMIT,
+    });
+  }
+
+  /**
+   * Journal entries newer than `afterSeq`, oldest first.
+   *
+   * Filtered rather than sliced by index, because the cap means position and
+   * seq stop agreeing the moment the log has been trimmed once.
+   */
+  async journalSince(
+    sessionId: string,
+    afterSeq: number,
+  ): Promise<SessionEvent[]> {
+    const stored = await this.#cache.listRange<SessionEvent>(
+      journalKey(sessionId),
+    );
+    return stored
+      .filter((entry) => entry.seq > afterSeq)
+      .sort((a, b) => a.seq - b.seq);
+  }
+
+  /**
+   * Claim a one-shot marker, answering `true` for exactly one caller ever.
+   *
+   * Built on `increment` rather than a flag on the transaction record, and the
+   * reason is worth stating: the record is read-modify-written by
+   * `appendApiEntry` on every exchange, so a flag stored there would be
+   * clobbered by an append that started before the flag was written. A counter
+   * on its own key cannot lose that race, and "first" is exactly what an atomic
+   * increment answers.
+   */
+  async claimFirst(name: string): Promise<boolean> {
+    return (await this.#cache.increment(onceKey(name), this.#txnTtl)) === 1;
+  }
+
+  /** How far piggyback delivery has got. Absent reads as "nothing delivered". */
+  async getEventCursor(sessionId: string): Promise<number> {
+    return (
+      (await this.#cache.get<number>(journalCursorKey(sessionId))) ?? 0
+    );
+  }
+
+  setEventCursor(sessionId: string, seq: number): Promise<void> {
+    return this.#cache.set(
+      journalCursorKey(sessionId),
+      seq,
+      this.#sessionTtl,
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -358,6 +457,42 @@ export function transactionIndexKey(transactionId: string): string {
 
 export function sessionIndexKey(sessionId: string): string {
   return cacheKey("session_txns", sessionId);
+}
+
+/**
+ * The session's event journal — and, doing double duty, the `TransactionEvents`
+ * key a session-scope `flow_await` parks on.
+ *
+ * One string for both on purpose. The two namespaces are separate (one is
+ * `CacheStore`, the other is an in-process waiter map), so there is no
+ * collision to fear, and deriving them from a single helper is what guarantees
+ * the append and the wake-up can never end up talking about different sessions.
+ * `flowRunKey` earns its keep the same way.
+ */
+export function journalKey(sessionId: string): string {
+  return cacheKey("journal", sessionId.trim());
+}
+
+/** The journal's own counter. Session-wide, and a different space from a
+ * transaction's `seq`. */
+export function journalSeqKey(sessionId: string): string {
+  return cacheKey("journal_seq", sessionId.trim());
+}
+
+/**
+ * How much of the journal has been handed to the model.
+ *
+ * Server-side rather than a token the model carries, because the model must not
+ * have to do bookkeeping to be told what happened — the whole delivery scheme
+ * rests on it being unavoidable rather than opt-in.
+ */
+export function journalCursorKey(sessionId: string): string {
+  return cacheKey("journal_cursor", sessionId.trim());
+}
+
+/** A one-shot marker — see `claimFirst`. */
+export function onceKey(name: string): string {
+  return cacheKey("once", name);
 }
 
 /**

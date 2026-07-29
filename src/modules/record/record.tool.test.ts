@@ -283,3 +283,203 @@ describe("record resources", () => {
     expect(resourceText(result)).toContain("provider-399");
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Piggyback delivery                                                          */
+/* -------------------------------------------------------------------------- */
+
+describe("piggyback delivery", () => {
+  interface WithEvents {
+    events?: {
+      events: { seq: number; kind: string; summary: string }[];
+      more: number;
+      cursor: number;
+    };
+  }
+
+  async function call(
+    name: string,
+    args: Record<string, unknown> = {},
+  ): Promise<WithEvents> {
+    const result = await harness.client.callTool({
+      name,
+      arguments: { session_id: sessionId, ...args },
+    });
+    return result.structuredContent as WithEvents;
+  }
+
+  it("attaches nothing when nothing has happened", async () => {
+    const output = await call("session_get");
+
+    // Absent, not empty: a key that only ever says "nothing" is a key the model
+    // pays to read on every single call.
+    expect(output.events).toBeUndefined();
+  });
+
+  /**
+   * The core claim of this whole mechanism: an event journaled while the model
+   * was doing something else reaches it on its next call, whatever that call
+   * was about.
+   */
+  it("delivers an event journaled between two unrelated calls", async () => {
+    await call("session_get");
+
+    await records.journal(sessionId, {
+      kind: "INBOUND_ACK",
+      action: "on_search",
+      summary: "ACKed on_search from the participant.",
+    });
+
+    const output = await call("session_get");
+
+    expect(output.events?.events).toHaveLength(1);
+    expect(output.events?.events[0]).toMatchObject({
+      kind: "INBOUND_ACK",
+      summary: "ACKed on_search from the participant.",
+    });
+    expect(output.events?.more).toBe(0);
+  });
+
+  it("delivers exactly once, then stops", async () => {
+    await records.journal(sessionId, {
+      kind: "INBOUND_ACK",
+      summary: "first",
+    });
+
+    await expect(
+      call("session_get").then((output) => output.events?.events),
+    ).resolves.toHaveLength(1);
+    await expect(
+      call("session_get").then((output) => output.events),
+    ).resolves.toBeUndefined();
+  });
+
+  /** Any session-scoped tool drains — that is what makes it unavoidable. */
+  it("rides on every session-scoped tool, not just the flow ones", async () => {
+    const payloadId = await recordOnSearch();
+
+    for (const [name, args] of [
+      ["session_get", {}],
+      ["record_get_data", { transaction_id: "txn-1" }],
+      ["record_get_payload", { payload_id: payloadId }],
+    ] as const) {
+      await records.journal(sessionId, {
+        kind: "CHAIN_SENT",
+        summary: `before ${name}`,
+      });
+
+      const output = await call(name, args);
+      expect(output.events?.events.at(-1)?.summary).toBe(`before ${name}`);
+    }
+  });
+
+  it("throttles a burst across calls rather than dropping it", async () => {
+    for (let index = 0; index < 14; index++) {
+      await records.journal(sessionId, {
+        kind: "CHAIN_SENT",
+        summary: `entry ${String(index)}`,
+      });
+    }
+
+    const first = await call("session_get");
+    expect(first.events?.events).toHaveLength(10);
+    expect(first.events?.more).toBe(4);
+
+    const second = await call("session_get");
+    expect(second.events?.events).toHaveLength(4);
+    expect(second.events?.more).toBe(0);
+  });
+
+  it("renders the delta into the text the model actually reads", async () => {
+    await records.journal(sessionId, {
+      kind: "INBOUND_NACK",
+      nack_code: "OUT_OF_SEQUENCE",
+      summary: "NACKed an unexpected on_status.",
+    });
+
+    const result = await harness.client.callTool({
+      name: "session_get",
+      arguments: { session_id: sessionId },
+    });
+    const [content] = result.content as { text: string }[];
+
+    expect(content?.text).toContain("since your last call");
+    expect(content?.text).toContain("INBOUND_NACK");
+    expect(content?.text).toContain("OUT_OF_SEQUENCE");
+  });
+
+  describe("record_get_events", () => {
+    it("re-reads what piggyback already consumed, without consuming it", async () => {
+      await records.journal(sessionId, {
+        kind: "INBOUND_ACK",
+        summary: "one",
+      });
+      await call("session_get"); // consumes it
+
+      const first = (
+        await harness.client.callTool({
+          name: "record_get_events",
+          arguments: { session_id: sessionId },
+        })
+      ).structuredContent as {
+        events: { summary: string }[];
+        delivered_through: number;
+        more: number;
+      };
+
+      expect(first.events.map((event) => event.summary)).toEqual(["one"]);
+      expect(first.delivered_through).toBe(1);
+
+      // Reading is repeatable, and it did not move the cursor...
+      const second = (
+        await harness.client.callTool({
+          name: "record_get_events",
+          arguments: { session_id: sessionId },
+        })
+      ).structuredContent as { events: unknown[]; delivered_through: number };
+      expect(second.events).toHaveLength(1);
+      expect(second.delivered_through).toBe(1);
+
+      // ...so a later piggyback still delivers only what is genuinely new.
+      await records.journal(sessionId, {
+        kind: "INBOUND_ACK",
+        summary: "two",
+      });
+      const output = await call("session_get");
+      expect(output.events?.events.map((event) => event.summary)).toEqual([
+        "two",
+      ]);
+    });
+
+    it("walks the journal with since_seq and reports what is left", async () => {
+      for (let index = 0; index < 5; index++) {
+        await records.journal(sessionId, {
+          kind: "CHAIN_SENT",
+          summary: `entry ${String(index)}`,
+        });
+      }
+
+      const page = (
+        await harness.client.callTool({
+          name: "record_get_events",
+          arguments: { session_id: sessionId, since_seq: 2, limit: 2 },
+        })
+      ).structuredContent as {
+        events: { seq: number }[];
+        more: number;
+      };
+
+      expect(page.events.map((event) => event.seq)).toEqual([3, 4]);
+      expect(page.more).toBe(1);
+    });
+
+    it("refuses an unknown session rather than answering an empty journal", async () => {
+      const result = await harness.client.callTool({
+        name: "record_get_events",
+        arguments: { session_id: "00000000-0000-0000-0000-000000000000" },
+      });
+
+      expect(result.isError).toBe(true);
+    });
+  });
+});

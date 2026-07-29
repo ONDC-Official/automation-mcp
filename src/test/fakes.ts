@@ -1,4 +1,10 @@
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
+import { parseValidationMessage } from "@/modules/validate/validate.parse.js";
+import type {
+  GatewayResult,
+  ValidationGateway,
+  ValidationRequest,
+} from "@/modules/validate/validate.gateway.js";
 import {
   UpstreamBuilds,
   UpstreamFlow,
@@ -13,6 +19,8 @@ import {
 } from "@/test/ondc-fixtures.js";
 import {
   buildRunnableMockConfig,
+  RUNNABLE_CHAIN_FLOW,
+  RUNNABLE_CHAIN_FLOW_ID,
   RUNNABLE_FLOW,
   RUNNABLE_FLOW_ID,
   RUNNABLE_FORM_FLOW,
@@ -54,24 +62,23 @@ export function createFakeConfigServiceGateway(
     })),
   }));
 
-  // Captured flows plus the two whose configs actually execute, so a test can
+  // Captured flows plus the three whose configs actually execute, so a test can
   // choose between fidelity to the wire and a real worker round trip.
   const flows: UpstreamFlow[] = [
     ...UpstreamFlowsResponse.parse(FLOWS_RESPONSE).data.flows,
     UpstreamFlow.parse(RUNNABLE_FLOW),
     UpstreamFlow.parse(RUNNABLE_FORM_FLOW),
+    UpstreamFlow.parse(RUNNABLE_CHAIN_FLOW),
   ];
   const mockConfig = UpstreamMockConfig.parse(MOCK_CONFIG_RESPONSE);
-  const runnableConfigs = new Map<string, UpstreamMockConfig>([
-    [
-      RUNNABLE_FLOW_ID,
-      UpstreamMockConfig.parse(buildRunnableMockConfig(RUNNABLE_FLOW_ID)),
-    ],
-    [
-      RUNNABLE_FORM_FLOW_ID,
-      UpstreamMockConfig.parse(buildRunnableMockConfig(RUNNABLE_FORM_FLOW_ID)),
-    ],
-  ]);
+  const runnableConfigs = new Map<string, UpstreamMockConfig>(
+    [RUNNABLE_FLOW_ID, RUNNABLE_FORM_FLOW_ID, RUNNABLE_CHAIN_FLOW_ID].map(
+      (flowId) => [
+        flowId,
+        UpstreamMockConfig.parse(buildRunnableMockConfig(flowId)),
+      ],
+    ),
+  );
   const knownFlowIds =
     options.knownFlowIds ?? flows.map((flow: UpstreamFlow) => flow.id);
 
@@ -115,3 +122,69 @@ export const FIXTURE_BUILD: BuildRef = {
 
 /** A flow present in the fixtures, with both mock- and np-owned steps. */
 export const FIXTURE_FLOW_ID = "Personal_Loan_Offline";
+
+/* -------------------------------------------------------------------------- */
+/* The validation oracle                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A `ValidationGateway` under the test's control.
+ *
+ * Defaults to answering `valid`, because almost every test in this suite is
+ * about something else and a validator that started refusing payloads would
+ * break all of them for reasons unrelated to what they assert.
+ *
+ * `invalidFrom` builds its findings with the **real parser**, so a test that
+ * asserts on a code or a JSONPath is asserting against the grammar the live
+ * service actually emits rather than against hand-written findings that could
+ * drift from it.
+ */
+export interface FakeValidationGateway extends ValidationGateway {
+  readonly calls: { validate: number };
+  /** Every request judged, in order. */
+  readonly seen: ValidationRequest[];
+  /** Answer every subsequent call with this. */
+  setResult(result: GatewayResult): void;
+  /** Throw on every subsequent call — exercises the "a check threw" path. */
+  setThrows(error: Error): void;
+}
+
+export function createFakeValidationGateway(
+  initial: GatewayResult = { status: "valid" },
+): FakeValidationGateway {
+  let result = initial;
+  let thrown: Error | undefined;
+  const calls = { validate: 0 };
+  const seen: ValidationRequest[] = [];
+
+  return {
+    calls,
+    seen,
+    setResult(next: GatewayResult) {
+      result = next;
+      thrown = undefined;
+    },
+    setThrows(error: Error) {
+      thrown = error;
+    },
+    validate(request: ValidationRequest) {
+      calls.validate += 1;
+      seen.push(request);
+      if (thrown) return Promise.reject(thrown);
+      return Promise.resolve(result);
+    },
+    ping() {
+      return Promise.resolve(true);
+    },
+  };
+}
+
+/** An `invalid` result whose findings come from the real parser. */
+export function invalidFrom(message: string): GatewayResult {
+  const { findings, docsUrl } = parseValidationMessage(message);
+  return {
+    status: "invalid",
+    findings,
+    ...(docsUrl !== undefined ? { docsUrl } : {}),
+  };
+}

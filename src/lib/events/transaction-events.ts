@@ -23,9 +23,23 @@
  * would come with pub/sub behind this same interface.
  */
 
-/** What woke a waiter. Mirrors the kinds recorded on the transaction. */
+/**
+ * What woke a waiter. Mirrors the kinds recorded on the transaction, plus one.
+ *
+ * `JOURNAL` is deliberately opaque: it says "the session's event journal grew"
+ * and nothing else. A waiter on the session drains the journal from the store
+ * when it wakes, so putting the entry's own kind here would be a second copy of
+ * something already durable — and the first thing to go stale. It is the
+ * clearest expression of this class's rule that an event is a *hint*, never the
+ * change itself.
+ */
 export type TransactionEventKind =
-  "INBOUND" | "OUTBOUND" | "FORM_SUBMITTED" | "CHAIN_SENT" | "CHAIN_PAUSED";
+  | "INBOUND"
+  | "OUTBOUND"
+  | "FORM_SUBMITTED"
+  | "CHAIN_SENT"
+  | "CHAIN_PAUSED"
+  | "JOURNAL";
 
 export interface TransactionEvent {
   /** Position in the transaction's entry list. Strictly increasing. */

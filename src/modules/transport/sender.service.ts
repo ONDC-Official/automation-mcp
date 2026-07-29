@@ -19,6 +19,21 @@ import type { AckStatus } from "@/modules/record/record.schema.js";
  * connection refused, timeout, TLS error — is thrown, because there is nothing
  * to record and nothing the model can learn from the body.
  *
+ * ## A throw still has to say whether the call was delivered
+ *
+ * The caller records the outbound entry *before* the send (see
+ * `ApiEntry.sendState`), so on a throw it has to decide whether to withdraw that
+ * entry or keep it. The two cases are genuinely different and only this module
+ * can tell them apart, so every `UpstreamError` from here carries `delivery`:
+ *
+ * - **`unreachable`** — the connection never came up. Nothing crossed, the step
+ *   is still owed, and the entry is withdrawn so the model can retry cleanly.
+ * - **`uncertain`** — the request was written and the answer never arrived: a
+ *   header or body timeout, a reset mid-flight. It may well have been processed,
+ *   so the entry is kept and marked `failed`. **This is the default**, because
+ *   guessing "nothing happened" is what would put a duplicate call on a real
+ *   participant's wire.
+ *
  * ## The signing seam
  *
  * The body is serialised **once** and both hashed and sent as those exact
@@ -100,18 +115,35 @@ export class SenderService {
         ...(this.#dispatcher ? { dispatcher: this.#dispatcher } : {}),
       });
     } catch (error) {
-      // No exchange happened, so there is nothing to record and nothing the
-      // model can fix in the payload. This is the one throwing case.
+      // The exchange did not complete, so the model has no body to learn from.
+      // `delivery` is what tells the caller whether to withdraw the entry it
+      // recorded before this call or keep it as "outcome unknown".
       throw new UpstreamError(
         "network-participant",
         `could not reach ${url}: ${
           error instanceof Error ? error.message : String(error)
         }`,
-        { url, action },
+        { url, action, delivery: classifyDelivery(error) },
       );
     }
 
-    const text = await response.body.text();
+    let text: string;
+    try {
+      text = await response.body.text();
+    } catch (error) {
+      // Headers came back, so the request unambiguously crossed — only the
+      // answer is lost. Wrapped rather than left raw so the caller sees the same
+      // error shape (and the same `delivery` field) it sees for every other
+      // transport failure.
+      throw new UpstreamError(
+        "network-participant",
+        `${url} answered ${String(response.statusCode)} but the body never arrived: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        { url, action, delivery: "uncertain", http_status: response.statusCode },
+      );
+    }
+
     const body = parseBody(text);
     const ack = readAck(body);
 
@@ -122,6 +154,47 @@ export class SenderService {
 
     return { httpStatus: response.statusCode, ack, body, sentBytes, url };
   }
+}
+
+/**
+ * Whether a failed send got as far as the participant.
+ *
+ * `unreachable` is the **allow-list**, and that direction is deliberate. Every
+ * code here describes a connection that was never established, so the request
+ * provably never left this process and withdrawing the record of it is safe.
+ * Anything unrecognised falls through to `uncertain`, which keeps the entry —
+ * the wrong guess there costs a stuck run the model can restart, whereas the
+ * wrong guess the other way is a duplicate protocol call on a real
+ * participant's wire, which nothing can take back.
+ */
+export function classifyDelivery(
+  error: unknown,
+): "unreachable" | "uncertain" {
+  const codes = new Set<string>();
+  for (let cause: unknown = error, depth = 0; cause && depth < 5; depth++) {
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === "string") codes.add(code);
+    cause = (cause as { cause?: unknown }).cause;
+  }
+
+  const unreachable = [
+    "ECONNREFUSED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "UND_ERR_CONNECT_TIMEOUT",
+    // TLS: the handshake failed, so no request bytes were ever written.
+    "CERT_HAS_EXPIRED",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+  ];
+
+  return unreachable.some((code) => codes.has(code))
+    ? "unreachable"
+    : "uncertain";
 }
 
 function parseBody(text: string): unknown {

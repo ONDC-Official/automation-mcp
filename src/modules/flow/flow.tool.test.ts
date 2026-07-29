@@ -70,9 +70,25 @@ async function startFlow(
     name: "flow_start",
     arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID, ...extra },
   });
-  const output = result.structuredContent as Record<string, unknown>;
-  transactionId = String(output["transaction_id"]);
-  return output;
+  // Deliberately not read off the output: a run that has put nothing on the
+  // wire has no transaction id, and `proceed` is what mints one.
+  transactionId = "";
+  return result.structuredContent as Record<string, unknown>;
+}
+
+/** Advance the run, naming it by flow, and keep whatever id it reports. */
+async function proceed(
+  extra: Record<string, unknown> = {},
+): Promise<{ outcome: StepOutcome; isError: boolean }> {
+  const result = await call("flow_proceed", {
+    session_id: sessionId,
+    flow_id: RUNNABLE_FLOW_ID,
+    ...extra,
+  });
+  if (typeof result.outcome?.transaction_id === "string") {
+    transactionId = result.outcome.transaction_id;
+  }
+  return result;
 }
 
 describe("flow_start", () => {
@@ -102,22 +118,48 @@ describe("flow_start", () => {
     });
   });
 
-  it("refuses to reuse a transaction id already running", async () => {
-    await startFlow({ transaction_id: "fixed-txn" });
+  it("mints nothing and persists nothing", async () => {
+    const output = await startFlow();
 
+    // The id belongs to whoever sends the flow's first action. Here that is
+    // this mock, and it has not sent it yet.
+    expect(output["transaction_id"]).toBeNull();
+
+    const ids =
+      await harness.container.services.record.listTransactionIds(sessionId);
+    expect(ids).toEqual([]);
+  });
+
+  it("refuses to resume a transaction that does not exist", async () => {
+    // An explicit id means "resume that transaction". Conjuring a record for
+    // an id the caller invented is exactly what this change removes: it would
+    // put a transaction on the books that no payload ever referenced.
     const result = await harness.client.callTool({
       name: "flow_start",
       arguments: {
         session_id: sessionId,
         flow_id: RUNNABLE_FLOW_ID,
-        transaction_id: "fixed-txn",
+        transaction_id: "never-existed",
       },
     });
 
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({
-      error: { code: "conflict" },
+      error: { code: "not_found" },
     });
+  });
+
+  it("resumes a run that is already going, rather than conflicting", async () => {
+    acceptAll("search");
+    await startFlow();
+    const { outcome } = await proceed();
+    expect(outcome.outcome).toBe("SENT");
+    const minted = transactionId;
+
+    const again = await startFlow();
+
+    expect(again["transaction_id"]).toBe(minted);
+    expect(again["outcome"]).toMatchObject({ outcome: "WAITING" });
   });
 });
 
@@ -126,10 +168,7 @@ describe("flow_proceed — sending", () => {
     const { seen } = acceptAll("search");
     await startFlow();
 
-    const { outcome } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    const { outcome } = await proceed();
 
     expect(outcome).toMatchObject({
       outcome: "SENT",
@@ -153,11 +192,7 @@ describe("flow_proceed — sending", () => {
     const { seen } = acceptAll("search");
     await startFlow();
 
-    await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-      inputs: { query: "gold loan" },
-    });
+    await proceed({ inputs: { query: "gold loan" } });
 
     expect(seen[0]).toMatchObject({
       message: { intent: { descriptor: { name: "gold loan" } } },
@@ -168,10 +203,7 @@ describe("flow_proceed — sending", () => {
     acceptAll("search");
     await startFlow();
 
-    const { outcome } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    const { outcome } = await proceed();
 
     const payload = await harness.client.callTool({
       name: "record_get_payload",
@@ -201,15 +233,9 @@ describe("flow_proceed — sending", () => {
   it("waits once the next step is the participant's", async () => {
     acceptAll("search");
     await startFlow();
-    await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    await proceed();
 
-    const { outcome } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    const { outcome } = await proceed();
 
     expect(outcome).toMatchObject({
       outcome: "WAITING",
@@ -227,10 +253,7 @@ describe("flow_proceed — sending", () => {
       });
     await startFlow();
 
-    const { outcome, isError } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    const { outcome, isError } = await proceed();
 
     expect(isError).toBe(false);
     expect(outcome).toMatchObject({ outcome: "SENT", ack: "NACK" });
@@ -244,10 +267,7 @@ describe("flow_proceed — sending", () => {
       .replyWithError(new Error("ECONNREFUSED"));
     await startFlow();
 
-    const { isError } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    const { isError } = await proceed();
 
     expect(isError).toBe(true);
   });
@@ -260,10 +280,7 @@ describe("flow_proceed — gates", () => {
     acceptAll("search");
     acceptAll("select");
     await startFlow();
-    await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    await proceed();
 
     // Force the cursor past on_search by recording it directly.
     const records = harness.container.services.record;
@@ -278,11 +295,7 @@ describe("flow_proceed — gates", () => {
       ackBody: { message: { ack: { status: "ACK" } } },
     });
 
-    const { outcome } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-      inputs: { loan_amount: 50_000 },
-    });
+    const { outcome } = await proceed({ inputs: { loan_amount: 50_000 } });
 
     expect(outcome).toMatchObject({
       outcome: "BLOCKED",
@@ -294,10 +307,7 @@ describe("flow_proceed — gates", () => {
   it("asks for input before sending a step that declares some", async () => {
     acceptAll("search");
     await startFlow();
-    await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    await proceed();
 
     const records = harness.container.services.record;
     await records.appendApiEntry({
@@ -323,10 +333,7 @@ describe("flow_proceed — gates", () => {
       { providerId: "$.message.catalog.providers[*].id" },
     );
 
-    const { outcome } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    const { outcome } = await proceed();
 
     expect(outcome).toMatchObject({
       outcome: "INPUT_REQUIRED",
@@ -349,11 +356,7 @@ describe("flow_proceed — gates", () => {
       .persist();
     await startFlow();
 
-    const { outcome } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-      dry_run: true,
-    });
+    const { outcome } = await proceed({ dry_run: true });
 
     expect(outcome.outcome).toBe("DRAFTED");
     expect(calls).toBe(0);
@@ -361,7 +364,7 @@ describe("flow_proceed — gates", () => {
     // The flow must not have moved: the same step is still ours to send.
     const status = await harness.client.callTool({
       name: "flow_get_status",
-      arguments: { session_id: sessionId, transaction_id: transactionId },
+      arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID },
     });
     expect(
       (status.structuredContent as { next: StepOutcome }).next,
@@ -382,11 +385,7 @@ describe("flow_proceed — gates", () => {
   it("rejects an unknown trigger_extra", async () => {
     await startFlow();
 
-    const { outcome } = await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-      trigger_extra: "nope",
-    });
+    const { outcome } = await proceed({ trigger_extra: "nope" });
 
     expect(outcome).toMatchObject({
       outcome: "BLOCKED",
@@ -395,18 +394,131 @@ describe("flow_proceed — gates", () => {
   });
 });
 
+describe("flow_proceed — minting the transaction id", () => {
+  it("opens the transaction under the id that actually went on the wire", async () => {
+    const { seen } = acceptAll("search");
+    await startFlow();
+
+    const { outcome } = await proceed();
+
+    const sent = seen[0] as { context: Record<string, string> };
+    expect(outcome.transaction_id).toBe(sent.context["transaction_id"]);
+
+    // …and that is the id the record is keyed on, not some earlier guess.
+    const record = await harness.container.services.record.requireTransaction(
+      sent.context["transaction_id"] as string,
+      NP,
+    );
+    expect(record.flowId).toBe(RUNNABLE_FLOW_ID);
+
+    const ids =
+      await harness.container.services.record.listTransactionIds(sessionId);
+    expect(ids).toEqual([sent.context["transaction_id"]]);
+  });
+
+  it("mints nothing on a dry run, because nothing was sent", async () => {
+    let calls = 0;
+    agent
+      .get(NP)
+      .intercept({ path: "/search", method: "POST" })
+      .reply(200, () => {
+        calls += 1;
+        return { message: { ack: { status: "ACK" } } };
+      })
+      .persist();
+    await startFlow();
+
+    const { outcome } = await proceed({ dry_run: true });
+
+    expect(outcome.outcome).toBe("DRAFTED");
+    expect(outcome.transaction_id).toBeUndefined();
+    expect(calls).toBe(0);
+
+    // A drafted payload was never on the wire, so the flow's first action is
+    // still unspoken for and no transaction exists.
+    const ids =
+      await harness.container.services.record.listTransactionIds(sessionId);
+    expect(ids).toEqual([]);
+
+    // Sending it for real afterwards is what finally mints one.
+    const sent = await proceed();
+    expect(sent.outcome.outcome).toBe("SENT");
+    expect(sent.outcome.transaction_id).toBeTypeOf("string");
+  });
+
+  it("does not let two concurrent calls both mint and both send", async () => {
+    // An unbound run gets a fresh placeholder id on every load, so the WORKING
+    // marker cannot be filed under it — both callers would take a lock of
+    // their own and the flow's first action would go out twice, to a third
+    // party. They contend on the run instead.
+    let calls = 0;
+    agent
+      .get(NP)
+      .intercept({ path: "/search", method: "POST" })
+      .reply(200, () => {
+        calls += 1;
+        return { message: { ack: { status: "ACK" } } };
+      })
+      .persist();
+    await startFlow();
+
+    const [a, b] = await Promise.all([
+      call("flow_proceed", {
+        session_id: sessionId,
+        flow_id: RUNNABLE_FLOW_ID,
+      }),
+      call("flow_proceed", {
+        session_id: sessionId,
+        flow_id: RUNNABLE_FLOW_ID,
+      }),
+    ]);
+
+    // Serialised, so the second caller sees a flow that has already moved on
+    // rather than a second chance to send the same step.
+    const outcomes = [a?.outcome.outcome, b?.outcome.outcome].sort();
+    expect(outcomes).toEqual(["SENT", "WAITING"]);
+    expect(calls).toBe(1);
+    expect(
+      await harness.container.services.record.listTransactionIds(sessionId),
+    ).toHaveLength(1);
+  });
+
+  it("persists nothing when the step is blocked before it can generate", async () => {
+    // `select_1` needs a providerId. A BLOCKED step put no payload on the
+    // wire, so it must leave no transaction behind either.
+    acceptAll("search");
+    await startFlow();
+    await proceed();
+    const minted = transactionId;
+
+    const records = harness.container.services.record;
+    await records.appendApiEntry({
+      transactionId: minted,
+      subscriberUrl: NP,
+      action: "on_search",
+      messageId: "m-in",
+      direction: "inbound",
+      timestamp: new Date(Date.now() + 1_000).toISOString(),
+      body: { context: { action: "on_search" }, message: { catalog: {} } },
+      ackBody: { message: { ack: { status: "ACK" } } },
+    });
+
+    const { outcome } = await proceed({ inputs: { loan_amount: 1 } });
+
+    expect(outcome).toMatchObject({ reason: "requirements_not_met" });
+    expect(await records.listTransactionIds(sessionId)).toEqual([minted]);
+  });
+});
+
 describe("flow_get_status", () => {
   it("derives the sequence from the recorded exchanges", async () => {
     acceptAll("search");
     await startFlow();
-    await call("flow_proceed", {
-      session_id: sessionId,
-      transaction_id: transactionId,
-    });
+    await proceed();
 
     const result = await harness.client.callTool({
       name: "flow_get_status",
-      arguments: { session_id: sessionId, transaction_id: transactionId },
+      arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID },
     });
     const status = result.structuredContent as {
       flow_status: string;
@@ -438,11 +550,13 @@ describe("flow_get_status", () => {
 
     const result = await harness.client.callTool({
       name: "flow_get_status",
-      arguments: { session_id: sessionId, transaction_id: transactionId },
+      arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID },
     });
 
     expect(result.structuredContent).toMatchObject({
       flow_status: "NOT_STARTED",
+      // Nothing has crossed the wire, so nobody has minted an id yet.
+      transaction_id: null,
     });
   });
 
@@ -455,6 +569,109 @@ describe("flow_get_status", () => {
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({
       error: { code: "not_found" },
+    });
+  });
+});
+
+describe("flow_restart", () => {
+  async function restart(
+    extra: Record<string, unknown> = {},
+  ): Promise<{ output: Record<string, unknown>; text: string; isError: boolean }> {
+    const result = await harness.client.callTool({
+      name: "flow_restart",
+      arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID, ...extra },
+    });
+    return {
+      output: result.structuredContent as Record<string, unknown>,
+      text: (result.content as { text: string }[])[0]?.text ?? "",
+      isError: result.isError === true,
+    };
+  }
+
+  it("hands back a run the model can drive straight away", async () => {
+    acceptAll("search");
+    await startFlow();
+    await proceed();
+    const firstTxn = transactionId;
+
+    const { output, text } = await restart({ reason: "search went out wrong" });
+
+    expect(output).toMatchObject({
+      transaction_id: null,
+      abandoned_transaction_id: firstTxn,
+      attempt: 2,
+      flow_id: RUNNABLE_FLOW_ID,
+    });
+    // The next step is ours again, and the rendering says which tool to call.
+    expect(output["outcome"]).toMatchObject({
+      outcome: "READY",
+      step_key: "search_1",
+    });
+    expect(text).toContain("attempt 2");
+    expect(text).toContain("flow_proceed");
+  });
+
+  it("re-arms only this run, leaving the session's other flows listening", async () => {
+    // Restart clears expectations per flow. Session-wide would take down a
+    // sibling flow's listener and leave it waiting on an endpoint that had
+    // quietly stopped accepting its callback.
+    const scope = {
+      domain: RUNNABLE_BUILD.domain,
+      version: RUNNABLE_BUILD.version,
+      role: "buyer",
+    } as const;
+    const records = harness.container.services.record;
+
+    await startFlow();
+    await records.armExpectation(scope, {
+      sessionId,
+      flowId: "some_other_flow",
+      expectedAction: "on_status",
+      subscriberUrl: NP,
+      autoAdvance: false,
+    });
+
+    await restart();
+
+    const armed = await records.expectationsForSession(scope, sessionId);
+    expect(armed.map((entry) => entry.flowId)).toEqual(["some_other_flow"]);
+  });
+
+  it("names flow_start when there is no run to restart", async () => {
+    const { output, isError } = await restart();
+
+    expect(isError).toBe(true);
+    expect(output).toMatchObject({
+      error: { code: "not_found", details: { hint: expect.any(String) } },
+    });
+    expect(
+      String(
+        (output["error"] as { details: { hint: string } }).details.hint,
+      ),
+    ).toContain("flow_start");
+  });
+
+  it("refuses to resume an attempt it has written off", async () => {
+    // The hole this closes: rebinding the run to a sealed transaction would
+    // undo the restart and strand the run on the history it was escaping.
+    acceptAll("search");
+    await startFlow();
+    await proceed();
+    const firstTxn = transactionId;
+    await restart();
+
+    const result = await harness.client.callTool({
+      name: "flow_start",
+      arguments: {
+        session_id: sessionId,
+        flow_id: RUNNABLE_FLOW_ID,
+        transaction_id: firstTxn,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: "conflict" },
     });
   });
 });

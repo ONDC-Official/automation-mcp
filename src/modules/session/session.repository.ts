@@ -1,4 +1,6 @@
 import { cacheKey, type CacheStore } from "@/lib/cache/cache-store.js";
+import { receiverRole } from "@/modules/catalog/catalog.service.js";
+import type { ExpectationScope } from "@/modules/record/record.schema.js";
 import type { Session } from "@/modules/session/session.schema.js";
 
 /**
@@ -17,9 +19,27 @@ export interface SessionRepository {
   save(session: Session, ttlMs: number): Promise<void>;
   find(sessionId: string): Promise<Session | undefined>;
   delete(sessionId: string): Promise<void>;
+  /**
+   * Every session created against one endpoint, oldest first.
+   *
+   * The endpoint — `{domain}/{version}/{buyer|seller}` — is the only thing an
+   * arriving call identifies, and it is shared by every session on that build.
+   * So when the receiver has to refuse a call it cannot attribute, this is the
+   * set of sessions it could conceivably have belonged to. Ids only: an entry
+   * that no longer resolves is simply a session that has expired.
+   */
+  listByEndpoint(scope: ExpectationScope): Promise<string[]>;
   /** Dependency probe surfaced through `/ready`. */
   ping(): Promise<boolean>;
 }
+
+/**
+ * How many sessions one endpoint's index remembers.
+ *
+ * Trimmed oldest-first, which is the right end to lose: the sessions most
+ * likely to still be running are the ones created most recently.
+ */
+export const ENDPOINT_INDEX_LIMIT = 500;
 
 export class CacheSessionRepository implements SessionRepository {
   readonly #cache: CacheStore;
@@ -28,8 +48,29 @@ export class CacheSessionRepository implements SessionRepository {
     this.#cache = cache;
   }
 
-  save(session: Session, ttlMs: number): Promise<void> {
-    return this.#cache.set(this.#key(session.session_id), session, ttlMs);
+  async save(session: Session, ttlMs: number): Promise<void> {
+    const key = this.#key(session.session_id);
+    // Only index a session the first time it is written. `save` is also how a
+    // session is updated, and re-appending on every write would fill the index
+    // with one id.
+    const known = await this.#cache.has(key);
+
+    await this.#cache.set(key, session, ttlMs);
+
+    if (!known) {
+      // Atomic append rather than read-modify-write: `session_create` is
+      // concurrent by nature, and `CLAUDE.md` forbids adding a fourth site that
+      // can lose an entry to a racing writer.
+      await this.#cache.listAppend(
+        endpointIndexKey({
+          domain: session.build.domain,
+          version: session.build.version,
+          role: receiverRole(session.mock_role),
+        }),
+        session.session_id,
+        { ttlMs, maxLength: ENDPOINT_INDEX_LIMIT },
+      );
+    }
   }
 
   find(sessionId: string): Promise<Session | undefined> {
@@ -37,7 +78,15 @@ export class CacheSessionRepository implements SessionRepository {
   }
 
   delete(sessionId: string): Promise<void> {
+    // The endpoint index is deliberately left alone: it is a list of candidates,
+    // not a source of truth, and every reader resolves each id before using it.
     return this.#cache.delete(this.#key(sessionId));
+  }
+
+  async listByEndpoint(scope: ExpectationScope): Promise<string[]> {
+    return [
+      ...new Set(await this.#cache.listRange<string>(endpointIndexKey(scope))),
+    ];
   }
 
   ping(): Promise<boolean> {
@@ -47,4 +96,14 @@ export class CacheSessionRepository implements SessionRepository {
   #key(sessionId: string): string {
     return cacheKey("session", sessionId);
   }
+}
+
+/** Sessions bucketed by the endpoint their callbacks arrive on. */
+export function endpointIndexKey(scope: ExpectationScope): string {
+  return cacheKey(
+    "endpoint_sessions",
+    scope.domain.trim().toUpperCase(),
+    scope.version.trim(),
+    scope.role,
+  );
 }

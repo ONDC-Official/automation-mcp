@@ -91,6 +91,15 @@ export function receiverRoutes(container: Container) {
               );
             });
         });
+      } else if (result.complete) {
+        // A flow whose last step is the participant's finishes *inside* their
+        // callback: no outcome is returned to anyone, so without this the run
+        // would simply stop looking busy and nothing would ever say it was
+        // done. Only when nothing is chaining — `chainNext` notices for itself.
+        const { sessionId: doneSession, transactionId } = result.complete;
+        setImmediate(() => {
+          void flow.noteCompletion(doneSession, transactionId);
+        });
       }
 
       return reply;

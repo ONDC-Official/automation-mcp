@@ -101,3 +101,39 @@ export function acceptsAction(
     .persist();
   return { seen };
 }
+
+/**
+ * A participant that fires its **next** request before answering this one.
+ *
+ * `receive → process → send the next call → return the ACK`, which is what a
+ * great many real implementations do and what produced the `OUT_OF_SEQUENCE`
+ * false positive the two-phase outbound append exists to fix. It is not
+ * misbehaviour: nothing in beckn makes an ACK's return leg a happens-before edge
+ * for the sender's next request, and the two legs are independent connections,
+ * so no amount of care on the participant's side can guarantee the ordering.
+ *
+ * `onReceive` is **awaited before the ACK is produced** — undici does await an
+ * async reply callback, which makes the inversion exact rather than probabilistic.
+ * Do not reach for `.delay()` here: it postpones the callback itself, so the ACK
+ * follows about a millisecond later and the follow-up call loses the race it was
+ * supposed to win.
+ */
+export function acceptsActionAndCallsBack(
+  agent: MockAgent,
+  base: string,
+  action: string,
+  onReceive: (payload: Record<string, unknown>) => Promise<unknown>,
+): ScriptedCall {
+  const seen: Record<string, unknown>[] = [];
+  agent
+    .get(base)
+    .intercept({ path: `/${action}`, method: "POST" })
+    .reply(200, async (options) => {
+      const payload = requestJson(options);
+      seen.push(payload);
+      await onReceive(payload);
+      return { message: { ack: { status: "ACK" } } };
+    })
+    .persist();
+  return { seen };
+}

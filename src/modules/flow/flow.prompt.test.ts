@@ -82,4 +82,27 @@ describe("flow prompts", () => {
     const text = await promptText("mock_buyer");
     expect(text).toContain(`inputs: {"id": "<step_key>"}`);
   });
+
+  /**
+   * The discipline the session journal made possible. A model that keeps
+   * driving every step by hand still produces a correct run — just a far more
+   * expensive one — so this has to be taught, not merely made available.
+   */
+  it.each(["mock_buyer", "mock_seller"])(
+    "%s teaches the event-driven loop rather than a hand-driven one",
+    async (name) => {
+      const text = await promptText(name);
+
+      // Steps that need nothing are already gone by the time you look.
+      expect(text).toMatch(/send themselves/i);
+      // The delivery channel, and the fact that it is one-shot.
+      expect(text).toContain("events");
+      expect(text).toMatch(/exactly once/i);
+      expect(text).toContain("record_get_events");
+      // Session-scope waiting is the idle behaviour, not run-scope polling.
+      expect(text).toMatch(/wait on the session/i);
+      // And the one event that means "you are now the blocker".
+      expect(text).toContain("CHAIN_PAUSED");
+    },
+  );
 });

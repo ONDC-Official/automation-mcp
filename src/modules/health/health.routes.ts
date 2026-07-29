@@ -20,6 +20,9 @@ const DependencyReport = z.object({
   status: z.enum(["up", "down"]),
   durationMs: z.number(),
   error: z.string().optional(),
+  // Present only on dependencies whose absence degrades function rather than
+  // stopping it, so a `down` that left the verdict `ready` explains itself.
+  optional: z.boolean().optional(),
 });
 
 const ReadinessResponse = z.object({

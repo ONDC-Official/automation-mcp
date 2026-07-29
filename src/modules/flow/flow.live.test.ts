@@ -62,18 +62,21 @@ describe.skipIf(!LIVE)("the flow loop against a live config", () => {
     );
     expect(flow, "no flow with a mock-owned step is published").toBeDefined();
 
+    const flowId = flow?.flow_id ?? "";
     const started = await container.services.flow.start({
       sessionId,
-      flowId: flow?.flow_id ?? "",
+      flowId,
     });
-    const transactionId = started.runtime.record.transactionId;
+    // A run that has put nothing on the wire has no transaction id — the
+    // flow's first action mints it, and here that action is this call.
+    expect(started.runtime.bound).toBe(false);
 
     const firstAction = started.runtime.flow.sequence[0]?.type ?? "search";
     const sent = acceptsAction(agent, NP, firstAction);
 
     const outcome = await container.services.flow.proceed({
       sessionId,
-      transactionId,
+      flowId,
       inputs: {},
     });
 
@@ -94,8 +97,10 @@ describe.skipIf(!LIVE)("the flow loop against a live config", () => {
     expect(payload.context).toBeDefined();
 
     // The whole point: a real generator produced a real context, and none of
-    // the config's canned identity survived into it.
-    expect(payload.context?.["transaction_id"]).toBe(transactionId);
+    // the config's canned identity survived into it. The id it carries is the
+    // id the transaction was opened under — sending this action is what minted
+    // it, so the two cannot disagree.
+    expect(payload.context?.["transaction_id"]).toBe(outcome.transaction_id);
     expect(payload.context?.["domain"]).toBe(BUILD.domain);
     expect(payload.context?.["bap_uri"] ?? "").not.toContain("bap.example.com");
     expect(payload.context?.["bpp_uri"] ?? "").not.toContain("bpp.example.com");

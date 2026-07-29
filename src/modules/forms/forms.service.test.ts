@@ -5,7 +5,10 @@ import { parseConfig } from "@/config/env.js";
 import { createContainer, type Container } from "@/container.js";
 import { readSubmissionId } from "@/modules/forms/forms.service.js";
 import type { Session } from "@/modules/session/session.schema.js";
-import { createFakeConfigServiceGateway } from "@/test/fakes.js";
+import {
+  createFakeConfigServiceGateway,
+  createFakeValidationGateway,
+} from "@/test/fakes.js";
 import {
   acceptsAction,
   counterpartyContext,
@@ -51,6 +54,7 @@ async function boot(interactionMode: "llm_auto" | "manual" = "llm_auto") {
   agent.disableNetConnect();
   container = await createContainer(config, {
     configServiceGateway: createFakeConfigServiceGateway(),
+    validationGateway: createFakeValidationGateway(),
     senderDispatcher: agent,
   });
   app = await buildHttpApp(container, config);
@@ -70,11 +74,13 @@ async function boot(interactionMode: "llm_auto" | "manual" = "llm_auto") {
   acceptsAction(agent, NP, "search");
   acceptsAction(agent, NP, "select");
 
-  const started = await container.services.flow.start({
+  await container.services.flow.start({
     sessionId,
     flowId: RUNNABLE_FORM_FLOW_ID,
   });
-  transactionId = started.runtime.record.transactionId;
+  // Unassigned until a payload crosses: this mock is the BAP here, so sending
+  // `search` in `reachFormStep` is what mints it.
+  transactionId = "";
 }
 
 afterEach(async () => {
@@ -115,7 +121,12 @@ function post(action: string, body: Record<string, unknown>) {
  * form URL along the way.
  */
 async function reachFormStep(): Promise<void> {
-  await container.services.flow.proceed({ sessionId, transactionId });
+  // Named by flow: sending this first action is what mints the transaction.
+  const sent = await container.services.flow.proceed({
+    sessionId,
+    flowId: RUNNABLE_FORM_FLOW_ID,
+  });
+  transactionId = sent.transaction_id as string;
   await post(
     "on_search",
     callbackFor("on_search", {
@@ -211,10 +222,9 @@ describe("a form the participant hosts", () => {
     );
     expect(data["kyc_form"]).toBe("sub-from-np");
 
-    const status = await container.services.flow.status(
-      sessionId,
+    const status = await container.services.flow.status(sessionId, {
       transactionId,
-    );
+    });
     expect(status.sequence.at(-1)).toMatchObject({
       key: "kyc_form",
       status: "COMPLETE",
@@ -319,6 +329,7 @@ describe("a form this mock hosts", () => {
     agent.disableNetConnect();
     container = await createContainer(config, {
       configServiceGateway: createFakeConfigServiceGateway(),
+      validationGateway: createFakeValidationGateway(),
       senderDispatcher: agent,
     });
     app = await buildHttpApp(container, config);
@@ -337,11 +348,14 @@ describe("a form this mock hosts", () => {
     acceptsAction(agent, NP, "on_search");
     acceptsAction(agent, NP, "on_select");
 
-    const started = await container.services.flow.start({
+    await container.services.flow.start({
       sessionId,
       flowId: RUNNABLE_FORM_FLOW_ID,
     });
-    transactionId = started.runtime.record.transactionId;
+    // The participant is the buyer here, so it sends `search` and the
+    // transaction id is its to choose. We pick it for the fixture and the
+    // receiver adopts it.
+    transactionId = "np-chosen-form-txn";
   });
 
   /** Drive to the form step with the participant playing the buyer. */
@@ -386,10 +400,9 @@ describe("a form this mock hosts", () => {
     expect(body.success).toBe(true);
     expect(body.submission_id).toHaveLength(36);
 
-    const status = await container.services.flow.status(
-      sessionId,
+    const status = await container.services.flow.status(sessionId, {
       transactionId,
-    );
+    });
     expect(status.sequence.at(-1)).toMatchObject({
       key: "kyc_form",
       status: "COMPLETE",

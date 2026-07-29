@@ -8,6 +8,8 @@ import {
   type Session,
 } from "@/modules/session/session.schema.js";
 import type { SessionService } from "@/modules/session/session.service.js";
+import { eventsFor, renderEvents } from "@/modules/record/record.tool.js";
+import type { RecordService } from "@/modules/record/record.service.js";
 
 /**
  * The protocol edge for sessions — no data access, no business rules.
@@ -48,7 +50,10 @@ export function renderFlowSummary(flow: FlowSummary): string {
   ].join("\n");
 }
 
-export function createSessionTools(service: SessionService): Registerable[] {
+export function createSessionTools(
+  service: SessionService,
+  records: RecordService,
+): Registerable[] {
   return [
     defineTool({
       name: "session_create",
@@ -102,9 +107,11 @@ export function createSessionTools(service: SessionService): Registerable[] {
         idempotentHint: true,
         openWorldHint: false,
       },
-      render: ({ session }) => renderSession(session),
+      render: ({ session, events }) =>
+        [renderSession(session), ...renderEvents(events)].join("\n"),
       handler: async ({ session_id }) => ({
         session: await service.requireSession(session_id),
+        ...(await eventsFor(records, session_id)),
       }),
     }),
   ];

@@ -11,6 +11,7 @@ import { createRecordTools } from "@/modules/record/record.tool.js";
 import { createSessionResources } from "@/modules/session/session.resource.js";
 import { createSessionTools } from "@/modules/session/session.tool.js";
 import { createTransportTools } from "@/modules/transport/transport.tool.js";
+import { createValidateTools } from "@/modules/validate/validate.tool.js";
 
 /**
  * The one place that knows which capabilities exist.
@@ -20,16 +21,21 @@ import { createTransportTools } from "@/modules/transport/transport.tool.js";
  * are built from the same factory.
  */
 export function collectCapabilities(container: Container): Registerable[] {
-  const { catalog, session, record, flow, forms } = container.services;
+  const { catalog, session, record, flow, forms, validate } = container.services;
 
   return [
     ...createTransportTools(container),
-    ...createSessionTools(session),
+    // `record` reaches every session-scoped tool because each one drains the
+    // session's event journal into its result — see `eventsFor`. That is the
+    // only channel guaranteed to put what happened on the wire in front of the
+    // model, so it is deliberately not something a tool can opt out of.
+    ...createSessionTools(session, record),
     ...createCatalogTools(catalog, session),
-    ...createFlowTools(flow, {
+    ...createFlowTools(flow, record, {
       maxAwaitMs: container.config.AWAIT_MAX_WAIT_MS,
     }),
-    ...createFormsTools(forms),
+    ...createFormsTools(forms, record),
+    ...createValidateTools(validate, session, record),
     ...createRecordTools(record, session),
     ...createSessionResources(session),
     ...createCatalogResources(catalog),

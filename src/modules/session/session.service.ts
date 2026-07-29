@@ -81,6 +81,7 @@ export class SessionService {
 
     const mockRole = oppositeRole(input.np_type);
     const sessionId = randomUUID();
+    const interactionMode = input.interaction_mode ?? "llm_auto";
     if (input.receiver_public_url !== undefined) {
       this.#assertOverrideKeepsPrefix(input.receiver_public_url);
     }
@@ -102,8 +103,18 @@ export class SessionService {
       },
       mock_role: mockRole,
       build,
-      interaction_mode: input.interaction_mode ?? "llm_auto",
-      auto_advance: input.auto_advance ?? false,
+      interaction_mode: interactionMode,
+      // Follows the interaction mode unless the caller says otherwise. An
+      // `llm_auto` session is one where the caller has said it will supply
+      // everything itself, so making it ask permission to send a step that
+      // needs nothing is ceremony: it can only answer yes. `manual` means a
+      // human is in the loop, and stepping through is the whole point.
+      //
+      // This is safe only because the session journal exists. Auto-advance
+      // sends payloads to a third party with nobody watching, and until every
+      // tool result carried a `CHAIN_SENT` line saying so, defaulting it on
+      // would have meant silent traffic on a real participant's wire.
+      auto_advance: input.auto_advance ?? interactionMode === "llm_auto",
       callback_url: advertisedUri(base, build, mockRole),
     };
 
@@ -138,6 +149,32 @@ export class SessionService {
       });
     }
     return session;
+  }
+
+  /**
+   * The live sessions a call arriving on this endpoint could have belonged to.
+   *
+   * Every session on a build shares one endpoint — a participant integrates
+   * against an endpoint, not against one of our test runs — so when the
+   * receiver refuses a call it cannot attribute, this is the honest answer to
+   * "whose might this have been?". Ids that no longer resolve are dropped here
+   * rather than by the caller: an expired session is not a candidate.
+   *
+   * Newest first, because a stray call is far likelier to belong to a run that
+   * is still going than to one created two days ago.
+   */
+  async sessionsOnEndpoint(
+    scope: ExpectationScope,
+    limit = 20,
+  ): Promise<string[]> {
+    const candidates = await this.#repository.listByEndpoint(scope);
+
+    const live: string[] = [];
+    for (const sessionId of [...candidates].reverse()) {
+      if (live.length >= limit) break;
+      if (await this.#repository.find(sessionId)) live.push(sessionId);
+    }
+    return live;
   }
 
   /**

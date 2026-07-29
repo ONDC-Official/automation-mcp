@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RedisLike } from "@/lib/cache/redis-cache-store.js";
+import type {
+  RedisLike,
+  RedisPipelineLike,
+} from "@/lib/cache/redis-cache-store.js";
 import { RedisCacheStore } from "@/lib/cache/redis-cache-store.js";
+import { sliceListRange } from "@/lib/cache/cache-store.js";
 import { NotFoundError, UpstreamError } from "@/lib/errors.js";
 import { logger } from "@/lib/logger.js";
 import { describeCacheStoreContract } from "@/test/cache-store-contract.js";
@@ -16,7 +20,10 @@ import { describeCacheStoreContract } from "@/test/cache-store-contract.js";
  * suite runs against this fake too and Redis cannot be lied to about time.
  */
 class FakeRedis implements RedisLike {
-  readonly #entries = new Map<string, { value: string; expiresAt: number }>();
+  readonly #entries = new Map<
+    string,
+    { value: string | string[]; expiresAt: number }
+  >();
   readonly calls: string[] = [];
   readonly #handlers = new Map<string, ((argument: never) => void)[]>();
 
@@ -31,13 +38,106 @@ class FakeRedis implements RedisLike {
     this.calls.push(`GET ${key}`);
     if (this.failAll) return Promise.reject(new Error("ECONNREFUSED"));
 
+    const value = this.#live(key);
+    if (value === undefined) return Promise.resolve(null);
+    if (Array.isArray(value)) {
+      return Promise.reject(
+        new Error("WRONGTYPE Operation against a key holding the wrong kind"),
+      );
+    }
+    return Promise.resolve(value);
+  }
+
+  lrange(key: string, start: number, stop: number): Promise<string[]> {
+    this.calls.push(`LRANGE ${key} ${String(start)} ${String(stop)}`);
+    if (this.failAll) return Promise.reject(new Error("ECONNREFUSED"));
+
+    const value = this.#live(key);
+    if (value === undefined) return Promise.resolve([]);
+    if (!Array.isArray(value)) {
+      return Promise.reject(
+        new Error("WRONGTYPE Operation against a key holding the wrong kind"),
+      );
+    }
+    return Promise.resolve(sliceListRange(value, start, stop));
+  }
+
+  multi(): RedisPipelineLike {
+    this.calls.push("MULTI");
+    return new FakePipeline(this);
+  }
+
+  /* --- the command bodies a MULTI queues, applied synchronously on EXEC --- */
+
+  applyIncrby(key: string, by: number): number {
+    this.calls.push(`INCRBY ${key} ${String(by)}`);
+    const value = this.#live(key);
+    if (Array.isArray(value)) {
+      throw new Error("WRONGTYPE Operation against a key holding the wrong kind");
+    }
+    if (value !== undefined && !/^-?\d+$/.test(value)) {
+      throw new Error("ERR value is not an integer or out of range");
+    }
+    const next = (value === undefined ? 0 : Number(value)) + by;
+    // A bare INCR leaves the key with no expiry; the PEXPIRE the store queues
+    // behind it is what bounds it. Mirrored here so a store that forgot the
+    // PEXPIRE would leak in the test exactly as it would in production.
+    this.#entries.set(key, {
+      value: String(next),
+      expiresAt: this.#entries.get(key)?.expiresAt ?? Number.POSITIVE_INFINITY,
+    });
+    return next;
+  }
+
+  applyRpush(key: string, values: string[]): number {
+    this.calls.push(`RPUSH ${key}`);
+    const existing = this.#live(key);
+    if (existing !== undefined && !Array.isArray(existing)) {
+      throw new Error("WRONGTYPE Operation against a key holding the wrong kind");
+    }
+    const list = [...(existing ?? []), ...values];
+    this.#entries.set(key, {
+      value: list,
+      expiresAt: this.#entries.get(key)?.expiresAt ?? Number.POSITIVE_INFINITY,
+    });
+    return list.length;
+  }
+
+  applyLtrim(key: string, start: number, stop: number): "OK" {
+    this.calls.push(`LTRIM ${key} ${String(start)} ${String(stop)}`);
+    const existing = this.#live(key);
+    if (existing === undefined) return "OK";
+    if (!Array.isArray(existing)) {
+      throw new Error("WRONGTYPE Operation against a key holding the wrong kind");
+    }
+    const kept = sliceListRange(existing, start, stop);
+    if (kept.length === 0) this.#entries.delete(key);
+    else this.#entries.set(key, {
+      value: kept,
+      expiresAt: this.#entries.get(key)?.expiresAt ?? Number.POSITIVE_INFINITY,
+    });
+    return "OK";
+  }
+
+  applyPexpire(key: string, ttlMs: number): number {
+    this.calls.push(`PEXPIRE ${key} ${String(ttlMs)}`);
+    if (!Number.isInteger(ttlMs) || ttlMs <= 0) {
+      throw new Error("ERR invalid expire time in 'pexpire'");
+    }
     const entry = this.#entries.get(key);
-    if (!entry) return Promise.resolve(null);
+    if (!entry) return 0;
+    this.#entries.set(key, { ...entry, expiresAt: Date.now() + ttlMs });
+    return 1;
+  }
+
+  #live(key: string): string | string[] | undefined {
+    const entry = this.#entries.get(key);
+    if (!entry) return undefined;
     if (entry.expiresAt <= Date.now()) {
       this.#entries.delete(key);
-      return Promise.resolve(null);
+      return undefined;
     }
-    return Promise.resolve(entry.value);
+    return entry.value;
   }
 
   set(key: string, value: string, mode: "PX", ttlMs: number): Promise<unknown> {
@@ -119,6 +219,55 @@ class FakeRedis implements RedisLike {
   /** The raw key set, for asserting what was actually written. */
   keys(): string[] {
     return [...this.#entries.keys()];
+  }
+}
+
+/**
+ * A `MULTI` that really is one step: nothing runs until `exec`, and then it all
+ * runs in the same synchronous block.
+ *
+ * A per-command failure comes back *in the results array* rather than as a
+ * rejection, exactly as ioredis reports it — which is the behaviour
+ * `RedisCacheStore#exec` exists to catch, and would be untestable against a
+ * fake that threw instead.
+ */
+class FakePipeline implements RedisPipelineLike {
+  readonly #queued: (() => unknown)[] = [];
+
+  constructor(private readonly redis: FakeRedis) {}
+
+  incrby(key: string, increment: number): RedisPipelineLike {
+    this.#queued.push(() => this.redis.applyIncrby(key, increment));
+    return this;
+  }
+
+  pexpire(key: string, ttlMs: number): RedisPipelineLike {
+    this.#queued.push(() => this.redis.applyPexpire(key, ttlMs));
+    return this;
+  }
+
+  rpush(key: string, ...values: string[]): RedisPipelineLike {
+    this.#queued.push(() => this.redis.applyRpush(key, values));
+    return this;
+  }
+
+  ltrim(key: string, start: number, stop: number): RedisPipelineLike {
+    this.#queued.push(() => this.redis.applyLtrim(key, start, stop));
+    return this;
+  }
+
+  exec(): Promise<[Error | null, unknown][] | null> {
+    if (this.redis.failAll) return Promise.reject(new Error("ECONNREFUSED"));
+
+    const results: [Error | null, unknown][] = [];
+    for (const run of this.#queued) {
+      try {
+        results.push([null, run()]);
+      } catch (error) {
+        results.push([error as Error, null]);
+      }
+    }
+    return Promise.resolve(results);
   }
 }
 
@@ -300,6 +449,108 @@ describe("redis cache store", () => {
       );
       await expect(store.delete("k")).rejects.toBeInstanceOf(UpstreamError);
       await expect(store.has("k")).rejects.toBeInstanceOf(UpstreamError);
+      await store.close();
+    });
+
+    it("throws from a failed increment, append and range", async () => {
+      const { store, client } = subject();
+      client.failAll = true;
+
+      await expect(store.increment("k", 60_000)).rejects.toBeInstanceOf(
+        UpstreamError,
+      );
+      await expect(
+        store.listAppend("k", 1, { ttlMs: 60_000 }),
+      ).rejects.toBeInstanceOf(UpstreamError);
+      await expect(store.listRange("k")).rejects.toBeInstanceOf(UpstreamError);
+      await store.close();
+    });
+
+    /**
+     * The reason `#exec` inspects every reply. `EXEC` resolves even when a
+     * queued command failed, so an unchecked call would report a silent no-op
+     * as a successful append — and the journal would lose entries with nothing
+     * anywhere saying so.
+     */
+    it("throws when a command inside the MULTI failed, though EXEC resolved", async () => {
+      const { store } = subject();
+      // A string where the list should be: RPUSH answers WRONGTYPE.
+      await store.set("clash", "not-a-list", 60_000);
+
+      await expect(
+        store.listAppend("clash", { a: 1 }, { ttlMs: 60_000 }),
+      ).rejects.toBeInstanceOf(UpstreamError);
+      await store.close();
+    });
+  });
+
+  describe("the append family", () => {
+    it("increments and expires in one MULTI", async () => {
+      const { store, client } = subject();
+      client.calls.length = 0;
+
+      await expect(store.increment("seq", 60_000)).resolves.toBe(1);
+
+      expect(client.calls).toEqual([
+        "MULTI",
+        "INCRBY seq 1",
+        "PEXPIRE seq 60000",
+      ]);
+      await store.close();
+    });
+
+    it("appends, trims and expires in one MULTI", async () => {
+      const { store, client } = subject();
+      client.calls.length = 0;
+
+      await store.listAppend("log", { seq: 1 }, { ttlMs: 60_000, maxLength: 3 });
+
+      expect(client.calls).toEqual([
+        "MULTI",
+        "RPUSH log",
+        "LTRIM log -3 -1",
+        "PEXPIRE log 60000",
+      ]);
+      await store.close();
+    });
+
+    /** No cap means no LTRIM — a trim to an unspecified length is not a no-op. */
+    it("omits the LTRIM when no maxLength is given", async () => {
+      const { store, client } = subject();
+      client.calls.length = 0;
+
+      await store.listAppend("log", { seq: 1 }, { ttlMs: 60_000 });
+
+      expect(client.calls).toEqual(["MULTI", "RPUSH log", "PEXPIRE log 60000"]);
+      await store.close();
+    });
+
+    it("issues DEL rather than a MULTI for a non-positive TTL", async () => {
+      const { store, client } = subject();
+      await store.listAppend("log", 1, { ttlMs: 60_000 });
+      client.calls.length = 0;
+
+      await expect(store.increment("seq", 0)).resolves.toBe(1);
+      await store.listAppend("log", 2, { ttlMs: -5 });
+
+      expect(client.calls).toEqual(["DEL seq", "DEL log"]);
+      await expect(store.listRange("log")).resolves.toEqual([]);
+      await store.close();
+    });
+
+    /** One unreadable entry must not cost the read every other entry. */
+    it("skips an unparseable list entry and warns", async () => {
+      const { store, client } = subject();
+      const warn = vi.spyOn(logger, "warn").mockReturnValue(undefined);
+      await store.listAppend("log", { seq: 1 }, { ttlMs: 60_000 });
+      client.applyRpush("log", ["{not json"]);
+      await store.listAppend("log", { seq: 3 }, { ttlMs: 60_000 });
+
+      await expect(store.listRange("log")).resolves.toEqual([
+        { seq: 1 },
+        { seq: 3 },
+      ]);
+      expect(warn).toHaveBeenCalledTimes(1);
       await store.close();
     });
 

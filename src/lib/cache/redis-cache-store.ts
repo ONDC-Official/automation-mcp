@@ -1,7 +1,10 @@
 import { Redis } from "ioredis";
 import type { RedisOptions } from "ioredis";
 import type { Logger } from "pino";
-import type { CacheStore } from "@/lib/cache/cache-store.js";
+import type {
+  CacheStore,
+  ListAppendOptions,
+} from "@/lib/cache/cache-store.js";
 import { UpstreamError } from "@/lib/errors.js";
 
 /**
@@ -56,12 +59,38 @@ export interface RedisLike {
   set(key: string, value: string, mode: "PX", ttlMs: number): Promise<unknown>;
   del(...keys: string[]): Promise<number>;
   exists(...keys: string[]): Promise<number>;
+  lrange(key: string, start: number, stop: number): Promise<string[]>;
+  /** Opens a transaction. The append family's atomicity rests on this. */
+  multi(): RedisPipelineLike;
   ping(): Promise<string>;
   quit(): Promise<unknown>;
   disconnect(): void;
   connect(): Promise<void>;
   on(event: "error", handler: (error: Error) => void): unknown;
   on(event: "ready" | "end", handler: () => void): unknown;
+}
+
+/**
+ * The queued half of a `MULTI`.
+ *
+ * Only the four commands the append family needs, for the same reason
+ * `RedisLike` carries only six: a test fake should be implementable in a dozen
+ * lines. Methods return the interface rather than `this` so ioredis's
+ * `ChainableCommander` — whose methods return `ChainableCommander` — satisfies
+ * it structurally.
+ */
+export interface RedisPipelineLike {
+  incrby(key: string, increment: number): RedisPipelineLike;
+  pexpire(key: string, ttlMs: number): RedisPipelineLike;
+  rpush(key: string, ...values: string[]): RedisPipelineLike;
+  ltrim(key: string, start: number, stop: number): RedisPipelineLike;
+  /**
+   * `null` when the transaction was discarded; otherwise one
+   * `[error, result]` pair per queued command — a failure inside a `MULTI` is
+   * reported per command rather than thrown, which is why `#exec` inspects
+   * every pair instead of trusting the call to have rejected.
+   */
+  exec(): Promise<[Error | null, unknown][] | null>;
 }
 
 export interface RedisCacheStoreOptions {
@@ -197,6 +226,88 @@ export class RedisCacheStore implements CacheStore {
     return count > 0;
   }
 
+  /*
+   * The append family.
+   *
+   * Each is one `MULTI`, so the mutation and the expiry that bounds it either
+   * both land or neither does. Written as separate commands rather than a Lua
+   * script deliberately: `INCRBY`/`RPUSH`/`LTRIM`/`PEXPIRE` are what a
+   * developer will see in `MONITOR` while debugging, and a script would trade
+   * that for nothing — a transaction is already atomic.
+   */
+
+  async increment(key: string, ttlMs: number, by = 1): Promise<number> {
+    // Property 4: a caller deriving this from a deadline already past means
+    // "gone". The value it would have had still comes back, since nothing
+    // survives the call to disagree.
+    if (ttlMs <= 0) {
+      await this.delete(key);
+      return by;
+    }
+
+    const replies = await this.#exec("increment", key, (multi) =>
+      multi.incrby(this.#k(key), by).pexpire(this.#k(key), Math.ceil(ttlMs)),
+    );
+
+    const value = replies[0];
+    if (typeof value !== "number") {
+      throw new UpstreamError(
+        "redis",
+        `state store increment for "${key}" answered ${typeof value}, not a number`,
+        { key, operation: "increment" },
+      );
+    }
+    return value;
+  }
+
+  async listAppend<T>(
+    key: string,
+    value: T,
+    options: ListAppendOptions,
+  ): Promise<void> {
+    const serialized = JSON.stringify(value);
+    // `JSON.stringify(undefined)` is `undefined`, and an entry that cannot be
+    // written is not an entry. Appending "undefined" would poison every later
+    // read of the list.
+    if (serialized === undefined) return;
+
+    if (options.ttlMs <= 0) {
+      await this.delete(key);
+      return;
+    }
+
+    await this.#exec("listAppend", key, (multi) => {
+      let queued = multi.rpush(this.#k(key), serialized);
+      if (options.maxLength !== undefined) {
+        // Keep the newest `maxLength`. Negative indices count from the tail, so
+        // this is "drop everything before the last N" without knowing the length.
+        queued = queued.ltrim(this.#k(key), -options.maxLength, -1);
+      }
+      return queued.pexpire(this.#k(key), Math.ceil(options.ttlMs));
+    });
+  }
+
+  async listRange<T>(key: string, start = 0, end = -1): Promise<T[]> {
+    const raw = await this.#run("listRange", key, () =>
+      this.#client.lrange(this.#k(key), start, end),
+    );
+
+    const parsed: T[] = [];
+    for (const entry of raw) {
+      try {
+        parsed.push(JSON.parse(entry) as T);
+      } catch (error) {
+        // Same rule as `get`: a value we cannot read is a value that is not
+        // there. Dropping one entry beats failing the read of every other.
+        this.#logger.warn(
+          { err: error, key },
+          "unparseable list entry in redis; skipping it",
+        );
+      }
+    }
+    return parsed;
+  }
+
   async ping(): Promise<boolean> {
     try {
       const reply = await this.#client.ping();
@@ -264,5 +375,44 @@ export class RedisCacheStore implements CacheStore {
         { key, operation },
       );
     }
+  }
+
+  /**
+   * Run one `MULTI`, and treat a per-command failure as a failure.
+   *
+   * `EXEC` resolves rather than rejecting when a queued command fails — a
+   * `WRONGTYPE` on the `RPUSH` arrives as an `Error` sitting in the results
+   * array, and an unchecked call would report a silent no-op as a successful
+   * append. `null` means the transaction was discarded entirely.
+   */
+  async #exec(
+    operation: string,
+    key: string,
+    queue: (multi: RedisPipelineLike) => RedisPipelineLike,
+  ): Promise<unknown[]> {
+    const replies = await this.#run(operation, key, () =>
+      queue(this.#client.multi()).exec(),
+    );
+
+    if (replies === null) {
+      this.#healthy = false;
+      throw new UpstreamError(
+        "redis",
+        `state store ${operation} for "${key}" was discarded before it ran`,
+        { key, operation },
+      );
+    }
+
+    return replies.map(([error, value]) => {
+      if (error) {
+        this.#healthy = false;
+        throw new UpstreamError(
+          "redis",
+          `state store ${operation} failed for "${key}": ${error.message}`,
+          { key, operation },
+        );
+      }
+      return value;
+    });
   }
 }

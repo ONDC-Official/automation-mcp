@@ -151,6 +151,80 @@ describe("SenderService", () => {
   });
 });
 
+describe("SenderService — whether a failed send was delivered", () => {
+  /**
+   * The caller records the outbound entry *before* the send, so on a throw it
+   * has to know whether to withdraw that record. Only this module can tell the
+   * two cases apart.
+   */
+  it.each([
+    ["ECONNREFUSED", "unreachable"],
+    ["ENOTFOUND", "unreachable"],
+    ["UND_ERR_CONNECT_TIMEOUT", "unreachable"],
+    ["CERT_HAS_EXPIRED", "unreachable"],
+    ["UND_ERR_HEADERS_TIMEOUT", "uncertain"],
+    ["UND_ERR_BODY_TIMEOUT", "uncertain"],
+    ["ECONNRESET", "uncertain"],
+    ["SOMETHING_NOBODY_HAS_SEEN", "uncertain"],
+  ])("%s → %s", async (code, delivery) => {
+    agent
+      .get(NP)
+      .intercept({ path: "/search", method: "POST" })
+      .replyWithError(Object.assign(new Error(code), { code }));
+
+    await expect(sender.send(NP, "search", {})).rejects.toMatchObject({
+      details: { delivery },
+    });
+  });
+
+  it("defaults to uncertain, because the wrong guess duplicates a call", async () => {
+    // An unrecognised failure is kept, not withdrawn. A stuck run is
+    // recoverable with flow_restart; a second protocol call on a real
+    // participant's wire is not recoverable at all.
+    agent
+      .get(NP)
+      .intercept({ path: "/search", method: "POST" })
+      .replyWithError(new Error("no code at all"));
+
+    await expect(sender.send(NP, "search", {})).rejects.toMatchObject({
+      details: { delivery: "uncertain" },
+    });
+  });
+
+  it("classifies a nested cause too", async () => {
+    const outer = new Error("wrapped");
+    (outer as { cause?: unknown }).cause = Object.assign(new Error("inner"), {
+      code: "ECONNREFUSED",
+    });
+    agent
+      .get(NP)
+      .intercept({ path: "/search", method: "POST" })
+      .replyWithError(outer);
+
+    await expect(sender.send(NP, "search", {})).rejects.toMatchObject({
+      details: { delivery: "unreachable" },
+    });
+  });
+
+  it("throws UpstreamError, not a raw undici error, when the body is lost", async () => {
+    // Headers came back so the request unambiguously crossed. Before this the
+    // body read sat outside the try and escaped as a raw error with no
+    // `delivery` at all, which the caller could only treat as a crash.
+    agent
+      .get(NP)
+      .intercept({ path: "/search", method: "POST" })
+      .reply(200, () => {
+        throw Object.assign(new Error("body timeout"), {
+          code: "UND_ERR_BODY_TIMEOUT",
+        });
+      });
+
+    await expect(sender.send(NP, "search", {})).rejects.toBeInstanceOf(
+      UpstreamError,
+    );
+  });
+});
+
 describe("readAck", () => {
   it.each([
     [{ message: { ack: { status: "ACK" } } }, "ACK"],

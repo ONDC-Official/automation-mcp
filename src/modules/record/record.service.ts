@@ -13,20 +13,25 @@ import type { FlowStatusCode } from "@/modules/flow/engine/engine-types.js";
 import {
   expectationKey,
   flowRunKey,
+  journalKey,
   normaliseSubscriberUrl,
   transactionKey,
   type RecordRepository,
 } from "@/modules/record/record.repository.js";
-import type {
-  ApiEntry,
-  Attention,
-  Direction,
-  Expectation,
-  ExpectationScope,
-  FormEntry,
-  PayloadRecord,
-  TransactionLocation,
-  TransactionRecord,
+import {
+  EVENTS_DELTA_LIMIT,
+  type Abandoned,
+  type ApiEntry,
+  type Attention,
+  type Direction,
+  type EventsDelta,
+  type Expectation,
+  type ExpectationScope,
+  type FormEntry,
+  type PayloadRecord,
+  type SessionEvent,
+  type TransactionLocation,
+  type TransactionRecord,
 } from "@/modules/record/record.schema.js";
 
 /**
@@ -105,6 +110,38 @@ export interface AppendApiEntryInput {
   httpStatus?: number;
   /** Event kind to publish. Defaults from `direction`. */
   eventKind?: TransactionEventKind;
+  /**
+   * Mark the entry as still in flight, to be completed by `settleApiEntry`.
+   *
+   * The outbound path only. See `ApiEntry.sendState` for why an outbound call is
+   * recorded before it is answered rather than after.
+   */
+  sendState?: "in_flight";
+  /**
+   * Skip the `TransactionEvent` notification.
+   *
+   * Phase one of a two-phase outbound append sets this so `settleApiEntry`
+   * publishes exactly once, when the ACK is actually known. Without it a
+   * `flow_await` parked during auto-advance would wake on our own unanswered
+   * call and report an exchange that had not happened yet.
+   */
+  silent?: boolean;
+}
+
+/** Completing an entry appended with `sendState: "in_flight"`. */
+export interface SettleApiEntryInput {
+  transactionId: string;
+  subscriberUrl: string;
+  /** The `seq` `appendApiEntry` handed back. */
+  seq: number;
+  /** The `payloadId` `appendApiEntry` handed back. */
+  payloadId: string;
+  ackBody?: unknown;
+  httpStatus?: number;
+  /** Set when the send threw after the request had already crossed. */
+  sendState?: "failed";
+  sendError?: string;
+  eventKind?: TransactionEventKind;
 }
 
 export interface AppendFormEntryInput {
@@ -121,6 +158,11 @@ export interface AppendResult {
   seq: number;
   payloadId?: string;
 }
+
+/** One journal entry, before the service stamps its `seq` and `at`. */
+export type JournalEntry = Omit<SessionEvent, "seq" | "at"> & {
+  at?: string;
+};
 
 export class RecordService {
   readonly #repository: RecordRepository;
@@ -141,6 +183,29 @@ export class RecordService {
    * `MULTI` or a Lua script.
    */
   readonly #expectationLocks = new Map<string, Promise<unknown>>();
+
+  /**
+   * Serialises read-modify-write on one transaction record.
+   *
+   * Same shape and same caveat as `#expectationLocks`, for the same reason on a
+   * different key. `saveTransaction` is a load-modify-save over the whole
+   * record, and the two paths that do it are genuinely concurrent: the HTTP
+   * receiver appends an inbound call while `FlowService#dispatch` is appending
+   * or settling an outbound one. The `await` between load and save is enough for
+   * either to overwrite an `apiList` the other had just extended — which loses
+   * an exchange outright, and an exchange this server never saw is a compliance
+   * finding it cannot make.
+   *
+   * The two-phase outbound append made that window materially likelier: there
+   * are now two writes on the outbound path, and the second lands exactly when
+   * the participant's callback is most likely to arrive.
+   *
+   * Single-process only. Two servers sharing a Redis still race, and closing
+   * that needs a compare-and-set on `CacheStore` — or `apiList` moved out of the
+   * record onto its own atomic `listAppend` key, which is the better answer and
+   * a bigger change than this one.
+   */
+  readonly #recordLocks = new Map<string, Promise<unknown>>();
 
   constructor(options: RecordServiceOptions) {
     this.#repository = options.repository;
@@ -224,105 +289,269 @@ export class RecordService {
    * to hundreds of kilobytes — inlining them would make every status read
    * deserialise the whole transaction.
    */
-  async appendApiEntry(input: AppendApiEntryInput): Promise<AppendResult> {
-    const record = await this.requireTransaction(
+  appendApiEntry(
+    input: AppendApiEntryInput,
+  ): Promise<AppendResult & { payloadId: string }> {
+    return this.#withRecordLock(
       input.transactionId,
       input.subscriberUrl,
+      async () => {
+        const record = await this.requireTransaction(
+          input.transactionId,
+          input.subscriberUrl,
+        );
+
+        const seq = record.seq + 1;
+        const payloadId = randomUUID();
+
+        const payload: PayloadRecord = {
+          payloadId,
+          transactionId: input.transactionId,
+          subscriberUrl: input.subscriberUrl,
+          direction: input.direction,
+          action: input.action,
+          messageId: input.messageId,
+          timestamp: input.timestamp,
+          body: input.body,
+          ...(input.ackBody !== undefined ? { ackBody: input.ackBody } : {}),
+          ...(input.httpStatus !== undefined
+            ? { httpStatus: input.httpStatus }
+            : {}),
+        };
+        await this.#repository.savePayload(payload);
+
+        const entry: ApiEntry = {
+          entryType: "API",
+          action: input.action,
+          payloadId,
+          messageId: input.messageId,
+          response: input.ackBody,
+          timestamp: input.timestamp,
+          seq,
+          direction: input.direction,
+          ...(input.sendState !== undefined
+            ? { sendState: input.sendState }
+            : {}),
+        };
+
+        const updated: TransactionRecord = {
+          ...record,
+          apiList: [...record.apiList, entry],
+          latestAction: input.action,
+          latestTimestamp: input.timestamp,
+          messageIds: record.messageIds.includes(input.messageId)
+            ? record.messageIds
+            : [...record.messageIds, input.messageId],
+          seq,
+        };
+        await this.#repository.saveTransaction(updated);
+
+        if (input.silent !== true) {
+          this.#publish(updated, {
+            seq,
+            kind:
+              input.eventKind ??
+              (input.direction === "inbound" ? "INBOUND" : "OUTBOUND"),
+            action: input.action,
+            payload_id: payloadId,
+          });
+        }
+
+        return { record: updated, seq, payloadId };
+      },
     );
+  }
 
-    const seq = record.seq + 1;
-    const payloadId = randomUUID();
+  /**
+   * Complete an entry that was appended before its answer was known.
+   *
+   * Phase two of the outbound append: fold the ACK/NACK onto both the slim entry
+   * and the stored payload, then publish the notification phase one suppressed.
+   *
+   * The record is **re-loaded inside the lock**, never patched from a copy the
+   * caller captured before the send. A callback can, and routinely does, land
+   * mid-flight; writing back a record read before it arrived would erase it.
+   *
+   * A `seq` that no longer resolves is logged and ignored rather than thrown:
+   * the only ways to get here are a transaction that expired mid-send or an
+   * entry `flow_restart` swept, and failing the send afterwards would report a
+   * delivered call as a transport error.
+   */
+  settleApiEntry(input: SettleApiEntryInput): Promise<TransactionRecord | undefined> {
+    return this.#withRecordLock(
+      input.transactionId,
+      input.subscriberUrl,
+      async () => {
+        const record = await this.#repository.findTransaction(
+          input.transactionId,
+          input.subscriberUrl,
+        );
+        const entry = record?.apiList.find(
+          (candidate) =>
+            candidate.seq === input.seq && candidate.entryType === "API",
+        );
 
-    const payload: PayloadRecord = {
-      payloadId,
-      transactionId: input.transactionId,
-      subscriberUrl: input.subscriberUrl,
-      direction: input.direction,
-      action: input.action,
-      messageId: input.messageId,
-      timestamp: input.timestamp,
-      body: input.body,
-      ...(input.ackBody !== undefined ? { ackBody: input.ackBody } : {}),
-      ...(input.httpStatus !== undefined
-        ? { httpStatus: input.httpStatus }
-        : {}),
-    };
-    await this.#repository.savePayload(payload);
+        if (!record || entry?.entryType !== "API") {
+          this.#logger.warn(
+            {
+              transactionId: input.transactionId,
+              seq: input.seq,
+            },
+            "could not settle an in-flight entry; it is no longer on the record",
+          );
+          return undefined;
+        }
 
-    const entry: ApiEntry = {
-      entryType: "API",
-      action: input.action,
-      payloadId,
-      messageId: input.messageId,
-      response: input.ackBody,
-      timestamp: input.timestamp,
-      seq,
-      direction: input.direction,
-    };
+        const settled: ApiEntry = {
+          ...entry,
+          response: input.ackBody,
+          ...(input.sendState !== undefined
+            ? { sendState: input.sendState }
+            : { sendState: undefined }),
+          ...(input.sendError !== undefined
+            ? { sendError: input.sendError }
+            : {}),
+        };
 
-    const updated: TransactionRecord = {
-      ...record,
-      apiList: [...record.apiList, entry],
-      latestAction: input.action,
-      latestTimestamp: input.timestamp,
-      messageIds: record.messageIds.includes(input.messageId)
-        ? record.messageIds
-        : [...record.messageIds, input.messageId],
-      seq,
-    };
-    await this.#repository.saveTransaction(updated);
+        const updated: TransactionRecord = {
+          ...record,
+          apiList: record.apiList.map((candidate) =>
+            candidate.seq === input.seq ? settled : candidate,
+          ),
+        };
+        await this.#repository.saveTransaction(updated);
 
-    this.#publish(updated, {
-      seq,
-      kind:
-        input.eventKind ??
-        (input.direction === "inbound" ? "INBOUND" : "OUTBOUND"),
-      action: input.action,
-      payload_id: payloadId,
-    });
+        // The body was stored in phase one; only its answer is new.
+        const payload = await this.#repository.findPayload(input.payloadId);
+        if (payload) {
+          await this.#repository.savePayload({
+            ...payload,
+            ...(input.ackBody !== undefined ? { ackBody: input.ackBody } : {}),
+            ...(input.httpStatus !== undefined
+              ? { httpStatus: input.httpStatus }
+              : {}),
+          });
+        }
 
-    return { record: updated, seq, payloadId };
+        this.#publish(updated, {
+          seq: input.seq,
+          kind: input.eventKind ?? "OUTBOUND",
+          action: entry.action,
+          payload_id: input.payloadId,
+        });
+
+        return updated;
+      },
+    );
+  }
+
+  /**
+   * Undo an in-flight entry for a call that provably never left.
+   *
+   * Only for a send that failed at the connection — refused, DNS, TLS — where
+   * nothing crossed the wire and the step is genuinely still owed. Anything that
+   * failed *after* the request was written is settled as `failed` instead, so a
+   * call that may have been delivered is never silently re-sent.
+   *
+   * **`record.seq` is deliberately left where it is.** It is a high-water mark,
+   * not a count: `flow_await` hands it back as a cursor, so reissuing a number
+   * would rewind waiters onto entries they had already been shown. The gap costs
+   * nothing.
+   */
+  discardApiEntry(input: {
+    transactionId: string;
+    subscriberUrl: string;
+    seq: number;
+    payloadId: string;
+  }): Promise<void> {
+    return this.#withRecordLock(
+      input.transactionId,
+      input.subscriberUrl,
+      async () => {
+        const record = await this.#repository.findTransaction(
+          input.transactionId,
+          input.subscriberUrl,
+        );
+        if (!record) return;
+
+        const apiList = record.apiList.filter(
+          (entry) => entry.seq !== input.seq,
+        );
+        if (apiList.length === record.apiList.length) return;
+
+        // Rebuilt from what survives rather than remembered from before the
+        // append: another exchange may have landed in between, and it is that
+        // one — not the pre-append state — that is now the latest.
+        const tail = apiList[apiList.length - 1];
+        const messageIds = apiList.flatMap((entry) =>
+          entry.entryType === "API" ? [entry.messageId] : [],
+        );
+
+        await this.#repository.saveTransaction({
+          ...record,
+          apiList,
+          latestAction:
+            tail === undefined
+              ? ""
+              : tail.entryType === "API"
+                ? tail.action
+                : tail.formType,
+          latestTimestamp: tail?.timestamp ?? record.createdAt,
+          messageIds: record.messageIds.filter(
+            (id) => messageIds.includes(id) || id === record.transactionId,
+          ),
+        });
+
+        await this.#repository.deletePayload(input.payloadId);
+      },
+    );
   }
 
   /** Record a form submission. Forms carry no protocol payload. */
-  async appendFormEntry(input: AppendFormEntryInput): Promise<AppendResult> {
-    const record = await this.requireTransaction(
+  appendFormEntry(input: AppendFormEntryInput): Promise<AppendResult> {
+    return this.#withRecordLock(
       input.transactionId,
       input.subscriberUrl,
+      async () => {
+        const record = await this.requireTransaction(
+          input.transactionId,
+          input.subscriberUrl,
+        );
+
+        const seq = record.seq + 1;
+        const timestamp = new Date().toISOString();
+
+        const entry: FormEntry = {
+          entryType: "FORM",
+          formType: input.formType,
+          formId: input.formId,
+          ...(input.submissionId !== undefined
+            ? { submissionId: input.submissionId }
+            : {}),
+          ...(input.error !== undefined ? { error: input.error } : {}),
+          timestamp,
+          seq,
+        };
+
+        const updated: TransactionRecord = {
+          ...record,
+          apiList: [...record.apiList, entry],
+          latestAction: input.formType,
+          latestTimestamp: timestamp,
+          seq,
+        };
+        await this.#repository.saveTransaction(updated);
+
+        this.#publish(updated, {
+          seq,
+          kind: "FORM_SUBMITTED",
+          action: input.formId,
+          ...(input.error !== undefined ? { detail: input.error } : {}),
+        });
+
+        return { record: updated, seq };
+      },
     );
-
-    const seq = record.seq + 1;
-    const timestamp = new Date().toISOString();
-
-    const entry: FormEntry = {
-      entryType: "FORM",
-      formType: input.formType,
-      formId: input.formId,
-      ...(input.submissionId !== undefined
-        ? { submissionId: input.submissionId }
-        : {}),
-      ...(input.error !== undefined ? { error: input.error } : {}),
-      timestamp,
-      seq,
-    };
-
-    const updated: TransactionRecord = {
-      ...record,
-      apiList: [...record.apiList, entry],
-      latestAction: input.formType,
-      latestTimestamp: timestamp,
-      seq,
-    };
-    await this.#repository.saveTransaction(updated);
-
-    this.#publish(updated, {
-      seq,
-      kind: "FORM_SUBMITTED",
-      action: input.formId,
-      ...(input.error !== undefined ? { detail: input.error } : {}),
-    });
-
-    return { record: updated, seq };
   }
 
   /**
@@ -332,17 +561,51 @@ export class RecordService {
    * to return to. Without this the model's next `flow_get_status` would show a
    * stalled flow and no explanation.
    */
-  async setAttention(
+  setAttention(
     transactionId: string,
     subscriberUrl: string,
     attention: Attention | undefined,
   ): Promise<void> {
-    const record = await this.requireTransaction(transactionId, subscriberUrl);
-    const updated: TransactionRecord =
-      attention === undefined
-        ? { ...record, attention: undefined }
-        : { ...record, attention };
-    await this.#repository.saveTransaction(updated);
+    return this.#withRecordLock(transactionId, subscriberUrl, async () => {
+      const record = await this.requireTransaction(
+        transactionId,
+        subscriberUrl,
+      );
+      const updated: TransactionRecord =
+        attention === undefined
+          ? { ...record, attention: undefined }
+          : { ...record, attention };
+      await this.#repository.saveTransaction(updated);
+    });
+  }
+
+  /**
+   * Write an attempt off, without deleting any of it.
+   *
+   * Called by `flow_restart`. Everything the attempt recorded — its entries,
+   * its payloads, its business data — stays exactly where it was and stays
+   * readable; only the record's status changes. Erasing a failed attempt would
+   * erase the findings this server exists to produce.
+   *
+   * The seal is what stops the abandoned attempt being *advanced*: its id
+   * remains resolvable through `txn_index` so late traffic can still be filed
+   * against it, and without a mark on the record, `flow_proceed` on that id
+   * would happily put new payloads on a third party's wire.
+   */
+  abandonTransaction(
+    transactionId: string,
+    subscriberUrl: string,
+    seal: Abandoned,
+  ): Promise<TransactionRecord> {
+    return this.#withRecordLock(transactionId, subscriberUrl, async () => {
+      const record = await this.requireTransaction(
+        transactionId,
+        subscriberUrl,
+      );
+      const updated: TransactionRecord = { ...record, abandoned: seal };
+      await this.#repository.saveTransaction(updated);
+      return updated;
+    });
   }
 
   /** Publish an event that carries no new entry — a chain pause, say. */
@@ -372,6 +635,124 @@ export class RecordService {
       event,
     );
     this.#events.notify(flowRunKey(record.sessionId, record.flowId), event);
+  }
+
+  /* ------------------------------- journal -------------------------------- */
+
+  /**
+   * Write one line to the session's journal, and wake anyone watching it.
+   *
+   * ## This never throws, and that is load-bearing
+   *
+   * Every caller is on a path where failing is worse than forgetting. The
+   * receiver journals *after* the ACK has been decided — a store blip there
+   * would turn our outage into a 500 the participant records as our
+   * non-compliance. `chainNext` journals with nobody left to return to. So a
+   * failure is logged and swallowed, in the same spirit as
+   * `TransactionEvents.notify`, which also cannot be allowed to fail a
+   * response.
+   *
+   * The trade is honest and worth stating: an entry can be lost. Nothing is
+   * *derived* from the journal — the transaction record remains the truth, and
+   * `flow_get_status` recomputes state from it — so a lost line costs the model
+   * a notification, never a correct answer.
+   *
+   * ## Two notifications, two seq spaces
+   *
+   * The wake-up goes to `journalKey(sessionId)`, carrying the **journal's**
+   * seq. Per-transaction and per-run notifications are untouched and keep
+   * carrying the transaction's. They are different counters on different keys
+   * and must never be compared; a session waiter tests its delivery cursor, a
+   * run waiter tests `after_seq`.
+   */
+  async journal(sessionId: string, entry: JournalEntry): Promise<void> {
+    try {
+      const seq = await this.#repository.nextJournalSeq(sessionId);
+      const event: SessionEvent = {
+        ...entry,
+        seq,
+        at: entry.at ?? new Date().toISOString(),
+      };
+
+      // Durable before the wake-up, exactly as `appendApiEntry` orders it: a
+      // waiter told about work it then fails to find would drain an empty delta
+      // and park again, missing the very thing it was woken for.
+      await this.#repository.appendJournal(sessionId, event);
+      this.#events.notify(journalKey(sessionId), { seq, kind: "JOURNAL" });
+    } catch (error) {
+      this.#logger.warn(
+        { err: error, sessionId, kind: entry.kind },
+        "could not journal a session event; the record itself is unaffected",
+      );
+    }
+  }
+
+  /**
+   * Everything the model has not been told yet, and mark it told.
+   *
+   * The cursor advances past exactly what is returned — never past what is
+   * withheld for the cap — so a burst is throttled across several tool calls
+   * rather than silently discarded. `more` is what tells the model there is a
+   * rest to ask for.
+   *
+   * Returns `undefined` when there is nothing, so an idle drain adds no key to
+   * the tool result at all rather than an empty object the model has to read
+   * past on every single call.
+   */
+  async drainEvents(sessionId: string): Promise<EventsDelta | undefined> {
+    try {
+      const cursor = await this.#repository.getEventCursor(sessionId);
+      const pending = await this.#repository.journalSince(sessionId, cursor);
+      if (pending.length === 0) return undefined;
+
+      const events = pending.slice(0, EVENTS_DELTA_LIMIT);
+      const last = events[events.length - 1];
+      // `pending` is non-empty and the cap is positive, so this cannot be
+      // undefined; the guard is for the compiler, not for a real case.
+      if (last === undefined) return undefined;
+
+      await this.#repository.setEventCursor(sessionId, last.seq);
+
+      return {
+        events,
+        more: pending.length - events.length,
+        cursor: last.seq,
+      };
+    } catch (error) {
+      // A drain rides on someone else's tool call. Failing it would turn a
+      // journal problem into a failed `flow_proceed`, which is precisely the
+      // inversion this whole mechanism exists to avoid.
+      this.#logger.warn(
+        { err: error, sessionId },
+        "could not drain session events; the tool result carries none",
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Read the journal **without** consuming it.
+   *
+   * The escape hatch behind `record_get_events`: a drained delta lost to a
+   * client-side error is otherwise unrecoverable, because the cursor has
+   * already moved past it. Deliberately cursor-neutral — a tool that both
+   * re-reads and consumes could not be used to recover from itself.
+   */
+  readEvents(sessionId: string, afterSeq = 0): Promise<SessionEvent[]> {
+    return this.#repository.journalSince(sessionId, afterSeq);
+  }
+
+  /** How much of the journal has already been delivered. */
+  eventCursor(sessionId: string): Promise<number> {
+    return this.#repository.getEventCursor(sessionId);
+  }
+
+  /**
+   * True for exactly one caller. Used to journal a transition once, from
+   * whichever path happens to observe it first.
+   */
+  claimFirst(name: string): Promise<boolean> {
+    return this.#repository.claimFirst(name);
   }
 
   /* ---------------------------- business data ----------------------------- */
@@ -647,26 +1028,58 @@ export class RecordService {
     });
   }
 
+  /**
+   * Disarm one **run**, leaving the session's other flows listening.
+   *
+   * `flow_restart` needs this granularity and the session-wide version cannot
+   * provide it: a session may have several flows in flight, and taking down a
+   * sibling's expectation would leave it waiting for a callback this endpoint
+   * has quietly stopped accepting — a 412 the model has no way to explain.
+   *
+   * Restart needs it for a second reason too. An entry armed for the abandoned
+   * attempt carries that attempt's `transactionId`, so leaving it would meet
+   * the *new* attempt's first legitimate callback with `TRANSACTION_MISMATCH`.
+   */
+  clearExpectationsForFlow(
+    scope: ExpectationScope,
+    sessionId: string,
+    flowId: string,
+    now: Date = new Date(),
+  ): Promise<void> {
+    return this.#withExpectationLock(scope, async () => {
+      const live = pruneExpired(
+        await this.#repository.loadExpectations(scope),
+        now,
+      );
+      await this.#repository.saveExpectations(
+        scope,
+        live.filter(
+          (entry) =>
+            !(entry.sessionId === sessionId && entry.flowId === flowId),
+        ),
+      );
+    });
+  }
+
   /** Chain onto whatever is already touching this bucket. */
-  async #withExpectationLock<T>(
+  #withExpectationLock<T>(
     scope: ExpectationScope,
     work: () => Promise<T>,
   ): Promise<T> {
-    const key = expectationKey(scope);
-    const previous = this.#expectationLocks.get(key) ?? Promise.resolve();
-    const current = previous.then(work, work);
-    this.#expectationLocks.set(
-      key,
-      current.catch(() => undefined),
+    return withKeyLock(this.#expectationLocks, expectationKey(scope), work);
+  }
+
+  /** Chain onto whatever is already writing this transaction record. */
+  #withRecordLock<T>(
+    transactionId: string,
+    subscriberUrl: string,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    return withKeyLock(
+      this.#recordLocks,
+      transactionKey(transactionId, subscriberUrl),
+      work,
     );
-    try {
-      return await current;
-    } finally {
-      // Only the tail clears the slot, or a queued caller loses its predecessor.
-      if (this.#expectationLocks.get(key) === current) {
-        this.#expectationLocks.delete(key);
-      }
-    }
   }
 
   /* ------------------------------- payloads ------------------------------- */
@@ -694,6 +1107,36 @@ export class RecordService {
       });
     }
     return payload;
+  }
+}
+
+/**
+ * Serialise `work` against everything else queued on `key`.
+ *
+ * The in-process mutual exclusion behind both `#expectationLocks` and
+ * `#recordLocks`. A rejected predecessor must not cancel its successors, hence
+ * `then(work, work)` — the queue is about ordering, not about outcomes.
+ *
+ * Not a distributed lock. Two processes against one Redis still race; this only
+ * closes the window inside a single server, which is where the MCP tool path and
+ * the HTTP receiver path genuinely run concurrently.
+ */
+async function withKeyLock<T>(
+  locks: Map<string, Promise<unknown>>,
+  key: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const previous = locks.get(key) ?? Promise.resolve();
+  const current = previous.then(work, work);
+  locks.set(
+    key,
+    current.catch(() => undefined),
+  );
+  try {
+    return await current;
+  } finally {
+    // Only the tail clears the slot, or a queued caller loses its predecessor.
+    if (locks.get(key) === current) locks.delete(key);
   }
 }
 

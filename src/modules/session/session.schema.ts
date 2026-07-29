@@ -4,6 +4,7 @@ import {
   FlowSummary,
   NpType,
 } from "@/modules/catalog/catalog.schema.js";
+import { EventsField } from "@/modules/record/record.schema.js";
 
 /**
  * A session is the anchor for everything that follows: it records **who is
@@ -65,7 +66,8 @@ export const Session = z.object({
     .boolean()
     .describe(
       "When true, this server chains its own steps as soon as the participant " +
-        "answers, pausing only for inputs, forms and errors.",
+        "answers, pausing only for inputs, forms and errors. Whatever it sends " +
+        "is reported as a CHAIN_SENT event on the next tool result.",
     ),
   callback_url: z
     .string()
@@ -111,9 +113,12 @@ export const CreateSessionInput = z.object({
     .boolean()
     .optional()
     .describe(
-      "Default false. When true, this server sends its own next step as soon " +
-        "as the participant answers, instead of waiting to be asked — pausing " +
-        "for inputs, forms and errors. Faster, but you see less of the flow.",
+      "Defaults to on for llm_auto sessions and off for manual ones. When on, " +
+        "this server sends its own next step as soon as the participant " +
+        "answers, instead of waiting to be asked — pausing for inputs, forms " +
+        "and errors. You do not see less of the flow: everything sent this way " +
+        "comes back as a CHAIN_SENT event on your next tool result. Set it " +
+        "false to drive every step yourself.",
     ),
   receiver_public_url: z
     .url()
@@ -144,5 +149,6 @@ export type GetSessionInput = z.infer<typeof GetSessionInput>;
 
 export const GetSessionOutput = z.object({
   session: Session,
+  ...EventsField,
 });
 export type GetSessionOutput = z.infer<typeof GetSessionOutput>;
