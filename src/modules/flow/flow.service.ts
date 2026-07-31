@@ -14,6 +14,13 @@ import type {
 } from "@/lib/events/transaction-events.js";
 import type { MockEngine } from "@/lib/mock-engine/mock-engine.js";
 import {
+  checkInputs,
+  describeInputs,
+  type InputSpec,
+  mockStepInputs,
+  resolveInputSpec,
+} from "@/modules/catalog/catalog.inputs.js";
+import {
   actorFor,
   type CatalogService,
 } from "@/modules/catalog/catalog.service.js";
@@ -32,11 +39,16 @@ import {
   getNextActions,
 } from "@/modules/flow/engine/flow-mapper.js";
 import { toEngineFlow } from "@/modules/flow/engine/to-engine-flow.js";
+import {
+  applyOverrides,
+  suggestOverrides,
+} from "@/modules/flow/flow.overrides.js";
 import type { FlowRepository } from "@/modules/flow/flow.repository.js";
 import {
   ATTEMPT_HISTORY_LIMIT,
   type FlowBinding,
   type FlowStatusOutput,
+  type InputProblem,
   type MissedStep,
   type RunSummary,
   type StepOutcome,
@@ -146,6 +158,29 @@ export interface FlowServiceOptions {
   receiverPublicUrl: string;
   /** Registry-style id advertised as `bap_id`/`bpp_id`. */
   mockSubscriberId: string;
+  /**
+   * The incident corpus. Optional, and absent in most tests — a run must work
+   * identically whether or not anybody is listening.
+   */
+  feedback?: FeedbackObserver;
+}
+
+/**
+ * The half of `FeedbackService` this service uses.
+ *
+ * Declared here rather than imported so `flow` does not depend on `feedback` —
+ * the corpus watches the loop, the loop does not know about the corpus. Both
+ * calls return `void`: capture is scheduled, never awaited, because a report is
+ * never worth a millisecond of a participant's connection.
+ */
+export interface FeedbackObserver {
+  noteOutcome(sessionId: string, flowId: string, outcome: StepOutcome): void;
+  noteError(
+    sessionId: string,
+    flowId: string,
+    error: unknown,
+    context?: { stepKey?: string; action?: string; transactionId?: string },
+  ): void;
 }
 
 export interface StartFlowArgs {
@@ -199,6 +234,14 @@ export interface ProceedArgs extends FlowRef {
   inputs?: Record<string, unknown> | undefined;
   triggerExtra?: string | undefined;
   dryRun?: boolean | undefined;
+  /**
+   * Patch the generated payload before it is validated and sent.
+   *
+   * Scoped to this call by construction — `chainNext` builds its own
+   * `ProceedArgs` and never copies this, so a step nobody approved cannot
+   * carry a patch nobody re-stated onto a third party's wire.
+   */
+  payloadOverrides?: Record<string, unknown> | undefined;
   /**
    * Internal: this call came from `chainNext`, not from the model.
    *
@@ -257,6 +300,8 @@ export class FlowService {
    */
   readonly #runLocks = new Map<string, Promise<unknown>>();
 
+  readonly #feedback: FeedbackObserver | undefined;
+
   constructor(options: FlowServiceOptions) {
     this.#sessions = options.sessions;
     this.#catalog = options.catalog;
@@ -269,6 +314,7 @@ export class FlowService {
     this.#logger = options.logger;
     this.#receiverPublicUrl = options.receiverPublicUrl.replace(/\/+$/, "");
     this.#mockSubscriberId = options.mockSubscriberId;
+    this.#feedback = options.feedback;
   }
 
   /**
@@ -731,10 +777,10 @@ export class FlowService {
       ...(record.abandoned ? { abandoned: record.abandoned } : {}),
       seq: record.seq,
       sequence: map.sequence.map((step) =>
-        toStepState(step, session.mock_role),
+        toStepState(step, session.mock_role, runtime.config),
       ),
       extra_steps: (map.extraSteps ?? []).map((step) =>
-        toStepState(step, session.mock_role),
+        toStepState(step, session.mock_role, runtime.config),
       ),
       missed_steps: map.missedSteps.map(toMissedStep),
       next,
@@ -756,22 +802,79 @@ export class FlowService {
    * by refusing.
    */
   async proceed(args: ProceedArgs): Promise<StepOutcome> {
-    // Named by flow, so the run may still be unbound — and an unbound run has
-    // nothing durable to contend on. The `WORKING` marker cannot close this on
-    // its own: both callers read `AVAILABLE` before either writes, and for a
-    // bound run that costs a duplicate entry, but here it would cost a second
-    // minted id, a second transaction, and the flow's first action going out
-    // twice to a third party. Named by transaction, the run is bound by
-    // definition and the marker is enough.
-    const outcome =
-      args.flowId === undefined
-        ? await this.#proceed(args)
-        : await this.#withRunLock(args.sessionId, args.flowId, () =>
-            this.#proceed(args),
-          );
+    let outcome: StepOutcome;
 
+    try {
+      // Named by flow, so the run may still be unbound — and an unbound run has
+      // nothing durable to contend on. The `WORKING` marker cannot close this on
+      // its own: both callers read `AVAILABLE` before either writes, and for a
+      // bound run that costs a duplicate entry, but here it would cost a second
+      // minted id, a second transaction, and the flow's first action going out
+      // twice to a third party. Named by transaction, the run is bound by
+      // definition and the marker is enough.
+      outcome =
+        args.flowId === undefined
+          ? await this.#proceed(args)
+          : await this.#withRunLock(args.sessionId, args.flowId, () =>
+              this.#proceed(args),
+            );
+    } catch (error) {
+      // The one path that produces no `StepOutcome` at all. `#dispatchSend`
+      // settles the record entry and rethrows — no `BLOCKED`, no `attention`,
+      // no journal line — and inside `chainNext` that throw used to end in a
+      // `logger.error` and nothing else. This is the single observation point
+      // for both, which is why it wraps the throw as well as the return.
+      this.#observe(args, undefined, error);
+      throw error;
+    }
+
+    this.#observe(args, outcome, undefined);
     this.#scheduleChain(args, outcome);
     return outcome;
+  }
+
+  /**
+   * Hand what just happened to the incident corpus.
+   *
+   * Deliberately the *only* such call on this path, and deliberately at the
+   * public boundary rather than beside each `blocked()`: `chainNext` re-enters
+   * `proceed`, so an auto-advanced step is observed here too, and there is no
+   * second site that could drift from this one. `blocked()` itself is a module
+   * function with no access to the session, which is what makes this the right
+   * altitude rather than merely a convenient one.
+   */
+  #observe(
+    args: ProceedArgs,
+    outcome: StepOutcome | undefined,
+    error: unknown,
+  ): void {
+    const feedback = this.#feedback;
+    if (feedback === undefined) return;
+
+    // A run named only by transaction still belongs to a flow; the id is the
+    // better label when we have neither, and it is never absent for long.
+    const flowId =
+      args.flowId ?? outcome?.step_key ?? args.transactionId ?? "unknown";
+
+    try {
+      if (error !== undefined) {
+        feedback.noteError(args.sessionId, flowId, error, {
+          ...(args.transactionId !== undefined
+            ? { transactionId: args.transactionId }
+            : {}),
+        });
+        return;
+      }
+      if (outcome !== undefined)
+        feedback.noteOutcome(args.sessionId, flowId, outcome);
+    } catch (observerError) {
+      // Same contract as `RecordService#journal`: telemetry may not fail a
+      // protocol call. The model's answer is already computed at this point.
+      this.#logger.warn(
+        { err: observerError, sessionId: args.sessionId },
+        "the feedback observer threw; the flow outcome is unaffected",
+      );
+    }
   }
 
   /**
@@ -825,6 +928,23 @@ export class FlowService {
             { err: error, sessionId: args.sessionId, transactionId },
             "auto-advance chain after a send failed",
           );
+
+          // Nobody is left to return to — this runs on a `setImmediate` after
+          // the tool result has gone — so before this line the run simply
+          // stopped, silently, and the model's next `flow_await` sat out its
+          // full timeout waiting for a step that was never going to be sent.
+          // The journal is the only channel that still reaches it.
+          //
+          // The incident itself is already open: `chainNext` re-enters
+          // `proceed`, whose own catch observed the throw. Opening a second one
+          // here would double-count the same failure.
+          await this.#records.journal(args.sessionId, {
+            kind: "ATTENTION",
+            transaction_id: transactionId,
+            summary:
+              "Automatic sending stopped after an error and will not resume on " +
+              "its own. Call flow_get_status to see where the run stands.",
+          });
         }
       })();
     });
@@ -878,6 +998,28 @@ export class FlowService {
     }
 
     const target = await this.#selectTarget(runtime, flowStatus, args);
+
+    /*
+     * Overrides only mean something on the branch that generates a payload.
+     *
+     * Silently dropping them on any other branch is exactly the failure this
+     * whole feature exists to answer: a caller states an intent, nothing
+     * honours it, and nothing says so. Refusing costs the run nothing —
+     * nothing has been generated, recorded or sent at this point.
+     */
+    if (args.payloadOverrides !== undefined && target.kind !== "dispatch") {
+      return this.#stamp(
+        runtime,
+        blocked(
+          "overrides_not_applicable",
+          "payload_overrides patch a payload this flow generates, and the next " +
+            `thing this run needs is not a step for this mock to send (${target.kind}). ` +
+            "Call flow_get_status to see what it is waiting on, then re-send " +
+            "the overrides on the flow_proceed that dispatches the step.",
+          { target: target.kind },
+        ),
+      );
+    }
 
     switch (target.kind) {
       case "outcome":
@@ -1352,7 +1494,10 @@ export class FlowService {
    * Best-effort by construction: it runs after the response and swallows its
    * own failures, like everything else on that path.
    */
-  async noteCompletion(sessionId: string, transactionId: string): Promise<void> {
+  async noteCompletion(
+    sessionId: string,
+    transactionId: string,
+  ): Promise<void> {
     try {
       const runtime = await this.load(sessionId, { transactionId });
       if (runtime.record.abandoned) return;
@@ -1504,7 +1649,10 @@ export class FlowService {
    * otherwise — colliding across every unbound run in the process. A candidate
    * that nothing was ever stored under reads as empty, which is the truth.
    */
-  #placeholderRecord(session: Session, binding: FlowBinding): TransactionRecord {
+  #placeholderRecord(
+    session: Session,
+    binding: FlowBinding,
+  ): TransactionRecord {
     return emptyTransactionRecord({
       transactionId: randomUUID(),
       sessionId: session.session_id,
@@ -1601,6 +1749,32 @@ export class FlowService {
           action: target.step.actionType,
         });
     }
+  }
+
+  /**
+   * `INPUT_REQUIRED`, with the shape spelled out rather than implied.
+   *
+   * The raw declaration is not handed back: `{name: "ExampleInputId", schema:
+   * {properties: {city_code}}}` reads as an instruction to nest, and nesting is
+   * the one mistake that fails silently all the way to a validation error at an
+   * unrelated JSONPath. `describeInputs` states the keys instead.
+   */
+  #inputRequired(
+    runtime: FlowRuntime,
+    step: MappedStep,
+    message: string,
+    problems?: InputProblem[],
+  ): StepOutcome {
+    return {
+      outcome: "INPUT_REQUIRED",
+      message,
+      step_key: step.actionId,
+      action: step.actionType,
+      inputs_required: describeInputs(specFor(step, runtime.config)),
+      ...(problems !== undefined && problems.length > 0
+        ? { input_problems: problems }
+        : {}),
+    };
   }
 
   #listening(step: MappedStep): StepOutcome {
@@ -1722,13 +1896,11 @@ export class FlowService {
             ? { kind: "dispatch", step: sequenceNext }
             : {
                 kind: "outcome",
-                outcome: {
-                  outcome: "INPUT_REQUIRED",
-                  message: gate.message,
-                  step_key: sequenceNext.actionId,
-                  action: sequenceNext.actionType,
-                  inputs_required: sequenceNext.input ?? [],
-                },
+                outcome: this.#inputRequired(
+                  runtime,
+                  sequenceNext,
+                  gate.message,
+                ),
               };
         }
 
@@ -1900,6 +2072,28 @@ export class FlowService {
     await mark(this.#lockId(runtime));
 
     try {
+      // Inputs first, ahead of requirements — whose own view of the world *is*
+      // `sessionData`, and would be answering about the wrong one.
+      //
+      // A wrong-shaped `inputs` object reaches `generate` as an absent value,
+      // and a generator that assigns it (`payload.x = user_inputs?.y`) deletes
+      // the field the default payload already had right. Nothing downstream
+      // ties the L1 failure that follows back to the input, so this is the last
+      // point at which the real cause is still visible.
+      const inputCheck = checkInputs(
+        specFor(step, runtime.config),
+        args.inputs,
+      );
+      if (!inputCheck.ok) {
+        return this.#inputRequired(
+          runtime,
+          step,
+          `Step "${step.actionId}" was not sent — the values supplied are not ` +
+            `the shape its generator reads. ${inputCheck.message}`,
+          inputCheck.problems,
+        );
+      }
+
       const sessionData = await this.#buildSessionData(runtime, args.inputs);
 
       const requirements = await this.#mockEngine.runRequirements(
@@ -1944,6 +2138,56 @@ export class FlowService {
       }
 
       const payload = generated.result;
+
+      /*
+       * ## The escape hatch, applied here and nowhere else
+       *
+       * After `generate`, so it patches the bytes the config actually
+       * produced; before the id is settled and before the gate, so the
+       * transaction stays ours to key on and the patched payload is what gets
+       * judged. An override is not a validation bypass — it exists so a run
+       * blocked by a **defect in a published config** can continue with a
+       * *correct* payload rather than be abandoned.
+       *
+       * All-or-nothing: a refusal leaves `payload` exactly as generated, so
+       * fixing the paths and calling again costs the run nothing.
+       */
+      let overridden: readonly string[] = [];
+      if (args.payloadOverrides !== undefined) {
+        const result = applyOverrides(payload, args.payloadOverrides);
+        if (result.problems.length > 0) {
+          // Top level, like `input_problems`: it is the thing to act on, and
+          // burying it in `details` makes it something to go looking for.
+          return {
+            ...blocked(
+              "overrides_refused",
+              `The payload_overrides for "${step.actionId}" were refused, so nothing ` +
+                "was patched, recorded or sent — the payload is exactly as the " +
+                `config generated it. ${result.problems
+                  .map((problem) => `${problem.path} — ${problem.reason}`)
+                  .join("; ")}`,
+              { step_key: step.actionId },
+            ),
+            action: step.actionType,
+            override_problems: result.problems.map((problem) => ({
+              path: problem.path,
+              reason: problem.reason,
+            })),
+          };
+        }
+        overridden = result.applied.map((entry) => entry.path);
+
+        this.#logger.warn(
+          {
+            sessionId: session.session_id,
+            transactionId: txnId,
+            stepKey: step.actionId,
+            paths: overridden,
+          },
+          "outbound payload patched by payload_overrides; this step is not a clean step",
+        );
+      }
+      const patched = overridden.length > 0 ? { overrides: [...overridden] } : {};
 
       if (bound) {
         // A run that already has an id keeps it for the rest of the flow.
@@ -2000,10 +2244,16 @@ export class FlowService {
           message:
             `Generated ${step.actionType} but did not send it. ` +
             `${describeVerdict(validation)} ` +
+            (overridden.length > 0
+              ? `Patched ${String(overridden.length)} path(s) first — re-send the same ` +
+                "payload_overrides on the call that dispatches it, because they " +
+                "apply to one call only. "
+              : "") +
             "Inspect it with record_get_payload, then call flow_proceed again without dry_run.",
           step_key: step.actionId,
           action: step.actionType,
           payload_id: payloadId,
+          ...patched,
           validation,
         });
       }
@@ -2032,11 +2282,28 @@ export class FlowService {
             ...(validation.docs_url !== undefined
               ? { docs_url: validation.docs_url }
               : {}),
+            // What the step declares, and what it was given, sit beside the
+            // findings on purpose. The generated payload is a function of the
+            // two, and a reader holding only the findings has no way to tell a
+            // config defect from a value it chose — an earlier version of this
+            // hint asserted "usually a config defect", and was believed.
+            ...inputEvidence(step, runtime.config, args.inputs),
+            ...patched,
             hint:
-              "The payload comes from the flow config's own generate function, " +
-              "so this is usually a config defect rather than anything you did. " +
-              "Inspect it with flow_proceed dry_run, and supply any inputs the " +
-              "step declares before retrying.",
+              "The payload is produced by the flow config's own generate " +
+              "function from the inputs supplied. Compare the findings against " +
+              "`declared_inputs` and `supplied_inputs` below: a field that is " +
+              "empty or missing is usually one the generator read off " +
+              "`user_inputs` and did not find. Inspect the payload with " +
+              "flow_proceed dry_run to confirm before concluding the config is " +
+              "at fault.",
+            // Naming the way out, beside the reason it is needed. Before this,
+            // a model that correctly diagnosed a defect in a *published* config
+            // had nothing left to do but give up — which is exactly what the
+            // 2026-07-31 runs did, twice.
+            ...(suggestOverrides(validation.findings) !== undefined
+              ? { recovery: suggestOverrides(validation.findings) }
+              : {}),
           },
         );
       }
@@ -2081,6 +2348,9 @@ export class FlowService {
         timestamp: context.timestamp,
         body: payload,
         sendState: "in_flight",
+        // A patched step is not a clean step, and the record is what the
+        // compliance report reads. Absent when nothing was patched.
+        ...patched,
         // Published once, by `settleApiEntry`, when the ACK is actually known.
         silent: true,
       });
@@ -2111,9 +2381,13 @@ export class FlowService {
         action: step.actionType,
         ack: sent.ack,
         payload_id: payloadId,
+        ...patched,
         summary:
           `${args.chained === true ? "Auto-sent" : "Sent"} ${step.actionType} — ` +
           `the participant answered ${sent.ack}.` +
+          (overridden.length > 0
+            ? ` Patched first: ${overridden.join(", ")}.`
+            : "") +
           // Folded into the existing line rather than journaled separately.
           // For a chained send the journal is the *only* channel back to the
           // model, so a payload that went out unvalidated — or known-bad under
@@ -2126,9 +2400,14 @@ export class FlowService {
       return {
         outcome: "SENT",
         message:
-          sent.ack === "ACK"
+          (sent.ack === "ACK"
             ? `Sent ${step.actionType}; the participant ACKed it. Call flow_await for the callback.`
-            : `Sent ${step.actionType}; the participant answered ${sent.ack}. Read ack_body — this is a finding, not a transport failure.`,
+            : `Sent ${step.actionType}; the participant answered ${sent.ack}. Read ack_body — this is a finding, not a transport failure.`) +
+          (overridden.length > 0
+            ? ` Note: ${String(overridden.length)} path(s) were patched by ` +
+              "payload_overrides, so this step was not generated purely by the " +
+              "flow's own config and the compliance report will say so."
+            : ""),
         step_key: step.actionId,
         action: step.actionType,
         transaction_id: txnId,
@@ -2136,6 +2415,7 @@ export class FlowService {
         ack: sent.ack,
         http_status: sent.httpStatus,
         ack_body: sent.body,
+        ...patched,
         validation,
       };
     } finally {
@@ -2199,8 +2479,7 @@ export class FlowService {
         await this.#records.settleApiEntry({
           ...entry,
           sendState: "failed",
-          sendError:
-            error instanceof Error ? error.message : "the send failed",
+          sendError: error instanceof Error ? error.message : "the send failed",
         });
       }
       throw error;
@@ -2463,9 +2742,7 @@ export class FlowService {
     await this.#records.armExpectation(receiverScope(runtime.session), {
       sessionId: runtime.session.session_id,
       flowId: runtime.binding.flowId,
-      ...(runtime.bound
-        ? { transactionId: runtime.record.transactionId }
-        : {}),
+      ...(runtime.bound ? { transactionId: runtime.record.transactionId } : {}),
       expectedAction: step.actionType,
       subscriberUrl: runtime.session.np.subscriber_url,
       autoAdvance: runtime.binding.autoAdvance,
@@ -2501,6 +2778,25 @@ export class FlowService {
     };
   }
 
+  /**
+   * Identity, **in the shape a config's `generate` actually reads it**.
+   *
+   * Every other value in `sessionData` arrives through `saveData`, which runs
+   * `jsonpath.query` and therefore always yields a *list*: `bppId` is
+   * `["bpp.example.com"]`, never `"bpp.example.com"`. Published configs are
+   * written against exactly that and index it in place —
+   * `context.bpp_id = sessionData?.bppId[0]` is the live TRV11 shape.
+   *
+   * Seeding a bare string here does not throw, which is precisely the problem:
+   * `[0]` on a string is its first *character*, so `"bpp.example.com"` reaches
+   * a third party's wire as `"b"`. It bites hardest on a flow's **first**
+   * action, when nothing has been saved yet and all four of these are seeds
+   * rather than saves — and on any field the participant simply omits, because
+   * an omitted field saves as `[]` and falls through to the seed.
+   *
+   * `transactionId` below has been a list for this same reason since forms
+   * landed; these four were missed.
+   */
   #seedIdentity(
     session: Session,
     transactionId: string,
@@ -2513,12 +2809,12 @@ export class FlowService {
 
     const ours =
       session.mock_role === "BAP"
-        ? { bapId: ourId, bapUri: ourUri }
-        : { bppId: ourId, bppUri: ourUri };
+        ? { bapId: [ourId], bapUri: [ourUri] }
+        : { bppId: [ourId], bppUri: [ourUri] };
     const theirs =
       session.mock_role === "BAP"
-        ? { bppId: theirId, bppUri: theirUri }
-        : { bapId: theirId, bapUri: theirUri };
+        ? { bppId: [theirId], bppUri: [theirUri] }
+        : { bapId: [theirId], bapUri: [theirUri] };
 
     const data: Record<string, unknown> = { ...stored };
 
@@ -2759,9 +3055,40 @@ function synthesiseExtra(step: EngineSequenceStep): MappedStep {
   };
 }
 
+/**
+ * What a step declares it needs, from both places it can be declared.
+ *
+ * The mock config's declaration is passed second — it wins, being the one the
+ * step's `generate` was authored against.
+ */
+function specFor(step: MappedStep, config: UpstreamMockConfig): InputSpec {
+  return resolveInputSpec(step.input, mockStepInputs(config, step.actionId));
+}
+
+/**
+ * The two things a validation failure has to be read against.
+ *
+ * Omitted entirely for a step that declares no inputs — there the payload
+ * really is the config's own work, and saying so by silence is honest.
+ */
+function inputEvidence(
+  step: MappedStep,
+  config: UpstreamMockConfig,
+  inputs: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const spec = specFor(step, config);
+  if (spec.fields.length === 0) return {};
+
+  return {
+    declared_inputs: describeInputs(spec),
+    supplied_inputs: inputs ?? null,
+  };
+}
+
 function toStepState(
   step: MappedStep,
   mockRole: Session["mock_role"],
+  config: UpstreamMockConfig,
 ): FlowStatusOutput["sequence"][number] {
   const payloadIds =
     step.payloads?.entryType === "API"
@@ -2788,7 +3115,7 @@ function toStepState(
       ? { ack: step.payloads.subStatus === "SUCCESS" ? "ACK" : "NACK" }
       : {}),
     ...(step.status === "INPUT-REQUIRED"
-      ? { inputs_required: step.input ?? [] }
+      ? { inputs_required: describeInputs(specFor(step, config)) }
       : {}),
     ...(step.awaitingMessageId !== undefined
       ? { awaiting_message_id: step.awaitingMessageId }
@@ -2836,7 +3163,10 @@ function toEvent(entry: HistoryEntry): TransactionEvent {
  */
 export function matchesFilter(
   event: SessionEvent,
-  filter: { kinds?: SessionEventKind[] | undefined; flowIds?: string[] | undefined },
+  filter: {
+    kinds?: SessionEventKind[] | undefined;
+    flowIds?: string[] | undefined;
+  },
 ): boolean {
   if (filter.kinds !== undefined && !filter.kinds.includes(event.kind)) {
     return false;

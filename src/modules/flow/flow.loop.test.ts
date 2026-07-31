@@ -166,7 +166,9 @@ describe("the flow loop", () => {
       context: Record<string, string>;
     };
     expect(sentSelect.context["transaction_id"]).toBe(transactionId);
-    expect(sentSelect.context["transaction_id"]).not.toBe("config-rewrote-this");
+    expect(sentSelect.context["transaction_id"]).not.toBe(
+      "config-rewrote-this",
+    );
 
     // 4. Theirs.
     await post(
@@ -206,6 +208,61 @@ describe("the flow loop", () => {
     );
     expect(data["providerId"]).toEqual(["provider-1"]);
     expect(data["orderId"]).toEqual(["order-1"]);
+  });
+
+  /**
+   * Inputs nested under the declaration's name never reach the generator.
+   *
+   * `select`'s generator reads `sessionData.user_inputs?.loan_amount` flat,
+   * and the fixture declares it the way TRV11 does — under a wrapper id
+   * (`SelectInputId`) that reads exactly like a key to nest beneath. Left
+   * unchecked, the nested shape generates an order with a null amount and puts
+   * it on the wire; the participant's NACK, or an L1 finding at
+   * `$.message.order.amount`, is then the first sign anything is wrong, and it
+   * points at the config rather than at the input. That cost a real run.
+   */
+  it("refuses inputs nested under the declaration instead of sending them", async () => {
+    acceptsAction(agent, NP, "search");
+    const selectCall = acceptsAction(agent, NP, "select");
+    await start();
+    await sendFirstAction();
+    await post("on_search", callbackFor("on_search", CATALOG, 1_000));
+
+    const nested = await container.services.flow.proceed({
+      sessionId,
+      transactionId,
+      inputs: { SelectInputId: { loan_amount: 50_000 } },
+    });
+
+    expect(nested).toMatchObject({
+      outcome: "INPUT_REQUIRED",
+      step_key: "select_1",
+      input_problems: [{ code: "nested_under_declaration" }],
+    });
+    expect(nested.inputs_required?.fields.map((field) => field.name)).toEqual([
+      "loan_amount",
+    ]);
+
+    // Nothing crossed the wire, and nothing was recorded — so the correction
+    // costs the run nothing.
+    expect(selectCall.seen).toHaveLength(0);
+    const stalled = await container.services.record.requireTransaction(
+      transactionId,
+      NP,
+    );
+    expect(stalled.apiList).toHaveLength(2);
+
+    // And the flat shape it asked for goes straight through.
+    const flat = await container.services.flow.proceed({
+      sessionId,
+      transactionId,
+      inputs: { loan_amount: 50_000 },
+    });
+    expect(flat).toMatchObject({ outcome: "SENT", action: "select" });
+    expect(selectCall.seen).toHaveLength(1);
+    expect(selectCall.seen[0]).toMatchObject({
+      message: { order: { amount: 50_000 } },
+    });
   });
 });
 
@@ -311,9 +368,11 @@ describe("a send that fails", () => {
     agent
       .get(NP)
       .intercept({ path: "/select", method: "POST" })
-      .replyWithError(Object.assign(new Error("connect refused"), {
-        code: "ECONNREFUSED",
-      }));
+      .replyWithError(
+        Object.assign(new Error("connect refused"), {
+          code: "ECONNREFUSED",
+        }),
+      );
 
     await expect(
       container.services.flow.proceed({
@@ -359,9 +418,11 @@ describe("a send that fails", () => {
     agent
       .get(NP)
       .intercept({ path: "/select", method: "POST" })
-      .replyWithError(Object.assign(new Error("headers timeout"), {
-        code: "UND_ERR_HEADERS_TIMEOUT",
-      }));
+      .replyWithError(
+        Object.assign(new Error("headers timeout"), {
+          code: "UND_ERR_HEADERS_TIMEOUT",
+        }),
+      );
 
     await expect(
       container.services.flow.proceed({
@@ -723,8 +784,9 @@ async function settle(): Promise<void> {
 
 describe("flow_await in session scope", () => {
   const awaitSession = (
-    extra: Parameters<Container["services"]["flow"]["awaitEvent"]>[0] extends
-      infer T
+    extra: Parameters<
+      Container["services"]["flow"]["awaitEvent"]
+    >[0] extends infer T
       ? Partial<Omit<T & object, "sessionId">>
       : never = {},
   ) =>
@@ -1136,9 +1198,9 @@ describe("auto-send by default", () => {
 
     // Exactly one `status`, not one per nested chain.
     expect(statusCall.seen).toHaveLength(1);
-    expect((await kinds()).filter((kind) => kind === "CHAIN_SENT")).toHaveLength(
-      1,
-    );
+    expect(
+      (await kinds()).filter((kind) => kind === "CHAIN_SENT"),
+    ).toHaveLength(1);
   });
 });
 
@@ -1416,7 +1478,10 @@ describe("the outbound gate", () => {
   it("keeps a non-compliant payload off the wire entirely", async () => {
     const search = acceptsAction(agent, NP, "search");
     validation.setResult(invalidFrom(L1_MULTI_RULE));
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
 
     const outcome = await container.services.flow.proceed({
       sessionId,
@@ -1434,7 +1499,10 @@ describe("the outbound gate", () => {
   it("mints nothing, so the run is still free to try again", async () => {
     acceptsAction(agent, NP, "search");
     validation.setResult(invalidFrom(L1_MULTI_RULE));
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
     const blockedOutcome = await container.services.flow.proceed({
       sessionId,
       flowId: RUNNABLE_FLOW_ID,
@@ -1457,7 +1525,10 @@ describe("the outbound gate", () => {
   it("sends anyway when the oracle is unreachable, and says so", async () => {
     const search = acceptsAction(agent, NP, "search");
     validation.setResult({ status: "unavailable", reason: "oracle was down" });
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
 
     const outcome = await container.services.flow.proceed({
       sessionId,
@@ -1474,7 +1545,10 @@ describe("the outbound gate", () => {
 
   it("validates a dry run without blocking it", async () => {
     validation.setResult(invalidFrom(L1_MULTI_RULE));
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
 
     const outcome = await container.services.flow.proceed({
       sessionId,
@@ -1487,5 +1561,209 @@ describe("the outbound gate", () => {
     expect(outcome.outcome).toBe("DRAFTED");
     expect(outcome.validation?.status).toBe("invalid");
     expect(outcome.payload_id).toBeTruthy();
+  });
+});
+
+/**
+ * `payload_overrides` — the escape hatch for a config that is itself wrong.
+ *
+ * Driven end to end rather than as unit tests (those are in
+ * `flow.overrides.test.ts`) because the claim is about the whole path: the
+ * patch has to reach the bytes the gate judges, the bytes the participant
+ * receives, and the record the compliance report will read. A fake verdict
+ * that ignored the payload would pass whether or not any of that happened,
+ * which is why the gateway judges each payload on its merits here.
+ */
+describe("payload_overrides", () => {
+  /** Reject every search whose descriptor name is not `patched`. */
+  function rejectUnlessPatched(): void {
+    validation.setResponder((request) => {
+      const name = (
+        (
+          (request.payload as { message?: { intent?: { descriptor?: unknown } } })
+            .message?.intent?.descriptor as { name?: unknown } | undefined
+        )?.name
+      );
+      return name === "patched"
+        ? { status: "valid" }
+        : invalidFrom(
+            "at '/message/intent/descriptor/name': got string, want object",
+          );
+    });
+  }
+
+  it("gets a run past a config that generates a non-compliant payload", async () => {
+    /*
+     * The 2026-07-31 case, reproduced: live TRV11 `search2_METRO_201` assigns
+     * `context.bpp_uri = sessionData?.bppUri` with no `[0]`, so a list reaches
+     * a string field. Two runs ended `gave_up` there — a correct participant
+     * got no compliance report because one step of one flow had a typo
+     * upstream, and nothing in this repo could fix it.
+     */
+    const search = acceptsAction(agent, NP, "search");
+    rejectUnlessPatched();
+    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+
+    const refused = await container.services.flow.proceed({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    expect(refused).toMatchObject({
+      outcome: "BLOCKED",
+      reason: "validation_failed",
+    });
+    expect(search.seen).toHaveLength(0);
+    // The block names the way out. Before this it said only "inspect it with
+    // dry_run", which is where both runs stopped.
+    expect(
+      (refused.details as { recovery?: string }).recovery,
+    ).toContain("$.message.intent.descriptor.name");
+
+    const sent = await container.services.flow.proceed({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      payloadOverrides: { "$.message.intent.descriptor.name": "patched" },
+    });
+
+    expect(sent).toMatchObject({ outcome: "SENT", ack: "ACK" });
+    expect(sent.overrides).toEqual(["$.message.intent.descriptor.name"]);
+    // The patch reached the wire, not just the verdict.
+    expect(search.seen[0]).toMatchObject({
+      message: { intent: { descriptor: { name: "patched" } } },
+    });
+  });
+
+  it("still blocks when the override does not fix the finding", async () => {
+    // Not a validation bypass. Sending a payload we already know violates L0
+    // would write our defect into the participant's compliance report.
+    const search = acceptsAction(agent, NP, "search");
+    rejectUnlessPatched();
+    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+
+    const outcome = await container.services.flow.proceed({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      payloadOverrides: { "$.message.intent.descriptor.name": "still-wrong" },
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "BLOCKED",
+      reason: "validation_failed",
+    });
+    expect(search.seen).toHaveLength(0);
+  });
+
+  it("records the patched step as patched", async () => {
+    // A compliance report that cannot say the participant was tested against a
+    // payload this flow's config did not produce is claiming more than it knows.
+    acceptsAction(agent, NP, "search");
+    rejectUnlessPatched();
+    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+
+    const sent = await container.services.flow.proceed({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      payloadOverrides: { "$.message.intent.descriptor.name": "patched" },
+    });
+
+    const record = await container.services.record.requireTransaction(
+      sent.transaction_id ?? "",
+      NP,
+    );
+    const entry = record.apiList.find(
+      (item) => item.entryType === "API" && item.direction === "outbound",
+    );
+    expect(entry).toMatchObject({ overrides: ["$.message.intent.descriptor.name"] });
+
+    // And on the journal, which is what the incident corpus reads — it is the
+    // difference between RECOVERED and RECOVERED_WITH_OVERRIDE.
+    const journal = await container.services.record.readEvents(sessionId);
+    const sentLine = journal.find((event) => event.kind === "OUTBOUND_SENT");
+    expect(sentLine?.overrides).toEqual(["$.message.intent.descriptor.name"]);
+  });
+
+  it("does not let a chained step inherit them", async () => {
+    /*
+     * The property that keeps this safe to leave on. Auto-advance sends with
+     * nobody watching; a chained step carrying a patch nobody re-stated would
+     * put bytes on a third party's wire that neither the config nor the model
+     * chose. `RUNNABLE_CHAIN_FLOW_ID` runs two mock-owned steps back to back,
+     * so the second one is genuinely chained rather than asked for.
+     */
+    const searchCall = acceptsAction(agent, NP, "search");
+    const statusCall = acceptsAction(agent, NP, "status");
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_CHAIN_FLOW_ID,
+    });
+
+    const sent = await container.services.flow.proceed({
+      sessionId,
+      flowId: RUNNABLE_CHAIN_FLOW_ID,
+      payloadOverrides: { "$.context.ttl": "PT99S" },
+    });
+    expect(sent).toMatchObject({ outcome: "SENT", action: "search" });
+    expect(sent.overrides).toEqual(["$.context.ttl"]);
+
+    await settle();
+
+    // Positive on both halves, so neither assertion can pass by the field
+    // simply being absent: the patch landed on the step it was given for...
+    const ttlOf = (call: { seen: unknown[] }, index = 0): unknown =>
+      (call.seen[index] as { context: Record<string, unknown> }).context["ttl"];
+    expect(ttlOf(searchCall)).toBe("PT99S");
+    // ...and the chained step carries the config's own value instead.
+    expect(statusCall.seen).toHaveLength(1);
+    expect(ttlOf(statusCall)).toBe("PT30S");
+
+    const record = await container.services.record.requireTransaction(
+      sent.transaction_id ?? "",
+      NP,
+    );
+    const chained = record.apiList.find(
+      (item) => item.entryType === "API" && item.action === "status",
+    );
+    expect(chained).toBeDefined();
+    expect(chained).not.toHaveProperty("overrides");
+  });
+
+  it("refuses the transaction id and leaves the payload alone", async () => {
+    const search = acceptsAction(agent, NP, "search");
+    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+
+    const outcome = await container.services.flow.proceed({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      payloadOverrides: { "$.context.transaction_id": "somebody-elses-id" },
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "BLOCKED",
+      reason: "overrides_refused",
+    });
+    expect(outcome.override_problems?.[0]?.reason).toContain("flow_restart");
+    // Nothing generated, nothing bound, nothing sent — so correcting it and
+    // calling again costs the run nothing.
+    expect(search.seen).toHaveLength(0);
+    expect(outcome.transaction_id).toBeUndefined();
+  });
+
+  it("refuses them on a step that is not ours to send", async () => {
+    // Silently dropping them is exactly the failure this feature answers: a
+    // caller states an intent and nothing honours it or says so.
+    acceptsAction(agent, NP, "search");
+    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await sendFirstAction();
+
+    const outcome = await container.services.flow.proceed({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      payloadOverrides: { "$.context.ttl": "PT10S" },
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "BLOCKED",
+      reason: "overrides_not_applicable",
+    });
   });
 });

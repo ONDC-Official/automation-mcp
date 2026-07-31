@@ -186,10 +186,31 @@ const b64 = (source: string): string => MockRunner.encodeBase64(source);
  * the return shape (`{valid, code, description}`), so these are written exactly
  * as a real config would be.
  */
+/**
+ * The flow's **first** action, and the one that indexes seeded identity `[0]`.
+ *
+ * Published configs read identity out of session data positionally, because
+ * `saveData` runs `jsonpath.query` and every value it writes is a list — the
+ * live TRV11 config says `context.bpp_id = sessionData?.bppId[0]` verbatim.
+ * On a first action nothing has been saved yet, so all four keys come from
+ * `FlowService#seedIdentity` instead, and if it seeds bare strings then `[0]`
+ * is the first *character* and `"mock.ondc-mcp.local"` goes out as `"m"`.
+ *
+ * Echoing them into the message is what makes that visible: nothing throws,
+ * the payload is well-formed, and only the value is quietly wrong.
+ */
 const GENERATE_SEARCH = b64(`
 async function generate(defaultPayload, sessionData) {
   defaultPayload.message = {
-    intent: { descriptor: { name: sessionData.user_inputs?.query ?? "loan" } },
+    intent: {
+      descriptor: { name: sessionData.user_inputs?.query ?? "loan" },
+      identity: {
+        bap_id: sessionData.bapId?.[0] ?? null,
+        bap_uri: sessionData.bapUri?.[0] ?? null,
+        bpp_id: sessionData.bppId?.[0] ?? null,
+        bpp_uri: sessionData.bppUri?.[0] ?? null,
+      },
+    },
   };
   return defaultPayload;
 }
@@ -283,7 +304,31 @@ interface StepOverrides {
   requirements: string;
   saveData?: Record<string, string>;
   formHtml?: string;
+  inputs?: unknown;
 }
+
+/**
+ * The schema-bearing declaration shape, as `ONDC:TRV11/2.0.1/Metro` publishes
+ * it: a wrapper id plus a JSON Schema whose *properties* are the keys
+ * `generate` reads off `user_inputs`.
+ *
+ * `GENERATE_SELECT` reads `sessionData.user_inputs?.loan_amount`, flat — so a
+ * caller that nests under `SelectInputId` generates an order with a null
+ * amount and no error anywhere. That is the bug this fixture exists to keep
+ * caught; see `catalog.inputs.ts`.
+ */
+const SELECT_INPUTS = {
+  id: "SelectInputId",
+  jsonSchema: {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: {
+      loan_amount: { type: "number", default: 50_000 },
+    },
+    required: ["loan_amount"],
+    additionalProperties: true,
+  },
+};
 
 function step(
   api: string,
@@ -305,7 +350,7 @@ function step(
       requirements: overrides.requirements,
       defaultPayload: { context: { action: api }, message: {} },
       saveData: overrides.saveData ?? {},
-      inputs: {},
+      inputs: overrides.inputs ?? {},
       ...(overrides.formHtml !== undefined
         ? { formHtml: overrides.formHtml }
         : {}),
@@ -357,6 +402,7 @@ export function buildRunnableMockConfig(flowId: string): UpstreamMockConfig {
         validate: VALIDATE_OK,
         requirements: REQUIREMENTS_NEEDS_PROVIDER,
         saveData: { orderAmount: "$.message.order.amount" },
+        inputs: SELECT_INPUTS,
       }),
       step("on_select", "on_select_1", "BPP", "select_1", {
         generate: GENERATE_ON,

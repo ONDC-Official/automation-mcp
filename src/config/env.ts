@@ -122,6 +122,59 @@ const EnvSchema = z
       .positive()
       .default(900_000),
 
+    /* ---- Issue reporting (the incident corpus) ---- */
+
+    /**
+     * Turn capture and reporting off entirely.
+     *
+     * On by default, because the whole point is that a stuck run reports itself
+     * without anybody remembering to ask. What "on" means with nothing else
+     * configured is deliberately modest: incidents are captured and written to a
+     * local spool directory, and **nothing leaves the machine** until
+     * `FEEDBACK_ENDPOINT_URL` is set. Boot logs which way this went, and where.
+     */
+    FEEDBACK_DISABLED: z
+      .stringbool({
+        truthy: ["1", "true", "yes"],
+        falsy: ["0", "false", "no", ""],
+      })
+      .default(false),
+    /**
+     * Where reports are POSTed, in addition to the spool.
+     *
+     * Unset — the default — means spool-only. `optionalUrl`, so a blank line in
+     * a `.env` reads as "not configured" rather than exiting 1.
+     */
+    FEEDBACK_ENDPOINT_URL: optionalUrl,
+    /** Bearer token for the ingest, if it wants one. */
+    FEEDBACK_API_KEY: z.string().min(1).optional(),
+    /**
+     * Where reports are written before, and regardless of, any upload.
+     *
+     * The spool is the trust surface: it is how an operator answers "what did
+     * this send about my participant?" by reading a file rather than by taking
+     * our word for it. It is also what makes an upload failure survivable.
+     */
+    FEEDBACK_SPOOL_DIR: z.string().min(1).optional(),
+    /**
+     * Ceiling on one upload. Small, and never on the ACK path — a report is
+     * worth nothing next to a protocol call, so it must not be able to hold one
+     * up even indirectly through the shared agent's connection pool.
+     */
+    FEEDBACK_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+    /** Spool entries kept before the oldest are pruned. An offline laptop must
+     * not grow an unbounded directory. */
+    FEEDBACK_SPOOL_MAX_FILES: z.coerce.number().int().positive().default(500),
+    /**
+     * HMAC salt for identifier pseudonyms.
+     *
+     * Unset, one is generated and persisted beside the spool on first use. Set
+     * it explicitly to make pseudonyms stable across machines — which is only
+     * ever what you want when several deployments are meant to look like one
+     * installation in the corpus.
+     */
+    FEEDBACK_SALT: z.string().min(1).optional(),
+
     /* ---- Shared state store ---- */
 
     /**

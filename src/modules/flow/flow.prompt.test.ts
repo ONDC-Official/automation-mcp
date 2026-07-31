@@ -103,6 +103,14 @@ describe("flow prompts", () => {
       expect(text).toMatch(/wait on the session/i);
       // And the one event that means "you are now the blocker".
       expect(text).toContain("CHAIN_PAUSED");
+      // The reporting loop: a model that never files a report leaves the
+      // corpus with facts and no diagnosis, which is the half only it has.
+      expect(text).toContain("ISSUE_OPEN");
+      expect(text).toContain("feedback_submit_report");
+      expect(text).toMatch(/tooling_gap/);
+      // `\s+`, not a space: the prompt is hard-wrapped, so any phrase long
+      // enough to be worth asserting on may carry a newline through its middle.
+      expect(text).toMatch(/do not paste payload\s+values/i);
     },
   );
 });

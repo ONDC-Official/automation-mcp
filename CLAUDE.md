@@ -126,15 +126,33 @@ Names follow the scaffold convention `module_verb_noun`. Every tool declares
 **Flow loop** — ✅ shipped
 
 - `flow_start` — session_id, flow_id → callback_url and the first `StepOutcome`. **`transaction_id` comes back `null`** and nothing is persisted but the binding; see the identity model. Validates the flow _before_ anything is sent: it must have a mock config, every step an owner, and every step key a config entry. Arms the expectation when the first step is the participant's — a model that obeys a `WAITING` outcome calls `flow_await`, never `flow_proceed`, so arming only in `proceed` meant the first callback was refused 412
-- `flow_proceed` — **the loop driver.** Requirements → generate → **bind, if this is the flow's first action** → record → save → send → settle, for the next mock-owned step. Optional `inputs`, `trigger_extra`, `dry_run`. **The record is written before the send, not after** — see "Recording an outbound call" below; getting this backwards NACKs correct participants
+- `flow_proceed` — **the loop driver.** Requirements → generate → **patch, if `payload_overrides` were given** → **bind, if this is the flow's first action** → record → save → send → settle, for the next mock-owned step. Optional `inputs`, `trigger_extra`, `dry_run`, `payload_overrides`. **The record is written before the send, not after** — see "Recording an outbound call" below; getting this backwards NACKs correct participants
 - `flow_await` — bounded blocking wait for the participant; reads the record first so a callback that already landed is never missed. An unbound run parks on `flow_run::{session}::{flow}` instead of the transaction (every event is published under both keys) and re-arms a lapsed expectation before a long wait
 - `flow_restart` — **abandon this run's attempt and open a fresh one**, in the same session. A flow's state is derived by replaying what was exchanged, so a NACKed step is part of the history from then on and `flow_start` deliberately _resumes_ — without this the only escape was `session_create`, which strands the old session's expectations on the endpoint every session shares. Destroys nothing: the abandoned attempt keeps its record, payloads and business data, and is _sealed_ (`TransactionRecord.abandoned`) rather than deleted. The run returns to unbound; the next action mints a new id. Named by `flow_id` only — the run is what restarts, and it may have no transaction id
 - `flow_get_status` — the derived flow map: every step's status and owner, off-sequence exchanges, and what the loop needs next
+
+**`payload_overrides` — the escape hatch for a config that is itself wrong**
+(`OVERRIDES-PLAN.md`, `flow/flow.overrides.ts`). Executing the flow's own
+`generate` is the strongest thing about this server, right up until a
+**published** config is simply broken — live TRV11 `search2_METRO_201` assigns
+`context.bpp_uri = sessionData?.bppUri` with no `[0]`, so a list reaches a
+string field and the gate stops the run. Two runs on 2026-07-31 ended
+`gave_up` there: a correct participant got no compliance report because of a
+typo nothing in this repo can fix. A map of JSONPath → value, applied after
+`generate` and before the gate, gets the run moving again.
+
+| Fact                                                                                                              | Consequence                                                                                                                                                                                    |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Not a validation bypass.** The gate runs on the _patched_ payload, so an override that does not fix the finding still blocks | sending a payload we already know violates L0 would write our defect into the participant's compliance report and teach neither side anything                                                  |
+| **Concrete paths only, all-or-nothing, `$.context.transaction_id` refused**                                       | a wildcard selects a set and `jsonpath.value` writes to one member of it silently; the transaction id keys every record and expectation, and `#assertTransactionId` exists to undo exactly this |
+| **Scoped to one call.** `chainNext` builds its own args and cannot inherit them; a non-dispatch branch refuses them by name | auto-advance sends with nobody watching, and a chained step carrying a patch nobody re-stated is bytes on a third party's wire that neither the config nor the model chose                     |
+| **A patched step is recorded as patched** — `ApiEntry.overrides`, the journal line, and the outcome              | the compliance report has to be able to say the participant was tested against a payload this flow's config did not produce. The corpus splits `RECOVERED_WITH_OVERRIDE` from `RECOVERED` for the same reason: one says an upstream config is broken, the other says the model was wrong and then was not |
 
 `flow_proceed` / `flow_await` / `flow_get_status` take **either** `flow_id`
 (works before the transaction exists, so prefer it) **or** `transaction_id`
 (names one specific run when a session has several). `flow_await` takes
 **neither**, too — see §4a.
+
 - `form_fetch` / `form_submit` — a form the participant hosts: fetch, screen, parse, fill, post. A form _we_ host needs no tool — the participant opens the URL we already sent
 
 `StepOutcome` is the tagged union every loop call ends in: `SENT` · `DRAFTED` ·
@@ -147,6 +165,39 @@ because it would have dispatched it.
 - `record_get_payload` — a stored payload by handle, with optional JSONPath slice and a byte cap
 - `record_get_data` — accumulated business data; oversized values are named, not returned
 - `record_get_events` — re-read the session journal **without** consuming it. Rarely needed, because every session-scoped result already carries the events since the last call; it exists for the overflow (`more > 0`) and to recover a delta lost to a client error, which is why it must stay cursor-neutral
+
+**Issue reporting** — ✅ shipped (`FEEDBACK-PLAN.md`)
+
+Every stuck run reports itself. Failures are captured deterministically from two
+taps — `RecordService#journal` and one outward observation point in
+`FlowService` that wraps the returned outcome _and_ the throw — deduplicated by
+signature, resolved by watching what the run did next, redacted structurally,
+and handed to a sink. **The report ships whether or not the model narrates it**;
+that is what makes it "every time" rather than "every time the model
+remembered".
+
+- `feedback_submit_report` — the model's account of one incident: `diagnosis`,
+  `attempted`, `outcome`, `suspected_cause`, and `tooling_gap` ("what would have
+  let you resolve this faster"), which is the field that actually improves this
+  tool surface. Not read-only, not idempotent — it finalises and sends
+- `feedback_list_reports` — every incident in the session; `include_body: true`
+  renders the fully-redacted report exactly as it would be uploaded, which is the
+  honest answer to a user asking what is being sent about them
+
+Three things are load-bearing and easy to undo:
+
+| Fact                                                                                                                                                       | Consequence                                                                                                                                                                                                                                                |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Code redacts, the model narrates.** Payload leaves become type tokens; only an explicit allowlist survives                                               | asking a model to strip PII from a payload it is holding is unverifiable and fails open. `feedback.redact.ts` is this module's `validate.parse.ts` — the file that can be wrong in a way nothing downstream catches, and therefore the file with the tests |
+| **`RECOVERED` is derived, never claimed** — an incident closes when a _later, successful_ exchange for the same action is journaled                        | "did the model fix it?" is the most valuable column in the corpus and the one the model is least able to answer about itself. `Narration.outcome` records the belief beside it; disagreement is itself a finding                                           |
+| **`RECOVERED_WITH_OVERRIDE` is a different row**, set when the journaled send carries `overrides`                                                          | "worked around a defect in a **published** config" and "was wrong and then was not" are opposite findings, and only the first is actionable outside this repo. `isRecovered()` keeps them interchangeable in control flow — a repeat re-opens either      |
+| **Detection must not double-count.** The journal side declines `OUTBOUND_SENT`-with-NACK and `CHAIN_PAUSED`, both of which `detectFromOutcome` already saw | `chainNext` re-enters `proceed`, so a chained step is observed once, not twice. `occurrences` is the number that says how hard something was fought                                                                                                        |
+| **One defect must not open two incidents.** A findings-bearing `BLOCKED` is normalised onto `VALIDATION_FINDINGS`, because the gate and `dry_run` describe the same failure through different outcome shapes | the gate's own message tells the model to inspect with `dry_run`, so the surface walks it into the second incident. Both 2026-07-31 runs spooled the pair                                                                                                 |
+
+`NODE_ENV=test` forces the no-op sink in `createContainer`, and `createHarness`
+injects one too. The spool's default is the operator's home directory, and the
+first version of this shipped without the guard and littered a real machine with
+reports about fixtures.
 
 **Session events** — ✅ shipped. See §4a. Every session-scoped tool result
 carries an `events` block; nothing that happens on the wire reaches the model
@@ -225,16 +276,16 @@ session, transaction or audit is created).
 
 Four things about it are load-bearing and easy to get wrong:
 
-| Fact | Consequence |
-| --- | --- |
-| Two grammars — L0 plain text (`at '/p': got x, want y`), L1 markdown (`#### **CODE**`) — and **L0 short-circuits L1** | the layer is *inferred*, not guessed. `validate.parse.ts` is the only thing that produces a code or a JSONPath, so it is the file with the tests |
-| `error.code` is always the literal `"Bad Request"`; `error.paths` is always empty | nothing structured to fall back on. The parser never throws and never answers a rejection with zero findings — an empty list reads exactly like `valid` |
-| No `context.transaction_id` ⇒ **HTTP 500** | guarded locally; the gateway will not call out without one |
-| A `protocol_validation=false` cookie makes ONIX **skip L1 and answer ACK** | we send no cookies. `validate.live.test.ts` asserts a known-bad payload still fails — that is what would catch this |
+| Fact                                                                                                                  | Consequence                                                                                                                                             |
+| --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Two grammars — L0 plain text (`at '/p': got x, want y`), L1 markdown (`#### **CODE**`) — and **L0 short-circuits L1** | the layer is _inferred_, not guessed. `validate.parse.ts` is the only thing that produces a code or a JSONPath, so it is the file with the tests        |
+| `error.code` is always the literal `"Bad Request"`; `error.paths` is always empty                                     | nothing structured to fall back on. The parser never throws and never answers a rejection with zero findings — an empty list reads exactly like `valid` |
+| No `context.transaction_id` ⇒ **HTTP 500**                                                                            | guarded locally; the gateway will not call out without one                                                                                              |
+| A `protocol_validation=false` cookie makes ONIX **skip L1 and answer ACK**                                            | we send no cookies. `validate.live.test.ts` asserts a known-bad payload still fails — that is what would catch this                                     |
 
 **`unavailable` is a third verdict, never a synonym for `valid`.** Both gates
 fail open on it, deliberately: NACKing a compliant participant because
-*workbench* was unreachable writes our infrastructure failure into their
+_workbench_ was unreachable writes our infrastructure failure into their
 compliance report. The skip is always said out loud — on the outcome for a
 direct call, in the journal for a chained send or an inbound callback, which is
 the only channel that reaches the model there.
@@ -294,7 +345,7 @@ HTTP status is **decoupled** from ACK/NACK:
 | Not a step the flow is waiting for                                                   | **200** | NACK, code `OUT_OF_SEQUENCE` — recorded anyway, as evidence                                                        |
 | `context.action` ≠ the URL's action segment                                          | **200** | NACK, code `ACTION_MISMATCH` — resolved and recorded first; the call did arrive                                    |
 | `transaction_id` ≠ the one this flow was bound to                                    | **200** | NACK, code `TRANSACTION_MISMATCH` — expectation put back, body stored out of line, surfaced as `attention`         |
-| The attempt it names was abandoned by `flow_restart`                                 | **200** | NACK, code `TRANSACTION_ABANDONED` — body stored out of line, surfaced as `attention`, never chained              |
+| The attempt it names was abandoned by `flow_restart`                                 | **200** | NACK, code `TRANSACTION_ABANDONED` — body stored out of line, surfaced as `attention`, never chained               |
 | Signature invalid / expired                                                          | 401     | — _(seam only; `verifyAuth` is a no-op today)_                                                                     |
 | Malformed context (no `message_id`, `action`, `transaction_id`, or counterparty URI) | **400** | _Deliberate divergence: the workbench panics with 500 on a missing `message_id`. We refuse cleanly and record it._ |
 | Transaction belongs to another domain/version/role                                   | 412     | NACK `WRONG_ENDPOINT`, naming the endpoint it does belong to                                                       |
@@ -318,6 +369,39 @@ The ACK is written **before** any auto-advance chaining (`setImmediate` after
 `reply.send`). Chaining inside the ACK window would hold the participant's
 connection open for the length of our own outbound call.
 
+### Step inputs are flat, and the declaration's name is not a key
+
+`flow_proceed`'s `inputs` becomes **`sessionData.user_inputs` verbatim**, and a
+step's `generate` reads the declared field names straight off it
+(`sessionData.user_inputs?.city_code`). But upstream publishes two declaration
+shapes that mean opposite things:
+
+| Shape                                 | Where the field names are                    |
+| ------------------------------------- | -------------------------------------------- |
+| `{name, schema:{properties}}` (TRV11) | in `schema.properties` — `name` is a wrapper |
+| `{name, label, type}` (FIS12)         | `name` **is** the field                      |
+
+Handing the raw declaration to the model cost a run: it read
+`{name: "ExampleInputId", schema: {properties: {city_code}}}` as an instruction
+to nest, `generate` found no `city_code`, and assigning `undefined` **deleted
+the field the default payload already had right**. The L1 failure that followed
+named `$.context.location.city.code` and nothing pointed back at the input, so
+it was filed as a config defect. The config was fine.
+
+`catalog/catalog.inputs.ts` is the one place that knows this. Three
+consequences, and undoing any of them restores the silence:
+
+| Fact                                                                                                                                | Consequence                                                                                                                                                                                                          |
+| ----------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Nothing hands back a raw declaration.** `inputs_required` states `fields`, a `note`, the merged `schema` and a worked `example`   | the raw shape is not neutral — it actively suggests the wrong thing, and it suggested it to a model that then checked `input_names`, got `["id","jsonSchema"]`, and read that as confirmation                        |
+| **The wrapper check runs ahead of the schema, and independently of it.** A key that names a schema-bearing declaration and holds an object is refused by name | TRV11's schema sets `additionalProperties: true`, so a declaration with nothing `required` lets the nested shape validate clean. Delegating this to Ajv would fail exactly as silently as before                     |
+| **`flow_proceed` checks inputs before requirements, generate or bind.** A mismatch answers `INPUT_REQUIRED` with `input_problems`   | nothing is generated, recorded or sent, so correcting it costs the run nothing — and this is the last point at which the real cause is still visible                                                                 |
+
+`id` and `submission_id` are ours (a manual step's trigger, a form submission)
+and are exempt from the declared schema. Declared **defaults are shown, never
+applied** — `example` carries them, and the value that goes out stays the
+model's choice.
+
 ### Identity model
 
 - `session_id` — one mock-NP session, many transactions
@@ -331,16 +415,16 @@ nothing** — no transaction, no business data, no id. It writes a binding, arms
 an expectation when the first step is the participant's, and returns
 `transaction_id: null`. The id is fixed at exactly one of two moments:
 
-| First action | Where the id comes from | Bind site |
-| --- | --- | --- |
-| Ours to send | `context.transaction_id` on the **generated payload**, read back after `generate` and before `send` | `flow.service.ts#bindOutbound` |
-| Theirs to send | `context.transaction_id` on their call, adopted verbatim | `flow.service.ts#adoptTransaction`, from the receiver's expectation branch |
+| First action   | Where the id comes from                                                                             | Bind site                                                                  |
+| -------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Ours to send   | `context.transaction_id` on the **generated payload**, read back after `generate` and before `send` | `flow.service.ts#bindOutbound`                                             |
+| Theirs to send | `context.transaction_id` on their call, adopted verbatim                                            | `flow.service.ts#adoptTransaction`, from the receiver's expectation branch |
 
 This is the workbench's own shape, not an invention:
 `startNewFlowController` writes nothing to cache, and the transaction is created
 only once a payload has crossed (`utils.go#createTransactionCache`). Minting up
 front produced an id that was never on the wire — the participant's call opened
-a *second* record under *their* id, and the id the caller was holding named
+a _second_ record under _their_ id, and the id the caller was holding named
 nothing, so `flow_await` on it could only time out.
 
 Two consequences worth keeping:
@@ -421,10 +505,10 @@ matches against it early. Over-recording is the harmless direction.
 A throw has to say whether the call was delivered, so `SenderService` classifies
 it onto `UpstreamError.details.delivery`:
 
-| `delivery` | Meaning | Entry |
-| --- | --- | --- |
-| `unreachable` | connection never came up (refused, DNS, TLS) | withdrawn — the step is still owed |
-| `uncertain` | request written, answer lost (timeouts, reset) — **the default** | kept, `sendState: "failed"` |
+| `delivery`    | Meaning                                                          | Entry                              |
+| ------------- | ---------------------------------------------------------------- | ---------------------------------- |
+| `unreachable` | connection never came up (refused, DNS, TLS)                     | withdrawn — the step is still owed |
+| `uncertain`   | request written, answer lost (timeouts, reset) — **the default** | kept, `sendState: "failed"`        |
 
 The default runs that way on purpose. A stuck run is recoverable with
 `flow_restart`; a duplicate protocol call on a real participant's wire is not
@@ -467,7 +551,7 @@ things no transaction owns. The two seq spaces are separate and must never be
 compared.
 
 **`RecordService#journal` never throws.** Every caller is on a path where
-failing is worse than forgetting — the receiver journals *after* the ACK is
+failing is worse than forgetting — the receiver journals _after_ the ACK is
 decided, `chainNext` journals with nobody left to return to. A store blip must
 not become a 500 the participant records as our non-compliance. Nothing is
 derived from the journal, so a lost line costs a notification, never a correct
@@ -480,13 +564,13 @@ answer.
    a `flow_await` reports the callback it unblocked on rather than one call late.
    Absent, not empty, when nothing happened.
 2. **Session-scope `flow_await`.** Naming neither `flow_id` nor
-   `transaction_id` blocks on the whole session. It is a *blocking drain*: the
+   `transaction_id` blocks on the whole session. It is a _blocking drain_: the
    delivery cursor is both the "anything new?" test and the answer, so no second
    seq is ever exposed. The loop re-drains at the top **including after a
    timeout** — an entry appended between a drain that found nothing and the park
    that follows it would notify no one, and the caller would otherwise sit out
    the full timeout with its answer already in the store. Filters (`kinds`,
-   `flow_ids`) decide what *ends* the wait, never what is delivered: the cursor
+   `flow_ids`) decide what _ends_ the wait, never what is delivered: the cursor
    has already moved past a filtered event, so withholding it would lose it. It
    answers with `runs` instead of `next`, and sweeps the session's runs to re-arm
    lapsed expectations before a long park.
@@ -557,12 +641,16 @@ src/lib/
   stdout-guard.ts  rebinds console onto stderr before anything else loads (stdio)
 
 src/modules/
-  catalog/     ✅ config-service client, builds/flows/mock configs, actor annotation
+  catalog/     ✅ config-service client, builds/flows/mock configs, actor annotation,
+               catalog.inputs.ts (what a step's declared inputs *mean* — the flat
+               `user_inputs` contract and the wrapper-name trap; the file with the tests)
   session/     ✅ sessions, NP identity, role inversion, interaction mode,
                endpoint index (the audience for an unattributable refusal)
                (later: difficulty knobs, nack_rules)
   flow/        ✅ engine/ (ported mapper) + the loop: start · proceed · await · status, prompts,
-               flow.repository.ts (FlowBinding — the run, and the id it later binds to)
+               flow.repository.ts (FlowBinding — the run, and the id it later binds to),
+               flow.overrides.ts (what a model may do to a generated payload —
+               pure, concrete-paths-only, all-or-nothing; the file with the tests)
   record/      ✅ exchanges + payloads + business data + the session event
                journal and its delivery cursor; all CacheStore access
   transport/   ✅ inbound receiver (pipeline + routes + lifecycle) + outbound sender
@@ -571,6 +659,10 @@ src/modules/
                prose→findings grammar, and where the tests are) · service (the
                ValidationCheck pipeline) · payload_validate.
                context + L2 intake still to come — each is one more check
+  feedback/    ✅ the incident corpus: redact (default-deny, the file with the
+               tests) · detect (the trigger table as data) · repository ·
+               service (capture · resolve · narrate · flush) · sink
+               (NoopSink · SpoolSink · HttpSink · SpoolAndUploadSink)
   signing/     ed25519 + blake2b-512, KeyProvider       (not built)
   report/      compliance report                        (not built)
 
@@ -597,6 +689,9 @@ Env (extend `src/config/env.ts`, keep the fail-fast-at-boot property). Live toda
 `RUNNER_CACHE_TTL_MS`, `RUNNER_FETCH_ALLOWLIST`, `FORM_FETCH_TIMEOUT_MS`,
 `VALIDATION_SERVICE_URL`, `VALIDATION_TIMEOUT_MS`, `VALIDATION_MODE`,
 `VALIDATION_CACHE_TTL_MS`,
+`FEEDBACK_DISABLED`, `FEEDBACK_ENDPOINT_URL`, `FEEDBACK_API_KEY`,
+`FEEDBACK_SPOOL_DIR`, `FEEDBACK_TIMEOUT_MS`, `FEEDBACK_SPOOL_MAX_FILES`,
+`FEEDBACK_SALT`,
 `TRANSACTION_TTL_MS`, `EXPECTATION_TTL_MS`, `REDIS_URL`, `REDIS_KEY_PREFIX`,
 `REDIS_COMMAND_TIMEOUT_MS`. Arriving with signing: `ONDC_SUBSCRIBER_ID`,
 `ONDC_UNIQUE_KEY_ID`, `ONDC_SIGNING_PRIVATE_KEY`, `ONDC_SIGNING_PUBLIC_KEY`,
@@ -644,7 +739,7 @@ distributed lock. All three are built from one helper, `withKeyLock` in
   server never saw is a finding it cannot make.
 - `FlowService#runLocks` — serialises `flow_proceed` per run when it is named by
   `flow_id`, because an unbound run has nothing durable to contend on. The
-  `WORKING` marker is read before it is written, and for the flow's *first*
+  `WORKING` marker is read before it is written, and for the flow's _first_
   action losing that race means a second minted id, a second transaction, and a
   duplicate call on a third party's wire.
 
@@ -690,8 +785,30 @@ Each phase lands with tests before the next starts.
    is 10.7 MB per build and the `x-validations` DSL is compiled by a service of
    its own. The context layer is still owed, and is now a `ValidationCheck`
    rather than a rewrite.
-9. `signing` — `header_sign` / `header_verify`, cross-checked against the header-guide vectors, then dropped into the `RequestSigner` seam on `SenderService` and the `verifyAuth` hook on the receiver. Both seams already exist and ship no-ops.
-10. `report` + L2 — `inbound_review`, `report_generate`, `session_state`, and the difficulty knobs / `nack_rules` on `session_create`.
+
+9. ✅ **`feedback` — every stuck run reports itself** (`FEEDBACK-PLAN.md`).
+   Structural redaction and its leak canary, the two capture taps, derived
+   resolution, the `ISSUE_OPEN` nudge riding the existing `events` piggyback,
+   spool-then-upload delivery, and `feedback_submit_report` /
+   `feedback_list_reports`. Landed out of the original order — before `signing`
+   — because it depends on the journal (phase 7) and on validation verdicts
+   (phase 8), and on nothing else.
+
+   It also closed three diagnostic holes the exploration turned up: `chainNext`
+   swallowing send failures with only a `logger.error`, the mock-runner's
+   `logs`/`stack` never reaching a caller, and a transport failure producing no
+   outcome, no `attention` and no journal line.
+
+9a. ✅ **`payload_overrides` — the escape hatch** (`OVERRIDES-PLAN.md`). Not a
+planned phase: it came straight out of the first four spooled feedback reports,
+which is the corpus doing exactly what it was built for. `flow.overrides.ts`,
+both gates' interaction with it, `ApiEntry.overrides`, the journal field and
+`RECOVERED_WITH_OVERRIDE`. The same triage fixed `#seedIdentity` seeding scalars
+where configs index `[0]`, the double-counted incident, and
+`record_get_payload`'s match list being read as the stored value.
+
+10. `signing` — `header_sign` / `header_verify`, cross-checked against the header-guide vectors, then dropped into the `RequestSigner` seam on `SenderService` and the `verifyAuth` hook on the receiver. Both seams already exist and ship no-ops.
+11. `report` + L2 — `inbound_review`, `report_generate`, `session_state`, and the difficulty knobs / `nack_rules` on `session_create`. Note that `report_generate` is the **participant's** compliance report and stays on the machine; `feedback` is our own tooling telemetry and leaves it. They share evidence; conflating their audiences would be the bug. **A patched step must be reported as patched** — `ApiEntry.overrides` is recorded and waiting for this.
 
 **Testing** — service logic: plain unit tests. Tools/resources/prompts:
 `src/test/harness.ts` (real client ↔ real server over in-memory transport).

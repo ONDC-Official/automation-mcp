@@ -6,6 +6,7 @@ import {
   type Container,
   type CreateContainerOptions,
 } from "@/container.js";
+import { NoopSink } from "@/modules/feedback/feedback.sink.js";
 import { buildMcpServer } from "@/mcp/server.js";
 import {
   createFakeConfigServiceGateway,
@@ -52,6 +53,11 @@ export async function createHarness(
     // A suite whose result depends on a remote validator is a suite that fails
     // for reasons unrelated to the change under test.
     validationGateway: createFakeValidationGateway(),
+    // Same rule, one step further: no test may write an issue report to the
+    // operator's home directory. `createContainer` refuses to build a real
+    // spool under `NODE_ENV=test` as well — two guards, because this one is
+    // bypassed by any test that builds a container directly.
+    feedbackSink: new NoopSink(),
     ...options,
   });
   const server = buildMcpServer(container);

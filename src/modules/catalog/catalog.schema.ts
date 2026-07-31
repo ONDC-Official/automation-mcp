@@ -228,7 +228,12 @@ export const FlowStep = z.object({
     .describe("True when the flow advances without waiting for this step."),
   inputs: z
     .array(StepInput)
-    .describe("Values a caller must supply before the step can be produced."),
+    .describe(
+      "Input declarations, as the flow definition publishes them. A `name` " +
+        "here is the declaration's own id — when it carries a `schema`, the " +
+        "keys to send are that schema's properties, not this name. " +
+        "flow_proceed's `inputs_required` states them directly; prefer it.",
+    ),
 });
 export type FlowStep = z.infer<typeof FlowStep>;
 

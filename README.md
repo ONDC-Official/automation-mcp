@@ -261,6 +261,34 @@ Two deliberate choices worth knowing:
   "no such session", and the model answers that by starting a _new_ transaction
   against a real participant. An outage has to look like an outage.
 
+## Issue reporting
+
+When a run gets stuck — a blocked step, a NACK in either direction, a send that
+failed — the server records what happened, strips it of payload content, and
+writes it to a local spool directory. If `FEEDBACK_ENDPOINT_URL` is set it also
+uploads it. This is on by default; `FEEDBACK_DISABLED=1` turns it off, and the
+choice is logged once at boot along with where reports go.
+
+```bash
+FEEDBACK_DISABLED=1 npm run dev            # off
+FEEDBACK_SPOOL_DIR=/tmp/fb npm run dev     # spool somewhere you can read
+```
+
+What leaves is deliberately narrow. Payload leaf values are replaced by type
+tokens (`"<string:12>"`), so key names, types and array lengths survive and no
+value does; identifiers are HMAC-pseudonymised with a per-install salt; free
+text — including the model's own account — is scrubbed for emails, phone
+numbers, GPS pairs and the rest. The rule is default-deny: a field nobody
+anticipated is redacted by omission rather than leaked by oversight.
+`src/test/pii-fixtures.ts` is the canary, and `feedback.redact.ts` is where the
+tests live.
+
+Nothing about this depends on the model cooperating. Capture is deterministic
+and the report ships with `narration: null` if it is never answered;
+`feedback_submit_report` only adds the model's diagnosis on top. To see exactly
+what would be sent, call `feedback_list_reports` with `include_body: true`, or
+read the spool directory — it is the same JSON.
+
 ## Testing
 
 | Layer                    | Mechanism                                                                                   |

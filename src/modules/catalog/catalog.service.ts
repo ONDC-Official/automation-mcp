@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 import { cacheKey, type CacheStore } from "@/lib/cache/cache-store.js";
 import { NotFoundError, ValidationError } from "@/lib/errors.js";
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
+import { resolveInputSpec } from "@/modules/catalog/catalog.inputs.js";
 import type {
   Build,
   BuildRef,
@@ -440,35 +441,19 @@ function toMockConfigStep(
   };
 }
 
-/** Names out of an array of `{name}` declarations. */
-function namesFromArray(entries: unknown[]): string[] {
-  return entries
-    .map((entry) =>
-      typeof entry === "object" && entry !== null && "name" in entry
-        ? String(entry.name)
-        : undefined,
-    )
-    .filter((name): name is string => name !== undefined);
-}
-
 /**
- * Input declarations vary in shape across configs: a bare array of
- * declarations, or a descriptor object that nests them (the live FIS12 configs
- * use `{oldInputs: [{name, …}]}`). Read names defensively and prefer nested
- * declarations over the wrapper's own keys — reporting "oldInputs" as an input
- * name would be actively misleading. An unfamiliar shape degrades to "no
- * declared inputs" rather than throwing mid-summary.
+ * The keys the step's generator will read off `sessionData.user_inputs`.
+ *
+ * Not the declaration names — those are two different things whenever a
+ * declaration carries a JSON Schema, and the difference is the whole subject of
+ * `flow.inputs.ts`. A summary that answered `["id", "jsonSchema"]` here (which
+ * this did, for the `{id, jsonSchema}` shape) reads as confirmation that the
+ * declaration's own keys are what `generate` wants, and has already been
+ * believed once.
+ *
+ * An unfamiliar shape degrades to "no declared inputs" rather than throwing
+ * mid-summary.
  */
 function inputNames(inputs: unknown): string[] {
-  if (Array.isArray(inputs)) return namesFromArray(inputs);
-
-  if (typeof inputs === "object" && inputs !== null) {
-    const nested = Object.values(inputs)
-      .filter((value): value is unknown[] => Array.isArray(value))
-      .flatMap(namesFromArray);
-    if (nested.length > 0) return nested;
-    return Object.keys(inputs);
-  }
-
-  return [];
+  return resolveInputSpec(inputs).fields.map((field) => field.name);
 }

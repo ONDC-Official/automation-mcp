@@ -134,6 +134,61 @@ describe("record_get_payload", () => {
     expect(output.payload).toEqual(["provider-0"]);
   });
 
+  it("says the outer array is the match list, not the value", async () => {
+    /*
+     * Regression: the match list was read as part of the stored value.
+     *
+     * A run on 2026-07-31 sliced `$.context.bpp_uri`, saw `[["https://…"]]`
+     * and filed the field as "a doubly-nested array". It was `["https://…"]`
+     * — the outer layer was this tool's own `jsonpath.query` result. The
+     * wrong nesting depth went into the diagnosis and into the corpus.
+     *
+     * Unwrapping a single match would trade one ambiguity for another
+     * (`$.a[*]` over a one-element list would then read as a scalar), so the
+     * count is stated instead.
+     */
+    const payloadId = await recordOnSearch();
+
+    const result = await harness.client.callTool({
+      name: "record_get_payload",
+      arguments: {
+        session_id: sessionId,
+        payload_id: payloadId,
+        jsonpath: "$.context.action",
+      },
+    });
+
+    const output = result.structuredContent as {
+      payload: unknown;
+      jsonpath_matches: number;
+    };
+    expect(output.payload).toEqual(["on_search"]);
+    expect(output.jsonpath_matches).toBe(1);
+
+    const text = (result.content as { text: string }[])[0]?.text ?? "";
+    expect(text).toContain("1 JSONPath match");
+    expect(text).toContain("not the stored value");
+  });
+
+  it("omits the match count when no jsonpath was given", async () => {
+    // Absent, not zero: the whole body is not a match list, and a `0` there
+    // would read as "nothing matched".
+    const payloadId = await recordOnSearch();
+
+    const result = await harness.client.callTool({
+      name: "record_get_payload",
+      arguments: {
+        session_id: sessionId,
+        payload_id: payloadId,
+        max_bytes: 200_000,
+      },
+    });
+
+    expect(result.structuredContent).not.toHaveProperty("jsonpath_matches");
+    const text = (result.content as { text: string }[])[0]?.text ?? "";
+    expect(text).not.toContain("JSONPath match");
+  });
+
   it("carries the ACK the counterparty answered with", async () => {
     const payloadId = await recordOnSearch();
 

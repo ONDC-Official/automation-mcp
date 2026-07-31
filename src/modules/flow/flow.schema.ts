@@ -44,6 +44,62 @@ export const FlowStatus = z.enum([
 ]);
 export type FlowStatus = z.infer<typeof FlowStatus>;
 
+/* -------------------------------------------------------------------------- */
+/* Declared inputs                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One key of the flat object a step's generator reads.
+ *
+ * Stated as fields rather than passed through as the raw upstream declaration,
+ * because the raw shape is actively misleading: `{name: "ExampleInputId",
+ * schema: {properties: {city_code}}}` reads as "nest under ExampleInputId" and
+ * means "send `city_code` at the top level". See `flow.inputs.ts`.
+ */
+export const StepInputField = z.object({
+  name: z.string().describe("Key inside the flat `inputs` object."),
+  required: z.boolean().describe("Whether the step's schema demands it."),
+  type: z.string().optional(),
+  label: z.string().optional(),
+  description: z.string().optional(),
+  default: z
+    .unknown()
+    .optional()
+    .describe("Declared default. Not applied for you."),
+  pattern: z.string().optional().describe("Regex the value must match."),
+  enum: z.array(z.unknown()).optional(),
+  reference: z
+    .string()
+    .optional()
+    .describe("JSONPath into saved data supplying the value, when declared."),
+});
+export type StepInputField = z.infer<typeof StepInputField>;
+
+export const InputsRequired = z.object({
+  fields: z
+    .array(StepInputField)
+    .describe("The keys to send, at the top level of `inputs`."),
+  note: z.string().describe("How to shape `inputs`. Read it before guessing."),
+  schema: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("JSON Schema for the whole flat `inputs` object, when declared."),
+  example: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      "A correctly shaped `inputs`, from declared samples and defaults.",
+    ),
+});
+export type InputsRequired = z.infer<typeof InputsRequired>;
+
+export const InputProblem = z.object({
+  code: z.enum(["nested_under_declaration", "schema"]),
+  field: z.string().optional(),
+  message: z.string(),
+});
+export type InputProblem = z.infer<typeof InputProblem>;
+
 /** One step of the derived map. */
 export const FlowStepState = z.object({
   key: z.string().describe("Step key, unique within the flow."),
@@ -69,10 +125,9 @@ export const FlowStepState = z.object({
   ack: AckStatus.optional().describe(
     "How the counterparty answered, for a completed step.",
   ),
-  inputs_required: z
-    .array(z.unknown())
-    .optional()
-    .describe("Input declarations that must be supplied before this can go."),
+  inputs_required: InputsRequired.optional().describe(
+    "What must be supplied before this step can go, as a flat object.",
+  ),
   awaiting_message_id: z
     .string()
     .optional()
@@ -237,11 +292,17 @@ export const StepOutcome = z.object({
     .describe("The participant's synchronous response, verbatim."),
 
   /* INPUT_REQUIRED */
-  inputs_required: z
-    .array(z.unknown())
+  inputs_required: InputsRequired.optional().describe(
+    "What the step declares it needs. Send `fields` as a flat object under " +
+      "flow_proceed's `inputs`.",
+  ),
+  input_problems: z
+    .array(InputProblem)
     .optional()
     .describe(
-      "What the step declares it needs. Pass values back as flow_proceed's `inputs`.",
+      "Why the supplied `inputs` were refused. Present only when values were " +
+        "sent and did not match — nothing was generated or sent, so fixing " +
+        "them and calling again costs the run nothing.",
     ),
 
   /* FORM_PENDING */
@@ -271,10 +332,32 @@ export const StepOutcome = z.object({
     .describe("Everything known about the block — requirement codes, errors."),
 
   /* Any outcome that generated a payload */
+  overrides: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Paths patched by `payload_overrides` before this payload was validated " +
+        "and sent. Present only when a step was patched, which makes it not a " +
+        "clean step: the participant was tested against a payload this flow's " +
+        "own config did not produce, and the compliance report says so.",
+    ),
+  override_problems: z
+    .array(
+      z.object({
+        path: z.string(),
+        reason: z.string(),
+      }),
+    )
+    .optional()
+    .describe(
+      "Why `payload_overrides` were refused. Nothing was patched, generated " +
+        "or sent — every path is judged before any is written, so correcting " +
+        "them and calling again costs the run nothing.",
+    ),
   validation: ValidationVerdict.optional().describe(
     "How the generated payload judged against the spec. Present whenever a " +
       "payload was produced, including one that was blocked or drafted rather " +
-      "than sent. `status: \"unavailable\"` means it went unchecked — the " +
+      'than sent. `status: "unavailable"` means it went unchecked — the ' +
       "payload was still sent, because refusing to act on our own outage " +
       "would strand the run.",
   ),
@@ -468,8 +551,12 @@ export const ProceedInput = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe(
-      "Values for a step reported as INPUT_REQUIRED. For a manual step pass " +
-        "{id: '<step_key>'} — naming it is what triggers it.",
+      "Values for a step reported as INPUT_REQUIRED, as a **flat** object: it " +
+        "becomes `sessionData.user_inputs` verbatim and the step's generator " +
+        "reads the declared field names off the top of it. Do not nest them " +
+        "under the declaration's name — `inputs_required.fields` lists the " +
+        "keys to send, and `inputs_required.example` shows the shape. For a " +
+        "manual step pass {id: '<step_key>'} — naming it is what triggers it.",
     ),
   trigger_extra: z
     .string()
@@ -478,12 +565,29 @@ export const ProceedInput = z.object({
       "Fire a named side-channel step from the flow's extra sequence instead " +
         "of advancing the main sequence. Only steps this mock owns can be fired.",
     ),
+  payload_overrides: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      "Patch the generated payload before it is validated and sent: a map of " +
+        "JSONPath to replacement value, e.g. " +
+        '{"$.context.bpp_uri": "https://np.example.com/seller"}. This is the ' +
+        "escape hatch for a **flow config that is itself wrong** — a step " +
+        "whose generator emits a non-compliant field cannot otherwise be got " +
+        "past, and abandoning the run costs the participant its compliance " +
+        "report. Not a validation bypass: the gate still runs on the patched " +
+        "payload, so an override that does not fix the finding still blocks. " +
+        "Paths must be concrete (no wildcards, filters or `..`), " +
+        "`$.context.transaction_id` is refused, and they apply to this call " +
+        "only — a chained step never inherits them.",
+    ),
   dry_run: z
     .boolean()
     .optional()
     .describe(
       "Generate and record the payload but do not send it, so it can be " +
-        "inspected first. Nothing reaches the participant.",
+        "inspected first. Nothing reaches the participant. Combines with " +
+        "`payload_overrides` to check a patch before it goes out.",
     ),
 });
 export type ProceedInput = z.infer<typeof ProceedInput>;

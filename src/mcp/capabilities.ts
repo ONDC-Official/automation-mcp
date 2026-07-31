@@ -3,6 +3,7 @@ import type { Container } from "@/container.js";
 import type { Registerable } from "@/lib/define-tool.js";
 import { createCatalogResources } from "@/modules/catalog/catalog.resource.js";
 import { createCatalogTools } from "@/modules/catalog/catalog.tool.js";
+import { createFeedbackTools } from "@/modules/feedback/feedback.tool.js";
 import { createFlowPrompts } from "@/modules/flow/flow.prompt.js";
 import { createFlowTools } from "@/modules/flow/flow.tool.js";
 import { createFormsTools } from "@/modules/forms/forms.tool.js";
@@ -21,7 +22,8 @@ import { createValidateTools } from "@/modules/validate/validate.tool.js";
  * are built from the same factory.
  */
 export function collectCapabilities(container: Container): Registerable[] {
-  const { catalog, session, record, flow, forms, validate } = container.services;
+  const { catalog, session, record, flow, forms, validate, feedback } =
+    container.services;
 
   return [
     ...createTransportTools(container),
@@ -37,6 +39,7 @@ export function collectCapabilities(container: Container): Registerable[] {
     ...createFormsTools(forms, record),
     ...createValidateTools(validate, session, record),
     ...createRecordTools(record, session),
+    ...createFeedbackTools(feedback, session, record),
     ...createSessionResources(session),
     ...createCatalogResources(catalog),
     ...createRecordResources(record, session),

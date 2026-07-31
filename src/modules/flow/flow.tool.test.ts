@@ -188,6 +188,41 @@ describe("flow_proceed — sending", () => {
     expect(sent.context["bap_uri"]).not.toContain("bap.example.com");
   });
 
+  it("seeds identity as lists, because configs index it [0]", async () => {
+    /*
+     * Regression: `#seedIdentity` wrote bare strings.
+     *
+     * Everything else in `sessionData` arrives through `saveData`, which runs
+     * `jsonpath.query` and always yields a list, so published configs index
+     * identity in place — live TRV11 has
+     * `context.bpp_id = sessionData?.bppId[0]`. A bare string does not throw
+     * there; `[0]` is its first character, so `"mock.ondc-mcp.local"` reaches
+     * a third party's wire as `"m"`.
+     *
+     * This is the flow's first action, which is exactly when it bites: nothing
+     * has been saved, so all four keys are seeds rather than saves. The same
+     * hole opens later for any field the participant omits, because an omitted
+     * field saves as `[]` and falls back to the seed.
+     */
+    const { seen } = acceptAll("search");
+    await startFlow();
+    await proceed();
+
+    const sent = seen[0] as {
+      message: { intent: { identity: Record<string, string> } };
+    };
+    const identity = sent.message.intent.identity;
+
+    expect(identity["bap_id"]).toBe("mock.ondc-mcp.local");
+    expect(identity["bap_uri"]).toBe(
+      `http://127.0.0.1:3000/${RUNNABLE_BUILD.domain}/${RUNNABLE_BUILD.version}/buyer`,
+    );
+    // The mock is the BAP here, so the BPP half is the participant — seeded as
+    // a fallback until its own payloads say otherwise, and a list either way.
+    expect(identity["bpp_id"]).toBe("np.example.com");
+    expect(identity["bpp_uri"]).toBe(NP);
+  });
+
   it("passes inputs through to the config's generator", async () => {
     const { seen } = acceptAll("search");
     await startFlow();
@@ -339,9 +374,11 @@ describe("flow_proceed — gates", () => {
       outcome: "INPUT_REQUIRED",
       step_key: "select_1",
     });
-    expect(outcome.inputs_required).toEqual([
-      expect.objectContaining({ name: "loan_amount" }),
-    ]);
+    // The keys to send, not the raw declaration — see catalog.inputs.ts.
+    expect(outcome.inputs_required).toMatchObject({
+      fields: [expect.objectContaining({ name: "loan_amount" })],
+    });
+    expect(outcome.inputs_required?.note).toMatch(/flat object/);
   });
 
   it("dry_run generates a payload without putting it on the wire", async () => {
@@ -576,7 +613,11 @@ describe("flow_get_status", () => {
 describe("flow_restart", () => {
   async function restart(
     extra: Record<string, unknown> = {},
-  ): Promise<{ output: Record<string, unknown>; text: string; isError: boolean }> {
+  ): Promise<{
+    output: Record<string, unknown>;
+    text: string;
+    isError: boolean;
+  }> {
     const result = await harness.client.callTool({
       name: "flow_restart",
       arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID, ...extra },
@@ -645,9 +686,7 @@ describe("flow_restart", () => {
       error: { code: "not_found", details: { hint: expect.any(String) } },
     });
     expect(
-      String(
-        (output["error"] as { details: { hint: string } }).details.hint,
-      ),
+      String((output["error"] as { details: { hint: string } }).details.hint),
     ).toContain("flow_start");
   });
 

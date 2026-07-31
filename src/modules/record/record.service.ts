@@ -49,6 +49,49 @@ import {
  *    this is what carries a provider id from `on_search` into `select`.
  */
 
+/**
+ * Something that watches every journal line as it is written.
+ *
+ * Exactly one implementation today — `FeedbackService`, which opens an incident
+ * from the lines that describe a failure. It is a tap rather than a set of
+ * calls scattered through the receiver and the flow service, because the
+ * journal is *already* the place every noteworthy thing goes: the guarantee
+ * "if the model is told, the corpus is told" holds by construction instead of
+ * by remembering.
+ *
+ * Two obligations on the implementer, neither of which this service enforces:
+ *
+ * 1. **Return promptly and never throw.** This is called on the receiver's
+ *    path, after the ACK is decided. Do the work off the hot path.
+ * 2. **Ignore your own kinds.** An observer that journals in response to a
+ *    journal line will recurse until the process dies.
+ */
+export interface SessionEventObserver {
+  onSessionEvent(
+    sessionId: string,
+    event: SessionEvent,
+    diagnostics?: SessionEventDiagnostics,
+  ): void;
+}
+
+/**
+ * Detail that goes to the observer and is **never stored on the event**.
+ *
+ * The journal is model-facing: its entries are one-sentence summaries, and
+ * `record_get_events` hands them straight to a context window. Findings,
+ * sandbox stacks and sequence maps belong in a report, not in a summary — so
+ * they travel beside the entry rather than on it, and die if nobody is
+ * listening.
+ *
+ * Deliberately typed as loose data here. `record` must not import `feedback`;
+ * the shape that matters is `IncidentEvidence`, and the observer is the thing
+ * that knows it.
+ */
+export interface SessionEventDiagnostics {
+  readonly stepKey?: string;
+  readonly evidence?: Record<string, unknown>;
+}
+
 export interface RecordServiceOptions {
   repository: RecordRepository;
   events: TransactionEvents;
@@ -57,6 +100,8 @@ export interface RecordServiceOptions {
   /** Lifetime of an armed expectation; this service owns `expireAt`. */
   expectationTtlMs: number;
   logger: Logger;
+  /** Optional; absent in most tests and when feedback reporting is disabled. */
+  observer?: SessionEventObserver;
 }
 
 export interface CreateTransactionInput {
@@ -117,6 +162,13 @@ export interface AppendApiEntryInput {
    * recorded before it is answered rather than after.
    */
   sendState?: "in_flight";
+  /**
+   * Paths patched by `payload_overrides` before this payload went out.
+   *
+   * See `ApiEntry.overrides`: a patched step is not a clean step, and the
+   * record is the only place a compliance report can learn that.
+   */
+  overrides?: string[];
   /**
    * Skip the `TransactionEvent` notification.
    *
@@ -207,12 +259,15 @@ export class RecordService {
    */
   readonly #recordLocks = new Map<string, Promise<unknown>>();
 
+  readonly #observer: SessionEventObserver | undefined;
+
   constructor(options: RecordServiceOptions) {
     this.#repository = options.repository;
     this.#events = options.events;
     this.#mockEngine = options.mockEngine;
     this.#expectationTtl = options.expectationTtlMs;
     this.#logger = options.logger;
+    this.#observer = options.observer;
   }
 
   /* ----------------------------- transactions ----------------------------- */
@@ -332,6 +387,9 @@ export class RecordService {
           ...(input.sendState !== undefined
             ? { sendState: input.sendState }
             : {}),
+          ...(input.overrides !== undefined && input.overrides.length > 0
+            ? { overrides: input.overrides }
+            : {}),
         };
 
         const updated: TransactionRecord = {
@@ -377,7 +435,9 @@ export class RecordService {
    * entry `flow_restart` swept, and failing the send afterwards would report a
    * delivered call as a transport error.
    */
-  settleApiEntry(input: SettleApiEntryInput): Promise<TransactionRecord | undefined> {
+  settleApiEntry(
+    input: SettleApiEntryInput,
+  ): Promise<TransactionRecord | undefined> {
     return this.#withRecordLock(
       input.transactionId,
       input.subscriberUrl,
@@ -665,10 +725,16 @@ export class RecordService {
    * and must never be compared; a session waiter tests its delivery cursor, a
    * run waiter tests `after_seq`.
    */
-  async journal(sessionId: string, entry: JournalEntry): Promise<void> {
+  async journal(
+    sessionId: string,
+    entry: JournalEntry,
+    diagnostics?: SessionEventDiagnostics,
+  ): Promise<void> {
+    let event: SessionEvent | undefined;
+
     try {
       const seq = await this.#repository.nextJournalSeq(sessionId);
-      const event: SessionEvent = {
+      event = {
         ...entry,
         seq,
         at: entry.at ?? new Date().toISOString(),
@@ -683,6 +749,40 @@ export class RecordService {
       this.#logger.warn(
         { err: error, sessionId, kind: entry.kind },
         "could not journal a session event; the record itself is unaffected",
+      );
+    }
+
+    // Outside the try, and after it, on purpose. A failed append still happened
+    // as far as the *corpus* is concerned — the thing it describes went wrong
+    // whether or not we managed to write a line about it — and an observer that
+    // only ever hears about successful writes would go quietest exactly when
+    // the store is in trouble.
+    this.#notifyObserver(
+      sessionId,
+      event ?? { ...entry, seq: 0, at: entry.at ?? new Date().toISOString() },
+      diagnostics,
+    );
+  }
+
+  /**
+   * Hand the line to the observer, absorbing anything it does wrong.
+   *
+   * Same contract as `journal` itself, one level down: this runs after the ACK
+   * is decided, so an observer that throws must not become a 500 the
+   * participant records as our non-compliance.
+   */
+  #notifyObserver(
+    sessionId: string,
+    event: SessionEvent,
+    diagnostics: SessionEventDiagnostics | undefined,
+  ): void {
+    if (this.#observer === undefined) return;
+    try {
+      this.#observer.onSessionEvent(sessionId, event, diagnostics);
+    } catch (error) {
+      this.#logger.warn(
+        { err: error, sessionId, kind: event.kind },
+        "a session event observer threw; the journal itself is unaffected",
       );
     }
   }
@@ -1219,7 +1319,10 @@ export function rankExpectations(
     }
     const registered = normaliseSubscriberUrl(entry.subscriberUrl);
     if (registered === advertised) return 1;
-    if (advertisedHost !== undefined && hostOfUrl(registered) === advertisedHost)
+    if (
+      advertisedHost !== undefined &&
+      hostOfUrl(registered) === advertisedHost
+    )
       return 2;
     return 3;
   };

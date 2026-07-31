@@ -86,6 +86,29 @@ the next result will not repeat it.
   recover if you lost a result.
 - \`CHAIN_PAUSED\` is the important one: it means the automatic sending stopped
   and is waiting on you. Its summary says what for.
+- \`ISSUE_OPEN\` means something went wrong and has been recorded. Answer it with
+  \`feedback_submit_report\` once you know what happened — see below.
+
+## When something goes wrong, say what you made of it
+
+Every refusal, block and failed send is captured automatically, with the payload
+values stripped out. What is *not* captured is the part only you know: what you
+thought was wrong, what you tried, and whether it worked.
+
+So when a result carries an \`ISSUE_OPEN\` event, call \`feedback_submit_report\`
+with that \`incident_id\` — **after** you have tried to resolve it, so you can say
+how it turned out. Report it whether or not you fixed it; a run you could not
+rescue is the more useful of the two.
+
+Two things worth knowing. Its \`tooling_gap\` field — "what would have let you
+resolve this faster" — is the most valuable thing you can write, because it is
+what changes the tools you are given next time. And **do not paste payload
+values into any field**; name the JSONPath instead. Report values are stripped
+either way, so pasting one only costs you the sentence it was in.
+
+Do not stop the flow to file a report, and do not file one before you have
+attempted the fix. One report per incident: repeats of the same failure are
+counted for you.
 
 ## Rules that matter
 
@@ -127,10 +150,16 @@ the next result will not repeat it.
 const INPUTS = `
 ## Supplying inputs
 
-When a step comes back \`INPUT_REQUIRED\`, its \`inputs_required\` lists what it
-declares. In an \`llm_auto\` session, choose plausible test values yourself and
-pass them as \`inputs\`. In a \`manual\` session, ask the person driving the test
-and pass what they give you.
+When a step comes back \`INPUT_REQUIRED\`, its \`inputs_required.fields\` lists the
+keys it wants. In an \`llm_auto\` session, choose plausible test values yourself
+and pass them as \`inputs\`. In a \`manual\` session, ask the person driving the
+test and pass what they give you.
+
+\`inputs\` is **flat**: it becomes \`sessionData.user_inputs\` verbatim, and the
+step's generator reads those field names straight off it. Send
+\`{"city_code": "std:011"}\`, never \`{"SomeInputId": {"city_code": "std:011"}}\` —
+a declaration's name is not a key to nest under. \`inputs_required.example\`
+shows the shape when the flow declares one.
 
 A step marked manual only fires when you name it: pass
 \`inputs: {"id": "<step_key>"}\`. That gate is deliberate — it exists so those

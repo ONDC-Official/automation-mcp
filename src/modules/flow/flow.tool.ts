@@ -62,6 +62,19 @@ export function renderOutcome(outcome: StepOutcome): string {
   if (outcome.form_url !== undefined) {
     lines.push(`  form: ${outcome.form_url}`);
   }
+  // Said plainly rather than left in `details`: a patched step is the one thing
+  // in a run that a compliance report has to caveat, and the model narrating
+  // that run should not have to go looking for it.
+  if (outcome.overrides !== undefined && outcome.overrides.length > 0) {
+    lines.push(`  patched: ${outcome.overrides.join(", ")}`);
+  }
+  if (outcome.override_problems !== undefined) {
+    lines.push(
+      ...outcome.override_problems.map(
+        (problem) => `  override refused: ${problem.path} — ${problem.reason}`,
+      ),
+    );
+  }
   if (outcome.details !== undefined) {
     lines.push(`  details: ${JSON.stringify(outcome.details)}`);
   }
@@ -384,6 +397,9 @@ export function createFlowTools(
         "participant's it comes back WAITING; call flow_await. Pass " +
         "`dry_run: true` to generate and inspect a payload without sending it, " +
         "or `trigger_extra` to fire a named side-channel step. " +
+        "When a step is blocked because the flow's own config generates a " +
+        "non-compliant payload, `payload_overrides` patches the offending " +
+        "fields so the run can continue instead of being abandoned. " +
         "Sending the flow's first action is what mints its transaction_id, " +
         "which the answer then reports.",
       inputSchema: ProceedInput,
@@ -406,6 +422,7 @@ export function createFlowTools(
           inputs: input.inputs,
           triggerExtra: input.trigger_extra,
           dryRun: input.dry_run,
+          payloadOverrides: input.payload_overrides,
         })),
         ...(await eventsFor(records, input.session_id)),
       }),

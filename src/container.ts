@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Agent } from "undici";
 import type { Logger } from "pino";
 import type { Config } from "@/config/env.js";
@@ -10,6 +11,16 @@ import { MockEngine } from "@/lib/mock-engine/mock-engine.js";
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
 import { HttpConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
 import { CatalogService } from "@/modules/catalog/catalog.service.js";
+import { FeedbackRepository } from "@/modules/feedback/feedback.repository.js";
+import { FeedbackService } from "@/modules/feedback/feedback.service.js";
+import {
+  HttpSink,
+  NoopSink,
+  SpoolAndUploadSink,
+  SpoolSink,
+  defaultSpoolDirectory,
+  type FeedbackSink,
+} from "@/modules/feedback/feedback.sink.js";
 import { FlowRepository } from "@/modules/flow/flow.repository.js";
 import { FlowService } from "@/modules/flow/flow.service.js";
 import { FormsService } from "@/modules/forms/forms.service.js";
@@ -88,6 +99,7 @@ export interface Container {
     readonly flow: FlowService;
     readonly forms: FormsService;
     readonly validate: ValidateService;
+    readonly feedback: FeedbackService;
   };
   /** Where a participant reaches this server's inbound receiver. */
   readonly receiverPublicUrl: string;
@@ -147,6 +159,11 @@ export interface CreateContainerOptions {
   >[0]["dispatcher"];
   /** Signs outbound payloads. Defaults to the no-op signer. */
   signer?: RequestSigner;
+  /**
+   * Where issue reports go. Tests must pass one — the default writes to the
+   * operator's home directory, which no test may touch.
+   */
+  feedbackSink?: FeedbackSink;
 }
 
 export async function createContainer(
@@ -269,12 +286,113 @@ export async function createContainer(
     logger,
   });
 
-  const record = new RecordService({
+  /*
+   * The incident corpus.
+   *
+   * Built here, between the repositories and the services, because of a knot:
+   * `RecordService` notifies it (it owns the journal tap) and it writes a
+   * journal line back (`ISSUE_OPEN`). Taking only the two *repositories* — never
+   * `RecordService` itself — keeps the module graph one-way, and the one call
+   * going the other direction arrives as the `journal` function below, bound
+   * after `record` exists.
+   *
+   * The `() => record` indirection is doing real work: it is evaluated on the
+   * capture path, long after this function has returned, so the temporal dead
+   * zone it appears to sit in is never actually entered.
+   */
+  const feedbackRepository = new FeedbackRepository({
+    cache: stateStore,
+    // An incident outlives the run it describes — that is what `UNRESOLVED`
+    // means — so it takes the session's TTL, not the transaction's.
+    sessionTtlMs: config.SESSION_TTL_MS,
+  });
+
+  /*
+   * Capture runs even with a no-op sink installed: incidents are still opened,
+   * counted and resolved, and only the *send* is dropped. That is what keeps
+   * `feedback_list_reports` useful to an operator who wants to see what would
+   * have been sent without anything leaving the machine.
+   *
+   * Note what "enabled with nothing configured" means: reports are written to a
+   * local directory and **nothing leaves the machine** until
+   * `FEEDBACK_ENDPOINT_URL` names somewhere for them to go. The spool is
+   * deliberately the default rather than the network.
+   */
+  const spoolDirectory = config.FEEDBACK_SPOOL_DIR ?? defaultSpoolDirectory();
+  // `NODE_ENV=test` is a hard refusal, not a default. The spool's default
+  // location is the operator's home directory, and a suite that writes there is
+  // a suite that quietly litters a real machine with reports about fixtures —
+  // which is exactly what happened the first time this shipped without the
+  // guard. `createHarness` also injects a no-op sink; this covers every test
+  // that builds a container directly.
+  const feedbackSink =
+    options.feedbackSink ??
+    (config.FEEDBACK_DISABLED || config.NODE_ENV === "test"
+      ? new NoopSink()
+      : new SpoolAndUploadSink({
+          spool: new SpoolSink({
+            directory: spoolDirectory,
+            maxFiles: config.FEEDBACK_SPOOL_MAX_FILES,
+            logger,
+          }),
+          ...(config.FEEDBACK_ENDPOINT_URL !== undefined
+            ? {
+                http: new HttpSink({
+                  endpoint: config.FEEDBACK_ENDPOINT_URL,
+                  ...(config.FEEDBACK_API_KEY !== undefined
+                    ? { apiKey: config.FEEDBACK_API_KEY }
+                    : {}),
+                  timeoutMs: config.FEEDBACK_TIMEOUT_MS,
+                  dispatcher: httpAgent,
+                  logger,
+                }),
+              }
+            : {}),
+          logger,
+        }));
+
+  // Said out loud, once, at boot. Something that ships diagnostics off the
+  // machine by default owes the operator a plain statement of where they go and
+  // how to stop it — buried in a README is not the same as printed on start.
+  if (config.FEEDBACK_DISABLED) {
+    logger.info("feedback: disabled (FEEDBACK_DISABLED)");
+  } else {
+    logger.info(
+      {
+        spool: spoolDirectory,
+        endpoint: config.FEEDBACK_ENDPOINT_URL ?? "(none — spool only)",
+      },
+      "feedback: issue reports are captured, redacted and spooled; " +
+        "set FEEDBACK_DISABLED=1 to turn this off",
+    );
+  }
+
+  // Annotated, not inferred: `feedback` and `record` reference each other, and
+  // TypeScript cannot resolve a type through that cycle on its own.
+  const feedback: FeedbackService = new FeedbackService({
+    repository: feedbackRepository,
+    flows: flowRepository,
+    records: recordRepository,
+    sessions: sessionRepository,
+    sink: feedbackSink,
+    journal: (sessionId, entry): Promise<void> =>
+      record.journal(sessionId, entry),
+    // Generated per process when unset, so pseudonyms are unlinkable across
+    // restarts until the spool persists one. Set `FEEDBACK_SALT` to make them
+    // stable, which is what a real corpus wants.
+    salt: config.FEEDBACK_SALT ?? randomUUID(),
+    repoRoot: process.cwd(),
+    enabled: !config.FEEDBACK_DISABLED,
+    logger,
+  });
+
+  const record: RecordService = new RecordService({
     repository: recordRepository,
     events,
     mockEngine,
     expectationTtlMs: config.EXPECTATION_TTL_MS,
     logger,
+    observer: feedback,
   });
 
   // Protocol validation. The gateway shares the process-wide agent because the
@@ -320,6 +438,7 @@ export async function createContainer(
     logger,
     receiverPublicUrl,
     mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    feedback,
   });
 
   const forms = new FormsService({
@@ -333,7 +452,15 @@ export async function createContainer(
       : {}),
   });
 
-  const services = { catalog, session, record, flow, forms, validate } as const;
+  const services = {
+    catalog,
+    session,
+    record,
+    flow,
+    forms,
+    validate,
+    feedback,
+  } as const;
 
   const inbound = new ReceiverService({
     sessions: session,
@@ -402,6 +529,10 @@ export async function createContainer(
       // standalone listener are the two that hold the event loop open — a
       // process that leaves either running never exits.
       await receiver.dispose();
+      // Before the state store closes, because draining reads and writes it.
+      // Capture is fire-and-forget everywhere else on purpose; shutdown is the
+      // one moment where "forget" would mean losing a report mid-write.
+      await feedback.drain();
       mockEngine.dispose();
       events.close();
       await stateStore.close();

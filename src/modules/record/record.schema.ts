@@ -80,6 +80,19 @@ export const ApiEntry = z.object({
   sendState: z.enum(["in_flight", "failed"]).optional(),
   /** Why an outbound send failed, when `sendState` is `failed`. */
   sendError: z.string().optional(),
+  /**
+   * Paths patched by `flow_proceed`'s `payload_overrides` before this went out.
+   *
+   * A patched step is **not a clean step**: the participant was tested against
+   * a payload this flow's published config did not produce, and a compliance
+   * report that cannot say so is claiming more than it knows. Absent on every
+   * unpatched entry, which is nearly all of them.
+   *
+   * Paths only. The values are already in the stored payload at exactly these
+   * locations, and duplicating them here would put unbounded caller-supplied
+   * data in the record for no gain.
+   */
+  overrides: z.array(z.string()).optional(),
 });
 export type ApiEntry = z.infer<typeof ApiEntry>;
 
@@ -305,6 +318,20 @@ export const SessionEventKind = z.enum([
    * session armed on the endpoint, because the wire genuinely cannot say.
    */
   "POSSIBLY_RELATED",
+  /**
+   * An issue report was opened and is waiting to be narrated.
+   *
+   * The nudge rides the journal rather than inventing a channel, because the
+   * `events` piggyback is already the one delivery path a model cannot opt out
+   * of. The report ships whether or not this is ever answered — narration is
+   * enrichment, not a precondition — so ignoring it costs detail, never the
+   * record itself.
+   *
+   * **Nothing may open an incident in response to this kind.** The observer
+   * that writes it is the same one that reads the journal; a detector that did
+   * not skip its own line would recurse until the process died.
+   */
+  "ISSUE_OPEN",
 ]);
 export type SessionEventKind = z.infer<typeof SessionEventKind>;
 
@@ -342,7 +369,18 @@ export const SessionEvent = z.object({
   payload_id: z
     .string()
     .optional()
-    .describe("Handle for the body, if one was stored. Read it with record_get_payload."),
+    .describe(
+      "Handle for the body, if one was stored. Read it with record_get_payload.",
+    ),
+  /**
+   * Paths `payload_overrides` patched before this went out.
+   *
+   * On the journal as well as the record because it is what separates
+   * `RECOVERED` from `RECOVERED_WITH_OVERRIDE`, and the incident corpus reads
+   * the journal, not the record. "The model fixed its own mistake" and "the
+   * model worked around a defect in a published config" are opposite findings.
+   */
+  overrides: z.array(z.string()).optional(),
   summary: z.string().describe("One sentence, written to be read at a glance."),
 });
 export type SessionEvent = z.infer<typeof SessionEvent>;
@@ -457,7 +495,23 @@ export const GetPayloadOutput = z.object({
   truncated: z
     .boolean()
     .describe("True when the body was cut short; narrow it with jsonpath."),
-  payload: z.unknown().describe("The body, or the JSONPath slice of it."),
+  payload: z
+    .unknown()
+    .describe(
+      "The whole body, or — when `jsonpath` was given — the **list of " +
+        "matches** for it. A single match is therefore still wrapped in an " +
+        "array: `$.context.bpp_uri` on a string field reads `[\"https://…\"]`. " +
+        "Read `jsonpath_matches` before concluding the value is itself a list.",
+    ),
+  jsonpath_matches: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      "How many nodes the `jsonpath` matched. Present only when one was " +
+        "given. `payload` is that many elements long, so the outer array is " +
+        "this count and not part of the stored value.",
+    ),
   ack: z
     .unknown()
     .optional()

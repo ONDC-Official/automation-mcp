@@ -97,6 +97,25 @@ export function renderPayload(
     `${output.action} ${arrow} at ${output.timestamp}`,
     `  message_id ${output.message_id} · ${String(output.size_bytes)} bytes stored`,
   ];
+  /*
+   * Say that the outer array is the match list, because it has been misread.
+   *
+   * A run on 2026-07-31 sliced `$.context.bpp_uri`, saw `[["https://…"]]` and
+   * filed the value as "a doubly-nested array" — it was `["https://…"]`, and
+   * the outer layer was this tool's own `jsonpath.query` result. The wrong
+   * nesting depth went into the diagnosis and into the incident corpus.
+   *
+   * Unwrapping a single match would trade one ambiguity for another: `$.a[*]`
+   * over a one-element list would then read as a scalar. Naming the count is
+   * unambiguous in both directions.
+   */
+  if (output.jsonpath_matches !== undefined) {
+    head.push(
+      `  ${String(output.jsonpath_matches)} JSONPath match${
+        output.jsonpath_matches === 1 ? "" : "es"
+      } — the outermost array below is this list, not the stored value.`,
+    );
+  }
   if (output.truncated) {
     head.push(
       "  TRUNCATED — pass a jsonpath to narrow this, or raise max_bytes.",
@@ -141,12 +160,15 @@ export function createRecordTools(
         const sizeBytes = Buffer.byteLength(full, "utf8");
 
         let selected: unknown = payload.body;
+        let matches: number | undefined;
         if (input.jsonpath !== undefined) {
           try {
-            selected = jsonpath.query(
+            const found = jsonpath.query(
               payload.body ?? {},
               input.jsonpath,
             ) as unknown[];
+            selected = found;
+            matches = found.length;
           } catch (error) {
             throw new ValidationError(
               `"${input.jsonpath}" is not a valid JSONPath: ${
@@ -169,6 +191,7 @@ export function createRecordTools(
           timestamp: payload.timestamp,
           size_bytes: sizeBytes,
           truncated,
+          ...(matches !== undefined ? { jsonpath_matches: matches } : {}),
           payload: truncated
             ? `${serialised.slice(0, limit)}… [truncated at ${String(limit)} bytes]`
             : selected,

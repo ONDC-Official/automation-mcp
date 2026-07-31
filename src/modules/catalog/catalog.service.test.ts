@@ -205,6 +205,51 @@ describe("mock-runner config", () => {
     expect(named).not.toContain("oldInputs");
   });
 
+  it("names the keys a generator reads, not the descriptor's own keys", async () => {
+    // The `{id, jsonSchema}` shape used to summarise as `["id", "jsonSchema"]`
+    // — which reads as confirmation that those are what `user_inputs` wants,
+    // and was believed once, on a run that then failed L1 at an unrelated path.
+    const base = createFakeConfigServiceGateway();
+    const fixture = await base.fetchMockConfig(FIXTURE_BUILD, FIXTURE_FLOW_ID);
+    const first = fixture?.steps[0];
+    if (fixture === undefined || first === undefined) {
+      throw new Error("fixture config has no steps");
+    }
+
+    const patched = {
+      ...fixture,
+      steps: [
+        {
+          ...first,
+          mock: {
+            ...first.mock,
+            inputs: {
+              id: "ExampleInputId",
+              jsonSchema: {
+                type: "object",
+                properties: { city_code: { type: "string" } },
+                required: ["city_code"],
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    const { service } = subject({
+      ...base,
+      fetchMockConfig: () => Promise.resolve(patched),
+    });
+
+    const summary = await service.loadMockConfig(
+      FIXTURE_BUILD,
+      FIXTURE_FLOW_ID,
+      "BAP",
+    );
+
+    expect(summary.steps[0]?.input_names).toEqual(["city_code"]);
+  });
+
   it("keeps the raw config server-side under the returned cache key", async () => {
     const { service, gateway } = subject();
     const summary = await service.loadMockConfig(

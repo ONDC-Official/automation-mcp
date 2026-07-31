@@ -145,6 +145,16 @@ export interface FakeValidationGateway extends ValidationGateway {
   readonly seen: ValidationRequest[];
   /** Answer every subsequent call with this. */
   setResult(result: GatewayResult): void;
+  /**
+   * Judge each payload on its merits, for the tests where the verdict has to
+   * *change* when the payload does.
+   *
+   * `payload_overrides` cannot be tested against a fixed verdict: the whole
+   * claim is that patching a field makes an invalid payload valid, and a
+   * gateway that answered the same either way would pass whether or not the
+   * patch reached the bytes being judged.
+   */
+  setResponder(responder: (request: ValidationRequest) => GatewayResult): void;
   /** Throw on every subsequent call — exercises the "a check threw" path. */
   setThrows(error: Error): void;
 }
@@ -153,6 +163,7 @@ export function createFakeValidationGateway(
   initial: GatewayResult = { status: "valid" },
 ): FakeValidationGateway {
   let result = initial;
+  let responder: ((request: ValidationRequest) => GatewayResult) | undefined;
   let thrown: Error | undefined;
   const calls = { validate: 0 };
   const seen: ValidationRequest[] = [];
@@ -162,6 +173,11 @@ export function createFakeValidationGateway(
     seen,
     setResult(next: GatewayResult) {
       result = next;
+      responder = undefined;
+      thrown = undefined;
+    },
+    setResponder(next: (request: ValidationRequest) => GatewayResult) {
+      responder = next;
       thrown = undefined;
     },
     setThrows(error: Error) {
@@ -171,7 +187,7 @@ export function createFakeValidationGateway(
       calls.validate += 1;
       seen.push(request);
       if (thrown) return Promise.reject(thrown);
-      return Promise.resolve(result);
+      return Promise.resolve(responder ? responder(request) : result);
     },
     ping() {
       return Promise.resolve(true);
