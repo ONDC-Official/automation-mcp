@@ -714,3 +714,67 @@ describe("flow_restart", () => {
     });
   });
 });
+
+/**
+ * The cursor the model is handed, and the one it used to be handed instead.
+ *
+ * This is the tool-layer half of the `flow_await` stall: the service can only
+ * do the right thing with a cursor it is given, and the reason it kept being
+ * given the wrong one is that `flow_proceed` reported no run `seq` at all. The
+ * only `seq` in its answer was the session journal's, inside `events`.
+ */
+describe("the seq a loop answer hands back", () => {
+  it("reports the run's own seq on flow_proceed, beside the journal's", async () => {
+    acceptAll("search");
+    await startFlow();
+
+    const result = await harness.client.callTool({
+      name: "flow_proceed",
+      arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID },
+    });
+    const output = result.structuredContent as {
+      seq: number;
+      events: { cursor: number };
+    };
+
+    // One exchange on the record, so the run's cursor is 1 — while the journal
+    // has already counted the binding *and* the send. Two counters, and the
+    // gap between them is exactly what used to be passed as `after_seq`.
+    expect(output.seq).toBe(1);
+    expect(output.events.cursor).toBeGreaterThan(output.seq);
+  });
+
+  it("answers at once when handed the journal's cursor by mistake", async () => {
+    acceptAll("search");
+    await startFlow();
+
+    const sent = await harness.client.callTool({
+      name: "flow_proceed",
+      arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID },
+    });
+    const journalCursor = (
+      sent.structuredContent as { events: { cursor: number } }
+    ).events.cursor;
+
+    const started = Date.now();
+    const result = await harness.client.callTool({
+      name: "flow_await",
+      arguments: {
+        session_id: sessionId,
+        flow_id: RUNNABLE_FLOW_ID,
+        after_seq: journalCursor,
+      },
+    });
+
+    // Before this it parked on a cursor no event on the run could reach and
+    // blocked for the whole default budget — five minutes, live.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(result.structuredContent).toMatchObject({
+      after_seq_adjusted: 1,
+      seq: 1,
+    });
+    expect(
+      (result.content as { text: string }[])[0]?.text,
+    ).toContain("after_seq was ahead of this run");
+  });
+});

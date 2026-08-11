@@ -175,6 +175,14 @@ export interface FlowToolOptions {
 const AWAIT_HEARTBEAT_MS = 10_000;
 
 /**
+ * How long `flow_await` blocks when the caller names no timeout.
+ *
+ * Well under `AWAIT_MAX_WAIT_MS`, which stays the ceiling an explicit
+ * `timeout_ms` is clamped to. See the handler for why the two differ.
+ */
+const DEFAULT_AWAIT_MS = 60_000;
+
+/**
  * Keep a long wait alive in the client.
  *
  * A wait measured in minutes outlives most MCP clients' own tool-call timeout,
@@ -289,6 +297,9 @@ export function createFlowTools(
           auto_advance: autoAdvance,
           attempt: runtime.binding.attempt,
           outcome,
+          // Present only for a resumed run: a fresh one has no transaction and
+          // therefore no cursor, and `flow_await` should be called without one.
+          ...(runtime.bound ? { seq: runtime.record.seq } : {}),
           ...(await eventsFor(records, input.session_id)),
         };
       },
@@ -414,8 +425,8 @@ export function createFlowTools(
       },
       render: (output) =>
         [renderOutcome(output), ...renderEvents(output.events)].join("\n"),
-      handler: async (input) => ({
-        ...(await service.proceed({
+      handler: async (input) => {
+        const outcome = await service.proceed({
           sessionId: input.session_id,
           transactionId: input.transaction_id,
           flowId: input.flow_id,
@@ -423,9 +434,23 @@ export function createFlowTools(
           triggerExtra: input.trigger_extra,
           dryRun: input.dry_run,
           payloadOverrides: input.payload_overrides,
-        })),
-        ...(await eventsFor(records, input.session_id)),
-      }),
+        });
+
+        // The cursor for the `flow_await` this answer tells the caller to make.
+        // Without it the only `seq` here is the session journal's, inside
+        // `events` — a different counter, and passing it as `after_seq` parks
+        // the wait somewhere no event on this run can reach.
+        const seq = await service.runSeq(
+          input.session_id,
+          outcome.transaction_id,
+        );
+
+        return {
+          ...outcome,
+          ...(seq !== undefined ? { seq } : {}),
+          ...(await eventsFor(records, input.session_id)),
+        };
+      },
     }),
 
     defineTool({
@@ -434,10 +459,16 @@ export function createFlowTools(
       description:
         "Block until something happens, then report it. Two scopes: " +
         "**Name a flow_id (or transaction_id)** and it waits on that one run, " +
-        "returning as soon as the participant calls back — pass the `seq` from " +
-        "your last call as `after_seq` so nothing is seen twice. When the " +
+        "returning as soon as the participant calls back. Pass the top-level " +
+        "`seq` from your last flow_start / flow_proceed / flow_await as " +
+        "`after_seq` so nothing is seen twice — never `events.cursor` or an " +
+        "`events[].seq`, which count session journal lines and would park the " +
+        "wait past anything this run can do. Omit it and you wait for whatever " +
+        "happens next. When the " +
         "participant sends the flow's first action this is where you learn the " +
         "transaction_id, because it was theirs to choose. " +
+        "A run-scoped wait answers immediately with `waited: false` when the " +
+        "next move is yours rather than theirs; `next` says what to call. " +
         "**Name neither** and it waits on the whole session: any callback on " +
         "any run, a step auto-advance sent, a refused call, a form submitted. " +
         "That is the one to use when you have nothing to do — it needs no seq " +
@@ -460,9 +491,12 @@ export function createFlowTools(
             ? output.timed_out
               ? "nothing happened in this session — call flow_await again to keep watching"
               : "something happened in this session"
-            : output.timed_out
-              ? `nothing arrived (seq ${String(output.seq)}) — call flow_await again to keep waiting`
-              : `${output.event?.kind ?? "EVENT"} ${output.event?.action ?? ""} (seq ${String(output.seq)})`;
+            : output.waited === false && output.timed_out
+              ? "did not wait: this run is not expecting the participant to do " +
+                "anything — see below for what it needs from you"
+              : output.timed_out
+                ? `nothing arrived (seq ${String(output.seq)}) — call flow_await again to keep waiting`
+                : `${output.event?.kind ?? "EVENT"} ${output.event?.action ?? ""} (seq ${String(output.seq)})`;
 
         const detail =
           output.scope === "run" && !output.timed_out
@@ -476,9 +510,23 @@ export function createFlowTools(
               ]
             : [];
 
+        // Loud, because it is a bug in the caller's bookkeeping and the symptom
+        // it produces — a wait that reports nothing — looks exactly like a
+        // participant that has gone quiet.
+        const adjusted =
+          output.after_seq_adjusted !== undefined
+            ? [
+                `  ! after_seq was ahead of this run (latest is ${String(
+                  output.after_seq_adjusted,
+                )}) and was ignored.`,
+                "    Pass the `seq` from flow_proceed / flow_await, not `events.cursor`.",
+              ]
+            : [];
+
         return [
           head,
           ...detail,
+          ...adjusted,
           ...renderEvents(output.events),
           ...(output.runs !== undefined ? ["", ...renderRuns(output.runs)] : []),
           ...(output.next !== undefined ? ["", renderOutcome(output.next)] : []),
@@ -488,8 +536,16 @@ export function createFlowTools(
         // Capped server-side by AWAIT_MAX_WAIT_MS: an unbounded wait would sit
         // past whatever the caller's own timeout is, and the model would never
         // learn whether anything arrived.
+        //
+        // The *default* is a minute rather than the cap, and that is a separate
+        // decision from the cap itself. This pair is built to long-poll — every
+        // outcome message says "call again" — so the cost of defaulting long is
+        // paid entirely by mistakes: a wait issued on the wrong cursor, or on a
+        // run that was never expecting anything, used to burn five minutes of
+        // the operator's wall clock before saying so. It also keeps the window
+        // clear of EXPECTATION_TTL_MS, which is itself five minutes.
         const timeoutMs = Math.min(
-          input.timeout_ms ?? options.maxAwaitMs,
+          input.timeout_ms ?? DEFAULT_AWAIT_MS,
           options.maxAwaitMs,
         );
 
@@ -504,6 +560,11 @@ export function createFlowTools(
             timeoutMs,
             kinds: input.kinds,
             flowIds: input.flow_ids,
+            // Naming a timeout is the caller saying it means to block. That is
+            // the only way to sit on a run whose main sequence is done waiting
+            // for an unsolicited extra step, which is otherwise indistinguishable
+            // from the mistake of waiting on your own turn.
+            waitAnyway: input.timeout_ms !== undefined,
           });
         } finally {
           stopHeartbeat();
@@ -533,6 +594,10 @@ export function createFlowTools(
             : {}),
           ...(result.next !== undefined ? { next: result.next } : {}),
           ...(result.runs !== undefined ? { runs: result.runs } : {}),
+          ...(result.afterSeqAdjusted !== undefined
+            ? { after_seq_adjusted: result.afterSeqAdjusted }
+            : {}),
+          ...(result.waited !== undefined ? { waited: result.waited } : {}),
           // A session-scope wait drained the journal as its own exit condition,
           // so its delta comes back on the result; draining again here would
           // find nothing and lose the very events it blocked for. A run-scoped

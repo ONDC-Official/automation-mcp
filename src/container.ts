@@ -525,13 +525,7 @@ export async function createContainer(
     async dispose(): Promise<void> {
       if (disposed) return;
       disposed = true;
-      // Release in reverse order of acquisition. The mock engine and the
-      // standalone listener are the two that hold the event loop open — a
-      // process that leaves either running never exits.
       await receiver.dispose();
-      // Before the state store closes, because draining reads and writes it.
-      // Capture is fire-and-forget everywhere else on purpose; shutdown is the
-      // one moment where "forget" would mean losing a report mid-write.
       await feedback.drain();
       mockEngine.dispose();
       events.close();

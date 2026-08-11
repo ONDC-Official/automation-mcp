@@ -118,6 +118,23 @@ const FORM_TYPES = new Set(["HTML_FORM", "DYNAMIC_FORM", "HTML_FORM_MULTI"]);
  */
 const REARM_SWEEP_LIMIT = 20;
 
+/**
+ * Journal kinds a run-scoped wait ends on, because nothing else will report them.
+ *
+ * Every other kind describes an exchange that was appended to a transaction and
+ * published on the run's own key, so the waiter is about to be woken properly —
+ * with the event, rather than with "nothing arrived" a beat before something
+ * did. These two have no such follow-up: `POSSIBLY_RELATED` is a call refused
+ * before it could be attributed to any run (a 400, or a 412 that matched no
+ * expectation), and `ATTENTION` is auto-advance saying it has stopped and will
+ * not resume. Both used to leave a run-scoped waiter sitting out its full
+ * budget with the answer already in the store.
+ */
+const DEAD_END_JOURNAL_KINDS = new Set<SessionEventKind>([
+  "POSSIBLY_RELATED",
+  "ATTENTION",
+]);
+
 /** What a wait answers with, in either scope. */
 export interface AwaitResult {
   timedOut: boolean;
@@ -129,6 +146,17 @@ export interface AwaitResult {
   next?: StepOutcome | undefined;
   /** Session scope only. */
   runs?: RunSummary[] | undefined;
+  /**
+   * Run scope only: the caller's `after_seq` was ahead of the record and was
+   * pulled back to this. See `#effectiveAfterSeq` for why that is never a
+   * cursor this run produced.
+   */
+  afterSeqAdjusted?: number | undefined;
+  /**
+   * Run scope only, and only when false: the call answered without parking
+   * because the run owes the *caller* the next step.
+   */
+  waited?: boolean | undefined;
   /**
    * Session scope only: the journal drained as the wait's own exit condition.
    *
@@ -1069,6 +1097,24 @@ export class FlowService {
    * minutes; a caller long-polling a participant that takes longer than that
    * would otherwise still be waiting on an endpoint that had quietly stopped
    * listening, and the callback it was waiting for would be refused 412.
+   *
+   * ## Three ways this used to sit out its whole budget
+   *
+   * All three were observed live, and all three cost five minutes a call.
+   *
+   * `after_seq` in the **wrong seq space** — the journal's, the only one a
+   * `flow_proceed` answer used to carry — parked a waiter above the record's
+   * high-water mark, where `TransactionEvents.notify` could never reach it.
+   * Not merely late: deaf for the rest of the timeout, to every future event.
+   * `#effectiveAfterSeq` refuses a cursor that cannot be this run's.
+   *
+   * Parking when the run owes the **caller** the next step could only ever time
+   * out; `#awaitable` answers such a call immediately instead.
+   *
+   * And a *refused* inbound call — 400, or a 412 that matched no expectation —
+   * appends nothing to any transaction, so it publishes no run event and could
+   * not end a wait at all. The park now races the session journal, which is
+   * where those refusals do land.
    */
   async awaitEvent(args: {
     sessionId: string;
@@ -1078,6 +1124,12 @@ export class FlowService {
     timeoutMs: number;
     kinds?: SessionEventKind[] | undefined;
     flowIds?: string[] | undefined;
+    /**
+     * The caller named a timeout, so it means to wait even on a run that is
+     * not expecting anything — the only way to catch an unsolicited extra step
+     * after the main sequence is done.
+     */
+    waitAnyway?: boolean | undefined;
   }): Promise<AwaitResult> {
     // Naming neither a flow nor a transaction means "tell me about the whole
     // session" — the wait a model reaches for when it is idle and wants to know
@@ -1087,7 +1139,7 @@ export class FlowService {
     }
 
     const runtime = await this.load(args.sessionId, args);
-    const afterSeq = args.afterSeq ?? 0;
+    const { cursor, adjusted } = this.#effectiveAfterSeq(runtime, args);
 
     // 1. Anything already recorded wins, with no waiting at all.
     //
@@ -1095,39 +1147,60 @@ export class FlowService {
     // it, so one still in flight is skipped: reporting it would answer a wait
     // with an exchange whose ACK has not come back yet. `settleApiEntry`
     // publishes it a moment later, and the park below catches that.
-    const recorded = runtime.record.apiList
+    const candidates = runtime.record.apiList
       .filter(
         (entry) =>
-          entry.seq > afterSeq &&
+          entry.seq > (cursor ?? 0) &&
           !(entry.entryType === "API" && entry.sendState === "in_flight"),
       )
-      .sort((a, b) => a.seq - b.seq)[0];
+      .sort((a, b) => a.seq - b.seq);
+
+    // With a cursor, the *oldest* unseen exchange, so a caller stepping through
+    // skips nothing. Without one there is no "unseen" to honour and the newest
+    // is the only answer worth giving — the oldest would be history the caller
+    // has already acted on, which is what a bare wait used to hand back
+    // forever.
+    const recorded = cursor === undefined ? candidates.at(-1) : candidates[0];
 
     if (recorded) {
       return {
         timedOut: false,
         scope: "run",
+        waited: false,
         transactionId: runtime.bound ? runtime.record.transactionId : null,
         seq: runtime.record.seq,
         event: toEvent(recorded),
         next: await this.describeNext(runtime),
+        ...(adjusted !== undefined ? { afterSeqAdjusted: adjusted } : {}),
+      };
+    }
+
+    // 2. Is there anything to wait *for*? A run whose next step is ours to send
+    //    — or which is finished, or blocked — is not going to be moved by the
+    //    participant, so parking on it buys nothing and costs the whole budget.
+    const pending = await this.describeNext(runtime);
+    if (!args.waitAnyway && !awaitable(pending)) {
+      return {
+        timedOut: true,
+        scope: "run",
+        waited: false,
+        transactionId: runtime.bound ? runtime.record.transactionId : null,
+        seq: runtime.record.seq,
+        next: pending,
+        ...(adjusted !== undefined ? { afterSeqAdjusted: adjusted } : {}),
       };
     }
 
     if (!runtime.bound) await this.#rearmIfLapsed(runtime);
 
-    // 2. Nothing yet: park.
-    const key = runtime.bound
-      ? transactionKey(
-          runtime.record.transactionId,
-          runtime.session.np.subscriber_url,
-        )
-      : flowRunKey(runtime.session.session_id, runtime.binding.flowId);
-
-    const event = await this.#events.waitFor(key, {
-      afterSeq,
-      timeoutMs: args.timeoutMs,
-    });
+    // 3. Nothing yet: park. A caller with no usable cursor is caught up by
+    //    definition — step 1 just showed it the newest exchange, or there were
+    //    none — so it waits from here rather than from the beginning.
+    const event = await this.#park(
+      runtime,
+      cursor ?? runtime.record.seq,
+      args.timeoutMs,
+    );
 
     // Re-load by the same ref: the record moved while we were parked, the run
     // may have acquired an id, and `next` has to be computed from what is true
@@ -1137,11 +1210,165 @@ export class FlowService {
     return {
       timedOut: event === undefined,
       scope: "run",
+      waited: true,
       transactionId: after.bound ? after.record.transactionId : null,
       seq: after.record.seq,
       event,
       next: await this.describeNext(after),
+      ...(adjusted !== undefined ? { afterSeqAdjusted: adjusted } : {}),
     };
+  }
+
+  /**
+   * The caller's cursor, if it can possibly be one of ours.
+   *
+   * `undefined` means "no usable cursor", and it has two causes that deserve
+   * the same treatment because they leave us knowing the same thing: nothing
+   * about what the caller has already seen.
+   *
+   * **Omitted.** It used to mean zero, which replayed the *oldest* exchange on
+   * the record on every call — four exchanges stale in one observed run, and
+   * indistinguishable from something that had just happened.
+   *
+   * **Above the record's high-water mark**, which is not a cursor this run can
+   * ever have issued: entry `seq` is assigned by `appendApiEntry` as
+   * `record.seq + 1`, so nothing it hands out exceeds `record.seq`. A larger
+   * number came from the session journal — a different counter on a different
+   * key, and until `runSeq` existed the only `seq` a `flow_proceed` answer
+   * carried. Taken at face value it is far worse than a wrong answer: the
+   * wake-up test in `TransactionEvents.notify` is `event.seq > afterSeq`, so
+   * the waiter goes deaf to *every* future event on the run and the call is
+   * guaranteed to sit out its entire budget. Live, that was five minutes with
+   * the awaited callback already on the record.
+   *
+   * Note what this deliberately does **not** do: clamp to the high-water mark.
+   * That would stop the deafness and still skip the exchange the caller was
+   * waiting for, since the callback that had already landed *is* the
+   * high-water mark. Discarding the number entirely is the honest reading —
+   * it told us nothing true — and `awaitEvent` then answers with the newest
+   * exchange and a cursor that works.
+   */
+  #effectiveAfterSeq(
+    runtime: FlowRuntime,
+    args: { afterSeq?: number | undefined; sessionId: string },
+  ): { cursor?: number; adjusted?: number } {
+    if (args.afterSeq === undefined) return {};
+
+    const highWater = runtime.record.seq;
+    if (args.afterSeq <= highWater) return { cursor: args.afterSeq };
+
+    this.#logger.warn(
+      {
+        sessionId: args.sessionId,
+        flowId: runtime.binding.flowId,
+        afterSeq: args.afterSeq,
+        highWater,
+      },
+      "after_seq is ahead of this run's latest event, so it cannot be a cursor " +
+        "this run issued — a session journal seq was probably passed instead. " +
+        "Ignoring it and reporting the latest exchange.",
+    );
+    return { adjusted: highWater };
+  }
+
+  /**
+   * Wait for this run to move, or for a refusal nobody could attribute to it.
+   *
+   * Two keys, because a run has two ways of being told something and only one
+   * of them appends to a transaction.
+   *
+   * The run key — the transaction when bound, the flow run before that — is
+   * where every recorded exchange is published. But a call that is *refused*
+   * during resolution (400 on a malformed context, 412 for an expectation that
+   * was never armed or a session that has expired) is filed against no
+   * transaction at all: there is nothing to append it to, which is the whole
+   * reason it was refused. Those land in the session journal instead, so the
+   * journal is raced alongside.
+   *
+   * A journal wake is checked before it is acted on, and the test is narrow on
+   * purpose: **only lines that no run event will ever follow**. Almost
+   * everything in the journal describes an exchange that was also appended to a
+   * transaction, so the run key is about to fire anyway and ending the wait on
+   * the journal line would merely pre-empt it with the worse answer — the
+   * journal carries no `TransactionEvent`, so the caller would be told nothing
+   * arrived a beat before something did. Two kinds have no such follow-up:
+   * `POSSIBLY_RELATED`, the refusals that could be attributed to no run at all,
+   * and `ATTENTION`, which is auto-advance reporting that it has stopped and
+   * will not resume. Those are precisely the ones a run-scoped waiter could
+   * otherwise sit out its whole budget without hearing.
+   */
+  async #park(
+    runtime: FlowRuntime,
+    afterSeq: number,
+    timeoutMs: number,
+  ): Promise<TransactionEvent | undefined> {
+    const sessionId = runtime.session.session_id;
+    const runKey = runtime.bound
+      ? transactionKey(
+          runtime.record.transactionId,
+          runtime.session.np.subscriber_url,
+        )
+      : flowRunKey(sessionId, runtime.binding.flowId);
+
+    const deadline = Date.now() + timeoutMs;
+    let journalSeq = await this.#records.eventCursor(sessionId);
+
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return undefined;
+
+      // `waitFor` resolves `undefined` on its own timeout, so the loser of this
+      // race settles harmlessly on the same deadline rather than leaking.
+      const winner = await Promise.race([
+        this.#events
+          .waitFor(runKey, { afterSeq, timeoutMs: remaining })
+          .then((event) => ({ from: "run" as const, event })),
+        this.#events
+          .waitFor(journalKey(sessionId), {
+            afterSeq: journalSeq,
+            timeoutMs: remaining,
+          })
+          .then((event) => ({ from: "journal" as const, event })),
+      ]);
+
+      if (winner.from === "run") return winner.event;
+      if (winner.event === undefined) return undefined;
+
+      const lines = await this.#relevantJournalLines(sessionId, journalSeq);
+      journalSeq = winner.event.seq;
+      if (lines.length === 0) continue;
+
+      // A refusal carries no transaction entry, so there is no `TransactionEvent`
+      // to hand back. The line itself reaches the caller through the `events`
+      // piggyback every session-scoped result already carries; what matters here
+      // is that the wait *ends* instead of sitting out its budget.
+      return undefined;
+    }
+  }
+
+  /**
+   * Journal lines since `afterSeq` that no run event is going to follow.
+   *
+   * Best-effort: the journal is a notification channel and nothing is derived
+   * from it, so a read that fails costs this wait an early wake-up and never a
+   * correct answer.
+   */
+  async #relevantJournalLines(
+    sessionId: string,
+    afterSeq: number,
+  ): Promise<SessionEvent[]> {
+    let lines: SessionEvent[];
+    try {
+      lines = await this.#records.readEvents(sessionId, afterSeq);
+    } catch (error) {
+      this.#logger.warn(
+        { err: error, sessionId },
+        "could not read the session journal while parked; staying parked",
+      );
+      return [];
+    }
+
+    return lines.filter((line) => DEAD_END_JOURNAL_KINDS.has(line.kind));
   }
 
   /**
@@ -1672,6 +1899,35 @@ export class FlowService {
    */
   async describeNext(runtime: FlowRuntime): Promise<StepOutcome> {
     return this.#describe(runtime, { arm: false });
+  }
+
+  /**
+   * This run's latest event number — the cursor `flow_await` takes.
+   *
+   * Exists so `flow_start` and `flow_proceed` can report it. Until they did,
+   * the only `seq` in a `flow_proceed` answer was the session journal's, and a
+   * model following the loop's own advice (`"Call flow_await for the
+   * callback"`) had no other number to reach for. It passed that one, and the
+   * wait parked above the record's high-water mark where nothing could reach
+   * it. See `#effectiveAfterSeq`.
+   *
+   * Undefined while the run is unbound: there is no record, so there is no
+   * cursor, and `flow_await` should be called without one.
+   *
+   * A record read, not a `load()`: this runs on the answer path of every
+   * `flow_proceed` and has no use for the flow, its config or a runner.
+   */
+  async runSeq(
+    sessionId: string,
+    transactionId: string | undefined,
+  ): Promise<number | undefined> {
+    if (transactionId === undefined) return undefined;
+    const session = await this.#sessions.requireSession(sessionId);
+    const record = await this.#records.findTransaction(
+      transactionId,
+      session.np.subscriber_url,
+    );
+    return record?.seq;
   }
 
   /**
@@ -3152,6 +3408,28 @@ function toEvent(entry: HistoryEntry): TransactionEvent {
     action: entry.action,
     payload_id: entry.payloadId,
   };
+}
+
+/**
+ * Whether this run is expecting the **participant** to do the next thing.
+ *
+ * The question a run-scoped wait has to ask before it parks, because the answer
+ * decides whether parking can succeed at all. Only two outcomes leave the next
+ * move with the counterparty: `WAITING` for a protocol call, and a form this
+ * mock *hosts*, which they have to submit. Everything else — `READY`,
+ * `INPUT_REQUIRED`, a form we have to fill, `COMPLETE`, `BLOCKED` — is the
+ * caller's own turn, and a wait on it can only ever run out the clock. Two live
+ * runs did exactly that for five minutes each, one on `COMPLETE` and one on
+ * `INPUT_REQUIRED`, with the answer already sitting in `next`.
+ *
+ * The one real exception is deliberately not decided here: a participant may
+ * still fire an unsolicited side-channel step after the main sequence is done.
+ * That is what an explicit `timeout_ms` is for — it says "wait anyway", and it
+ * bypasses this.
+ */
+export function awaitable(outcome: StepOutcome): boolean {
+  if (outcome.outcome === "WAITING") return true;
+  return outcome.outcome === "FORM_PENDING" && outcome.form_role === "host";
 }
 
 /**

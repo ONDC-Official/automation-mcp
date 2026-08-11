@@ -127,7 +127,7 @@ Names follow the scaffold convention `module_verb_noun`. Every tool declares
 
 - `flow_start` — session_id, flow_id → callback_url and the first `StepOutcome`. **`transaction_id` comes back `null`** and nothing is persisted but the binding; see the identity model. Validates the flow _before_ anything is sent: it must have a mock config, every step an owner, and every step key a config entry. Arms the expectation when the first step is the participant's — a model that obeys a `WAITING` outcome calls `flow_await`, never `flow_proceed`, so arming only in `proceed` meant the first callback was refused 412
 - `flow_proceed` — **the loop driver.** Requirements → generate → **patch, if `payload_overrides` were given** → **bind, if this is the flow's first action** → record → save → send → settle, for the next mock-owned step. Optional `inputs`, `trigger_extra`, `dry_run`, `payload_overrides`. **The record is written before the send, not after** — see "Recording an outbound call" below; getting this backwards NACKs correct participants
-- `flow_await` — bounded blocking wait for the participant; reads the record first so a callback that already landed is never missed. An unbound run parks on `flow_run::{session}::{flow}` instead of the transaction (every event is published under both keys) and re-arms a lapsed expectation before a long wait
+- `flow_await` — bounded blocking wait for the participant; reads the record first so a callback that already landed is never missed. An unbound run parks on `flow_run::{session}::{flow}` instead of the transaction (every event is published under both keys) and re-arms a lapsed expectation before a long wait. Four things stop it parking where it can never be woken — see "**A wait that can never end**" below; every one of them made a compliant participant look like a silent one
 - `flow_restart` — **abandon this run's attempt and open a fresh one**, in the same session. A flow's state is derived by replaying what was exchanged, so a NACKed step is part of the history from then on and `flow_start` deliberately _resumes_ — without this the only escape was `session_create`, which strands the old session's expectations on the endpoint every session shares. Destroys nothing: the abandoned attempt keeps its record, payloads and business data, and is _sealed_ (`TransactionRecord.abandoned`) rather than deleted. The run returns to unbound; the next action mints a new id. Named by `flow_id` only — the run is what restarts, and it may have no transaction id
 - `flow_get_status` — the derived flow map: every step's status and owner, off-sequence exchanges, and what the loop needs next
 
@@ -152,6 +152,23 @@ typo nothing in this repo can fix. A map of JSONPath → value, applied after
 (works before the transaction exists, so prefer it) **or** `transaction_id`
 (names one specific run when a session has several). `flow_await` takes
 **neither**, too — see §4a.
+
+**A wait that can never end** (`flow.service.ts#awaitEvent`, `#park`,
+`#effectiveAfterSeq`). Three live runs against workbench.ondc.tech spent five
+minutes each in `flow_await` with the callback they were waiting for already on
+the record. Every cause produced the same symptom, and it is the worst one this
+server has: **a participant that did exactly the right thing became
+indistinguishable from one that never called**, which is a compliance report
+blaming the wrong side.
+
+| Fact                                                                                                                                                         | Consequence                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`after_seq` above `record.seq` is discarded, not clamped**, and the answer says so (`after_seq_adjusted`)                                                  | entry seq is `record.seq + 1`, so no cursor a run issues can exceed it — a larger one is the **journal's** counter (§4a), which is always further along. `notify` wakes on `event.seq > afterSeq`, so taking it at face value went deaf to every future event, not merely the one already recorded. Clamping to the high-water mark would end the deafness and still skip the awaited callback, because that callback *is* the high-water mark |
+| **Every loop answer carries the run's `seq`** — `flow_start`, `flow_proceed` (`FlowService#runSeq`), `flow_get_status`, `flow_await`                          | this is what made the bug reachable at all. `flow_proceed` used to expose only `events.cursor`, so a model following the tool's own advice (`"Call flow_await for the callback"`) had the wrong counter and no other. Two counters and one field name is a trap; the fix is an affordance, not a warning         |
+| **A run-scoped wait does not park when `next` is not `WAITING`** (`awaitable`), unless an explicit `timeout_ms` says to                                       | both observed stalls were on `COMPLETE` and `INPUT_REQUIRED` — runs owing the *caller* the next move, where parking can only run out the clock. The escape hatch is real: a participant may still fire an unsolicited extra step after the sequence is done                                                       |
+| **The park races `journal::{sessionId}`** for `POSSIBLY_RELATED` and `ATTENTION` only (`DEAD_END_JOURNAL_KINDS`)                                              | a refused call is filed against no transaction — there is nothing to append it to, which is why it was refused — so it publishes no run event. Every other journal kind *is* followed by one, and waking on those would answer "nothing arrived" a beat before something did                                      |
+| **All four 400 `MALFORMED_CONTEXT` branches journal** (`receiver.service.ts#refuseMalformed`)                                                                | they used to `return` and nothing else: no record (there is no id to file under), no journal, no channel to the model at all. A participant calling without `bap_uri` was completely invisible, and "they never called" and "we would not take their call" are opposite problems with one appearance              |
+| **`timeout_ms` defaults to 60s**; `AWAIT_MAX_WAIT_MS` (300s) is only the cap                                                                                 | the pair is built to long-poll and every outcome says "call again", so a long default is paid for entirely by mistakes. It also keeps the window clear of `EXPECTATION_TTL_MS`, which is itself 300s                                                                                                             |
 
 - `form_fetch` / `form_submit` — a form the participant hosts: fetch, screen, parse, fill, post. A form _we_ host needs no tool — the participant opens the URL we already sent
 
@@ -549,6 +566,17 @@ answers "did this run move?" for a waiter on one transaction; this one answers
 "what happened in this session that I have not been told about?", which includes
 things no transaction owns. The two seq spaces are separate and must never be
 compared.
+
+**Saying that was not enough, and the gap cost three runs.** `after_seq` is the
+run's counter, but `flow_proceed` reported only the journal's — inside `events`,
+under the same field name — so a model told to "call flow_await for the
+callback" had one number in front of it and it was the wrong one. Passing it
+parked the wait past anything the run could ever do. **Whenever a result carries
+a number from one counter, it must carry the other's too or neither**: that is
+why `runSeq` exists and why every loop answer now has a top-level `seq`. A
+rejected cursor is reported (`after_seq_adjusted`) rather than quietly fixed,
+because the caller will otherwise make the same mistake on every call. Full
+reasoning in §3 under "A wait that can never end".
 
 **`RecordService#journal` never throws.** Every caller is on a path where
 failing is worse than forgetting — the receiver journals _after_ the ACK is

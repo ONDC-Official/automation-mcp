@@ -114,6 +114,12 @@ counted for you.
 
 - **Never poll \`flow_get_status\` in a loop.** \`flow_await\` blocks server-side
   and wakes on the callback. Read status when you have lost track, not to wait.
+- **\`after_seq\` is the top-level \`seq\`, never \`events.cursor\`.** Every loop
+  answer carries both, and they are different counters: \`seq\` counts this
+  run's exchanges, \`events.cursor\` counts session journal lines and runs well
+  ahead of it. Pass the \`seq\` from your last \`flow_proceed\` / \`flow_await\`, or
+  pass nothing at all — omitting it is always safe. A wait told to start past
+  where the run has got to would have nothing to wake on.
 - **When idle, wait on the session, not on one run.** \`flow_await\` with neither
   \`flow_id\` nor \`transaction_id\` needs no \`seq\` bookkeeping — the server tracks
   what you have been shown — and it returns \`runs\`, a line per flow telling you

@@ -1767,3 +1767,189 @@ describe("payload_overrides", () => {
     });
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* What made a correct participant look like a silent one                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `flow_await` used to sit out its whole budget with the answer already in the
+ * store. Three separate causes, all reproduced from live runs against
+ * workbench.ondc.tech, all costing five minutes a call.
+ *
+ * The common shape is worth stating: every one of them made a **participant
+ * that had done exactly the right thing** indistinguishable from one that had
+ * gone quiet. That is the worst failure this server can have, because the run
+ * it produces is a compliance report blaming the wrong side.
+ */
+describe("a wait that could never have ended", () => {
+  it("ignores an after_seq from the session journal's counter", async () => {
+    // The one from the logs. `flow_proceed` used to report no run `seq` at all,
+    // so the only number in front of the model was the journal's — a different
+    // counter, and always further along, because it counts everything in the
+    // session rather than one transaction's exchanges. Passing it parked the
+    // waiter above the record's high-water mark, where `notify`'s
+    // `event.seq > afterSeq` test could never reach it: deaf not merely to the
+    // callback already recorded, but to every future one too.
+    acceptsAction(agent, NP, "search");
+    await start();
+    await sendFirstAction();
+    await post("on_search", callbackFor("on_search", CATALOG, 1_000));
+
+    const record = await container.services.record.requireTransaction(
+      transactionId,
+      NP,
+    );
+    expect(record.seq).toBe(2);
+
+    // What the journal was up to by then — comfortably past the record, which
+    // is the whole trap.
+    const journal = await container.services.record.readEvents(sessionId);
+    expect(journal.at(-1)?.seq).toBeGreaterThan(record.seq);
+
+    const started = Date.now();
+    const result = await container.services.flow.awaitEvent({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      afterSeq: journal.at(-1)?.seq ?? 7,
+      timeoutMs: 10_000,
+    });
+
+    // Answers at once with the callback that had already landed, rather than
+    // blocking until the timeout and reporting that nothing arrived.
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.timedOut).toBe(false);
+    expect(result.event?.action).toBe("on_search");
+    // And says why, because silently correcting it would leave the caller
+    // making the same mistake on every subsequent call.
+    expect(result.afterSeqAdjusted).toBe(2);
+    expect(result.seq).toBe(2);
+  });
+
+  it("does not wait on a run that owes the caller the next step", async () => {
+    // Both live stalls were this: `next` said COMPLETE, then INPUT_REQUIRED.
+    // Neither run was expecting the participant to do anything, so parking
+    // could only ever run out the clock.
+    acceptsAction(agent, NP, "search");
+    await start();
+    await sendFirstAction();
+    await post("on_search", callbackFor("on_search", CATALOG, 1_000));
+
+    const started = Date.now();
+    const result = await container.services.flow.awaitEvent({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      afterSeq: 2,
+      timeoutMs: 10_000,
+    });
+
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.waited).toBe(false);
+    expect(result.timedOut).toBe(true);
+    expect(result.next?.outcome).toBe("INPUT_REQUIRED");
+  });
+
+  it("waits anyway when the caller names a timeout", async () => {
+    // The escape hatch, and the reason the short-circuit is not unconditional:
+    // a participant may still fire an unsolicited side-channel step at a run
+    // whose sequence has nothing pending. Naming a timeout says "I know".
+    acceptsAction(agent, NP, "search");
+    await start();
+    await sendFirstAction();
+    await post("on_search", callbackFor("on_search", CATALOG, 1_000));
+
+    const started = Date.now();
+    const result = await container.services.flow.awaitEvent({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      afterSeq: 2,
+      timeoutMs: 300,
+      waitAnyway: true,
+    });
+
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+    expect(result.waited).toBe(true);
+    expect(result.timedOut).toBe(true);
+  });
+
+  it("reports the newest exchange when no cursor was given, not the oldest", async () => {
+    // A bare wait used to answer with entry 1 every single time. Observed four
+    // exchanges stale, next to a `next` that correctly said the flow had moved
+    // on — and a stale event reads exactly like a fresh one.
+    acceptsAction(agent, NP, "search");
+    acceptsAction(agent, NP, "select");
+    await start();
+    await sendFirstAction();
+    await post("on_search", callbackFor("on_search", CATALOG, 1_000));
+    await container.services.flow.proceed({
+      sessionId,
+      transactionId,
+      inputs: { loan_amount: 50_000 },
+    });
+
+    const result = await container.services.flow.awaitEvent({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      timeoutMs: 10_000,
+    });
+
+    expect(result.timedOut).toBe(false);
+    expect(result.event?.action).toBe("select");
+    expect(result.event?.seq).toBe(3);
+  });
+
+  it("ends a parked wait when the participant's call is refused outright", async () => {
+    // A 400 or an unmatched 412 is filed against no transaction — there is
+    // nothing to append it to, which is why it was refused — so it publishes no
+    // run event and used to leave a run-scoped waiter parked for its full
+    // budget. The refusal lands in the session journal, so the park races that
+    // too. This is the mock-BPP direction's failure mode in particular, where
+    // an armed expectation is the only way in.
+    acceptsAction(agent, NP, "search");
+    await start();
+    await sendFirstAction();
+
+    const started = Date.now();
+    const waiting = container.services.flow.awaitEvent({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+      afterSeq: 1,
+      timeoutMs: 10_000,
+    });
+
+    // A call the receiver cannot key on: no counterparty URI, so it cannot even
+    // say who is calling. Before this it produced no record, no journal line
+    // and no log the model could read — completely invisible.
+    const refused = await post("on_search", {
+      context: {
+        domain: session.build.domain,
+        version: session.build.version,
+        action: "on_search",
+        transaction_id: transactionId,
+        message_id: "msg-malformed",
+        timestamp: new Date().toISOString(),
+      },
+      message: CATALOG,
+    });
+    expect(refused.statusCode).toBe(400);
+
+    const result = await waiting;
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(result.waited).toBe(true);
+
+    // The refusal itself reaches the caller through the events piggyback, which
+    // is the only channel a call belonging to no transaction can use.
+    const journal = await container.services.record.readEvents(sessionId);
+    const line = journal.find(
+      (entry) => entry.nack_code === "MALFORMED_CONTEXT",
+    );
+    expect(line?.kind).toBe("POSSIBLY_RELATED");
+    // This mock is the BAP, so the caller identifies itself as the BPP. Naming
+    // the field is the whole value of the line: it is what the integrator has
+    // to change.
+    expect(line?.summary).toContain("context.bpp_uri is required");
+    // And the body is kept, because "what did they actually send?" is the only
+    // question worth asking next.
+    expect(line?.payload_id).toBeDefined();
+  });
+});

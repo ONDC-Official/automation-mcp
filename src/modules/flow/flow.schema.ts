@@ -394,6 +394,23 @@ export const StartFlowInput = z.object({
 });
 export type StartFlowInput = z.infer<typeof StartFlowInput>;
 
+/**
+ * The one sentence that keeps two seq spaces apart.
+ *
+ * A run's `seq` counts exchanges on **this transaction**; the `events` block on
+ * every session-scoped result counts lines in the **session journal**. They are
+ * different counters and comparing them is meaningless — but until this field
+ * existed, `flow_proceed` reported only the journal's, so a model going
+ * `flow_proceed` → `flow_await` had the wrong number and no other. It passed it,
+ * `after_seq` landed above the record's high-water mark, and the wait parked on
+ * a cursor no future event could reach.
+ */
+const RUN_SEQ_NOTE =
+  "This run's event number — pass it to flow_await as `after_seq`. It counts " +
+  "exchanges on this transaction, and is **not** `events.cursor` or " +
+  "`events[].seq`, which count session journal lines and belong to a " +
+  "different counter entirely.";
+
 export const StartFlowOutput = z.object({
   session_id: z.string(),
   transaction_id: z
@@ -424,6 +441,11 @@ export const StartFlowOutput = z.object({
         "gets its own transaction_id.",
     ),
   outcome: StepOutcome.describe("What the first step of the flow needs."),
+  seq: z
+    .number()
+    .int()
+    .optional()
+    .describe(`${RUN_SEQ_NOTE} Absent while the run has no transaction yet.`),
   ...EventsField,
 });
 export type StartFlowOutput = z.infer<typeof StartFlowOutput>;
@@ -517,10 +539,7 @@ export const FlowStatusOutput = z.object({
       "Set when reading an attempt that flow_restart wrote off. Its record is " +
         "kept as evidence but it cannot be advanced; the run has moved on.",
     ),
-  seq: z
-    .number()
-    .int()
-    .describe("Latest event number. Pass it to flow_await as after_seq."),
+  seq: z.number().int().describe(RUN_SEQ_NOTE),
   sequence: z.array(FlowStepState).describe("The main sequence, in order."),
   extra_steps: z
     .array(FlowStepState)
@@ -600,7 +619,18 @@ export type ProceedInput = z.infer<typeof ProceedInput>;
  * attached to a nested outcome would either duplicate the one at top level or,
  * worse, consume it there instead.
  */
-export const ProceedOutput = StepOutcome.extend(EventsField);
+export const ProceedOutput = StepOutcome.extend({
+  seq: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      `${RUN_SEQ_NOTE} Absent when nothing was sent, so the run still has no ` +
+        "transaction. Read as of this answer: a chained step may append more " +
+        "after it, which replays harmlessly on the next wait.",
+    ),
+  ...EventsField,
+});
 export type ProceedOutput = z.infer<typeof ProceedOutput>;
 
 export const AwaitInput = z.object({
@@ -612,7 +642,11 @@ export const AwaitInput = z.object({
     .optional()
     .describe(
       "Run scope only. Only report events newer than this — use the `seq` from " +
-        "the last flow_get_status or flow_await so nothing is seen twice. " +
+        "the last flow_start, flow_proceed, flow_get_status or flow_await so " +
+        "nothing is seen twice. It counts exchanges on this transaction: do " +
+        "**not** pass `events.cursor` or an `events[].seq`, which count " +
+        "session journal lines and run far ahead. Omit it and you are told " +
+        "where the run stands and then wait for the next thing. " +
         "Ignored in session scope, which tracks delivery for you.",
     ),
   timeout_ms: z
@@ -620,7 +654,11 @@ export const AwaitInput = z.object({
     .int()
     .positive()
     .optional()
-    .describe("How long to block. Capped server-side; defaults to the cap."),
+    .describe(
+      "How long to block, in ms. Defaults to 60s and is capped server-side. " +
+        "Passing it explicitly also forces a real wait on a run that owes " +
+        "*you* the next step, which is otherwise answered immediately.",
+    ),
   kinds: z
     .array(SessionEventKind)
     .optional()
@@ -697,6 +735,27 @@ export const AwaitOutput = z.object({
     "What the loop needs now the wait is over. Run scope only — a session " +
       "wait covers several runs, so it answers with `runs` instead.",
   ),
+  after_seq_adjusted: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      "Set when the `after_seq` you passed was ahead of this run's latest " +
+        "event, which is the value here — so it cannot be a cursor this run " +
+        "issued, and it was ignored. It means a number from another counter " +
+        "was passed, almost always `events.cursor`, which counts session " +
+        "journal lines. Uncorrected it would have parked the wait where no " +
+        "future event on this run could reach it. Use this `seq` next time.",
+    ),
+  waited: z
+    .boolean()
+    .optional()
+    .describe(
+      "False when the call answered without blocking because this run is not " +
+        "waiting on the participant at all — `next` says what it wants from " +
+        "you instead. Pass an explicit `timeout_ms` to wait anyway, which is " +
+        "what you want only if you expect an unsolicited side-channel call.",
+    ),
   runs: z
     .array(RunSummary)
     .optional()

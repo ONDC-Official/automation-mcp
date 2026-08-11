@@ -205,28 +205,27 @@ export class ReceiverService {
     body: unknown,
     headers: Record<string, unknown>,
   ): Promise<InboundResult> {
+    const scope: ExpectationScope = {
+      domain: request.domain,
+      version: request.version,
+      role: request.role,
+    };
+
     /* 1. Parse. A context we cannot key on is unusable. */
     const context = readContext(body);
     if (typeof context.message_id !== "string" || context.message_id === "") {
-      return {
-        status: 400,
-        body: nack(
-          "MALFORMED_CONTEXT",
-          "context.message_id is required and must be a string.",
-        ),
-      };
+      return this.#refuseMalformed(scope, request, body, {
+        detail: "context.message_id is required and must be a string.",
+      });
     }
     const messageId = context.message_id;
     // The body's action decides the step, not the path — the workbench matches
     // on `context.action` too. The path is checked against it below.
     if (typeof context.action !== "string" || context.action === "") {
-      return {
-        status: 400,
-        body: nack(
-          "MALFORMED_CONTEXT",
-          "context.action is required and must be a string.",
-        ),
-      };
+      return this.#refuseMalformed(scope, request, body, {
+        messageId,
+        detail: "context.action is required and must be a string.",
+      });
     }
     const action = context.action;
     const timestamp =
@@ -242,15 +241,15 @@ export class ReceiverService {
     const counterpartyField = request.role === "buyer" ? "bpp_uri" : "bap_uri";
     const advertisedUri = context[counterpartyField];
     if (typeof advertisedUri !== "string" || advertisedUri === "") {
-      return {
-        status: 400,
-        body: nack(
-          "MALFORMED_CONTEXT",
+      return this.#refuseMalformed(scope, request, body, {
+        messageId,
+        action,
+        timestamp,
+        detail:
           `context.${counterpartyField} is required: this endpoint is a ${
             request.role === "buyer" ? "BAP" : "BPP"
           }, so the ${counterpartyField} identifies the caller.`,
-        ),
-      };
+      });
     }
 
     if (!this.verifyAuth(headers)) {
@@ -260,6 +259,7 @@ export class ReceiverService {
     /* 3. Resolve the transaction, or create it from an armed expectation. */
     const resolved = await this.#resolve(
       request,
+      scope,
       context,
       action,
       advertisedUri,
@@ -652,6 +652,7 @@ export class ReceiverService {
    */
   async #resolve(
     request: InboundRequest,
+    scope: ExpectationScope,
     context: BecknContext,
     action: string,
     advertisedUri: string,
@@ -669,21 +670,15 @@ export class ReceiverService {
 
     if (transactionId === undefined) {
       return {
-        failure: {
-          status: 400,
-          body: nack(
-            "MALFORMED_CONTEXT",
-            "context.transaction_id is required and must be a string.",
-          ),
-        },
+        failure: await this.#refuseMalformed(scope, request, call.body, {
+          messageId: call.messageId,
+          action,
+          timestamp: call.timestamp,
+          advertisedUri,
+          detail: "context.transaction_id is required and must be a string.",
+        }),
       };
     }
-
-    const scope: ExpectationScope = {
-      domain: request.domain,
-      version: request.version,
-      role: request.role,
-    };
 
     /* 1. Known transaction. */
     const located = await this.#records.findTransactionLocations(transactionId);
@@ -1144,6 +1139,89 @@ export class ReceiverService {
    * throughout: this runs on a request that is already being refused, and
    * nothing here may turn a clean 412 into a 500.
    */
+  /**
+   * Refuse a call whose context we cannot key on — and say so out loud.
+   *
+   * These four branches used to `return` a 400 and nothing else: no record (by
+   * definition — there is no id to file it under), no journal line, no log the
+   * model could read. A participant calling with a missing `bap_uri` was
+   * therefore **completely invisible**. The operator saw a run sitting in
+   * `flow_await` reporting that nothing had arrived, which is exactly what a
+   * silent participant looks like, and the two are the opposite problem: one is
+   * "they never called", the other is "they called and we would not take it".
+   *
+   * So it is journaled to every live session on the endpoint, the same audience
+   * and the same reasoning as `#journalUnattributable` — a malformed call names
+   * no session, and the sessions sharing this endpoint are precisely the ones it
+   * might have been for. The body is kept, capped, because "what did they
+   * actually send?" is the only question worth asking next.
+   *
+   * Best-effort throughout: a call we are already refusing must not turn into a
+   * 500 because the journal was unavailable.
+   */
+  async #refuseMalformed(
+    scope: ExpectationScope,
+    request: InboundRequest,
+    body: unknown,
+    call: {
+      messageId?: string;
+      action?: string;
+      timestamp?: string;
+      advertisedUri?: string;
+      detail: string;
+    },
+  ): Promise<InboundResult> {
+    const ackBody = nack("MALFORMED_CONTEXT", call.detail);
+
+    try {
+      const audience = await this.#sessions.sessionsOnEndpoint(
+        scope,
+        UNATTRIBUTED_FANOUT_LIMIT,
+      );
+      if (audience.length > 0) {
+        const payloadId = await this.#records.storePayload({
+          // No transaction and possibly no caller: the endpoint is the only
+          // true thing about this call, so that is what it is filed under. The
+          // handle is what makes it readable, not the key.
+          transactionId: `MALFORMED::${scope.domain}/${scope.version}/${scope.role}`,
+          subscriberUrl: call.advertisedUri ?? "unknown",
+          direction: "inbound",
+          action: call.action ?? request.action,
+          messageId: call.messageId ?? "unknown",
+          timestamp: call.timestamp ?? new Date().toISOString(),
+          body: capBody(body),
+          ackBody,
+        });
+
+        for (const sessionId of audience) {
+          await this.#records.journal(sessionId, {
+            kind: "POSSIBLY_RELATED",
+            action: call.action ?? request.action,
+            ack: "NACK",
+            nack_code: "MALFORMED_CONTEXT",
+            payload_id: payloadId,
+            summary:
+              `Refused a ${request.action} call on ${scope.domain}/${scope.version}/${scope.role} ` +
+              `with 400: ${call.detail} It could not be attributed to any run, so it may be yours. ` +
+              `Read what arrived with record_get_payload (${payloadId}).`,
+          });
+        }
+      }
+    } catch (error) {
+      this.#logger.warn(
+        { err: error, ...scope, action: request.action },
+        "could not journal a malformed inbound call",
+      );
+    }
+
+    this.#logger.warn(
+      { ...scope, action: request.action, detail: call.detail },
+      "refused an inbound call whose context could not be keyed on",
+    );
+
+    return { status: 400, body: ackBody };
+  }
+
   async #journalUnattributable(args: {
     /** The endpoint the call arrived on; its armed sessions are the audience. */
     scope: ExpectationScope;
