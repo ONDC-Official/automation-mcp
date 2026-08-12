@@ -47,11 +47,18 @@ const EnvSchema = z
     MCP_ALLOWED_HOSTS: csv.optional(),
     MCP_ALLOWED_ORIGINS: csv.optional(),
 
-    AUTH_MODE: z.enum(["none", "jwt"]).default("none"),
+    AUTH_MODE: z.enum(["none", "jwt", "apikey"]).default("none"),
     AUTH_ISSUER: z.url().optional(),
     AUTH_AUDIENCE: z.string().min(1).optional(),
     AUTH_JWKS_URL: z.url().optional(),
     AUTH_REQUIRED_SCOPES: csv.default([]),
+    /**
+     * Comma-separated list of valid API keys for `AUTH_MODE=apikey`.
+     *
+     * Clients send any of these as a bearer token. Keys are compared in
+     * constant time to prevent timing attacks.
+     */
+    AUTH_API_KEYS: csv.default([]),
 
     RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
     RATE_LIMIT_WINDOW: z.string().min(1).default("1 minute"),
@@ -286,13 +293,17 @@ const EnvSchema = z
       path: ["AUTH_MODE"],
     },
   )
+  .refine((env) => env.AUTH_MODE !== "apikey" || env.AUTH_API_KEYS.length > 0, {
+    message: "AUTH_MODE=apikey requires at least one key in AUTH_API_KEYS",
+    path: ["AUTH_API_KEYS"],
+  })
   // Refuse to run an unauthenticated MCP server in production. This is the
   // failure mode that quietly exposes every tool to the open internet.
   .refine(
     (env) => !(env.NODE_ENV === "production" && env.AUTH_MODE === "none"),
     {
       message:
-        "AUTH_MODE=none is refused when NODE_ENV=production — configure AUTH_MODE=jwt",
+        "AUTH_MODE=none is refused when NODE_ENV=production — configure AUTH_MODE=jwt or AUTH_MODE=apikey",
       path: ["AUTH_MODE"],
     },
   );

@@ -17,6 +17,7 @@ services:
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1,localhost}
       # env.ts refuses to boot with AUTH_MODE=none when NODE_ENV=production.
       AUTH_MODE: ${AUTH_MODE:-jwt}
+      AUTH_API_KEYS: ${AUTH_API_KEYS:-}
       AUTH_ISSUER: ${AUTH_ISSUER:?set AUTH_ISSUER}
       AUTH_AUDIENCE: ${AUTH_AUDIENCE:?set AUTH_AUDIENCE}
       AUTH_JWKS_URL: ${AUTH_JWKS_URL:?set AUTH_JWKS_URL}
