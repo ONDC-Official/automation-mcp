@@ -48,9 +48,12 @@ const EnvSchema = z
     MCP_ALLOWED_ORIGINS: csv.optional(),
 
     AUTH_MODE: z.enum(["none", "jwt", "apikey"]).default("none"),
-    AUTH_ISSUER: z.url().optional(),
-    AUTH_AUDIENCE: z.string().min(1).optional(),
-    AUTH_JWKS_URL: z.url().optional(),
+    AUTH_ISSUER: optionalUrl,
+    AUTH_AUDIENCE: z.preprocess(
+      (v) => (v === "" ? undefined : v),
+      z.string().min(1).optional(),
+    ),
+    AUTH_JWKS_URL: optionalUrl,
     AUTH_REQUIRED_SCOPES: csv.default([]),
     /**
      * Comma-separated list of valid API keys for `AUTH_MODE=apikey`.
