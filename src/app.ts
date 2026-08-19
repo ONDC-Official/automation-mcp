@@ -7,8 +7,10 @@ import type { Config } from "@/config/env.js";
 import type { Container } from "@/container.js";
 import { logger } from "@/lib/logger.js";
 import { healthRoutes } from "@/modules/health/health.routes.js";
+import { metricsRoutes } from "@/modules/metrics/metrics.routes.js";
 import { formsRoutes } from "@/modules/forms/forms.routes.js";
 import { receiverRoutes } from "@/modules/transport/receiver.routes.js";
+import { uiRoutes } from "@/modules/ui/ui.routes.js";
 import { authPlugin } from "@/plugins/auth.js";
 import { errorHandlerPlugin } from "@/plugins/error-handler.js";
 import { mcpPlugin } from "@/plugins/mcp.js";
@@ -53,6 +55,15 @@ export async function buildHttpApp(container: Container, config: Config) {
   await app.register(authPlugin, config);
   await app.register(mcpPlugin, container);
   await app.register(healthRoutes(container));
+  // Beside health, and unauthenticated in the same sense: an operator's probe,
+  // not an MCP client's call. Its own bearer check lives in the route, because
+  // `app.authenticate` answers with an OAuth discovery pointer a Prometheus
+  // scraper cannot follow. Registers nothing at all when METRICS_ENABLED is off.
+  await app.register(metricsRoutes(container));
+  // The viewer's read-only JSON, root-mounted for the same reason as the two
+  // above: it is an operator's surface, not a URL we advertise to a
+  // counterparty. Registers nothing at all when UI_ENABLED is off.
+  await app.register(uiRoutes(container));
 
   // The ONDC receiver, registered after health and left unauthenticated for
   // the same reason: it is called by a third-party network participant that has

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import {
   detectFromError,
   detectFromEvent,
@@ -90,7 +91,28 @@ export interface FeedbackServiceOptions {
   repoRoot?: string;
   /** False under `FEEDBACK_DISABLED`: capture stops at the front door. */
   enabled: boolean;
+  /**
+   * `TELEMETRY_CORRELATION`: attach clear `session_id` / `transaction_id` to a
+   * report, under one key and nowhere else.
+   *
+   * **It is read here and never passed to `feedback.redact.ts`.** That module
+   * is pure, imports no config, and does not know this flag exists — which is
+   * what makes "the flag cannot weaken redaction" a property of the module
+   * graph rather than of somebody's care.
+   */
+  correlation?: boolean;
   logger: Logger;
+  /** Optional; absent in unit tests. Capture is identical without it. */
+  metrics?: Metrics;
+  /**
+   * Injectable clock, as `SessionService.createSession` and
+   * `RecordService.createTransaction` already take one.
+   *
+   * Rendering a report stamps `generated_at`, so without this two renders of
+   * one incident differ on that field alone — which is precisely the
+   * difference a differential test needs to be able to rule out.
+   */
+  now?: () => Date;
 }
 
 /**
@@ -169,7 +191,10 @@ export class FeedbackService implements SessionEventObserver {
   readonly #salt: string;
   readonly #repoRoot: string | undefined;
   readonly #enabled: boolean;
+  readonly #correlation: boolean;
   readonly #logger: Logger;
+  readonly #metrics: Metrics | undefined;
+  readonly #now: () => Date;
 
   /**
    * Serialises `note()` per signature.
@@ -216,7 +241,23 @@ export class FeedbackService implements SessionEventObserver {
     this.#salt = options.salt;
     this.#repoRoot = options.repoRoot;
     this.#enabled = options.enabled;
+    this.#correlation = options.correlation ?? false;
     this.#logger = options.logger;
+    this.#metrics = options.metrics;
+    this.#now = options.now ?? (() => new Date());
+  }
+
+  /**
+   * Whether reports carry clear ids (`TELEMETRY_CORRELATION`).
+   *
+   * Exposed so `sharingNotice()` can say so. `feedback_list_reports` is
+   * documented as the honest answer to "what are you sending about me?", and a
+   * notice that claimed everything was pseudonymised while `correlation` sat in
+   * the body would make that documentation false — quietly, and in the one
+   * place a user is explicitly invited to trust it.
+   */
+  get correlates(): boolean {
+    return this.#correlation;
   }
 
   /* -------------------------------- taps --------------------------------- */
@@ -307,6 +348,13 @@ export class FeedbackService implements SessionEventObserver {
           resolved_at: at,
         };
         await this.#repository.save(resolved);
+        // The **derived** state, never `Narration.outcome`. A dashboard that
+        // counted what the model believed about itself would be measuring the
+        // model's optimism rather than the run.
+        this.#metrics?.incidentsResolved.inc({
+          trigger: incident.trigger,
+          state: outcome.state,
+        });
         // Terminal state is the trigger to report. Narration, if it ever
         // arrives, re-flushes with `flushed_at` cleared — the model usually
         // answers after the run has moved on, and waiting for it would mean a
@@ -315,7 +363,7 @@ export class FeedbackService implements SessionEventObserver {
       }
     } catch (error) {
       this.#logger.warn(
-        { err: error, sessionId },
+        { err: error, session_id: sessionId },
         "could not resolve feedback incidents; they stay open",
       );
     }
@@ -443,8 +491,16 @@ export class FeedbackService implements SessionEventObserver {
         };
 
         await this.#repository.save(incident);
+        // Counted on first sighting only — the `existing` branch returns above
+        // — so this counts *incidents*, matching `occurrences: 1` at open.
+        // `code` may be a validation finding code, whose space upstream owns,
+        // so it goes through the same cap `ondc_validation_findings_total` uses.
+        this.#metrics?.incidents.inc({
+          trigger: incident.trigger,
+          code: this.#metrics.findingCode(incident.code),
+        });
         this.#logger.debug(
-          { sessionId, signature, incidentId: incident.id },
+          { session_id: sessionId, signature, incidentId: incident.id },
           "opened a feedback incident",
         );
 
@@ -469,7 +525,7 @@ export class FeedbackService implements SessionEventObserver {
       });
     } catch (error) {
       this.#logger.warn(
-        { err: error, sessionId, signature },
+        { err: error, session_id: sessionId, signature },
         "could not record a feedback incident; nothing else is affected",
       );
     }
@@ -525,7 +581,7 @@ export class FeedbackService implements SessionEventObserver {
       const report: IssueReport = {
         schema_version: REPORT_SCHEMA_VERSION,
         report_id: incident.id,
-        generated_at: new Date().toISOString(),
+        generated_at: this.#now().toISOString(),
         install_id: installId(this.#salt),
         build: {
           domain: session?.build.domain ?? "unknown",
@@ -570,6 +626,28 @@ export class FeedbackService implements SessionEventObserver {
         // model was never asked" are different facts about the corpus, and a
         // missing key cannot tell them apart.
         narration: incident.narration ?? null,
+        /*
+         * The flag's whole blast radius: one key, assembled here, from ids the
+         * incident already holds in the clear.
+         *
+         * Deliberately **not** routed through `feedback.redact.ts` — that
+         * module never learns this flag exists, so no future edit to it can
+         * accidentally widen what the flag does. And deliberately spread as a
+         * conditional so a flag-off report has no `correlation` key at all,
+         * rather than one set to `undefined`: `JSON.stringify` drops the second
+         * on the way to the spool but a differential assertion would not, and
+         * the point of the shape is that the assertion is exact.
+         */
+        ...(this.#correlation
+          ? {
+              correlation: {
+                session_id: incident.session_id,
+                ...(incident.transaction_id !== undefined
+                  ? { transaction_id: incident.transaction_id }
+                  : {}),
+              },
+            }
+          : {}),
       };
 
       return report;
@@ -588,7 +666,10 @@ export class FeedbackService implements SessionEventObserver {
     try {
       return await this.#repository.list(sessionId);
     } catch (error) {
-      this.#logger.warn({ err: error, sessionId }, "could not list incidents");
+      this.#logger.warn(
+        { err: error, session_id: sessionId },
+        "could not list incidents",
+      );
       return [];
     }
   }

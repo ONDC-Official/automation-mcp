@@ -368,7 +368,7 @@ export class FormsService {
 
       this.#logger.info(
         {
-          transactionId: args.transactionId,
+          transaction_id: args.transactionId,
           formId: args.formId,
           submissionId,
           outcome: outcome.outcome,

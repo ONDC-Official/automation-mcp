@@ -12,6 +12,7 @@ import type {
   TransactionEvent,
   TransactionEvents,
 } from "@/lib/events/transaction-events.js";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import type { MockEngine } from "@/lib/mock-engine/mock-engine.js";
 import {
   checkInputs,
@@ -31,6 +32,7 @@ import type {
 import type {
   EngineFlow,
   EngineSequenceStep,
+  FlowMap,
   FlowStatusCode,
   MappedStep,
 } from "@/modules/flow/engine/engine-types.js";
@@ -191,6 +193,28 @@ export interface FlowServiceOptions {
    * identically whether or not anybody is listening.
    */
   feedback?: FeedbackObserver;
+  /** Optional, on the same terms. */
+  metrics?: Metrics;
+  /** Optional, on the same terms. */
+  mirror?: RunMirror;
+}
+
+/**
+ * The half of `MirrorService` this service uses.
+ *
+ * Declared here rather than imported, exactly as `FeedbackObserver` is: the
+ * mirror watches the loop, the loop does not know about the mirror.
+ */
+export interface RunMirror {
+  noteRunStarted(
+    sessionId: string,
+    run: {
+      flowId: string;
+      attempt: number;
+      autoAdvance: boolean;
+      startedAt: string;
+    },
+  ): void;
 }
 
 /**
@@ -305,6 +329,29 @@ export interface FlowRuntime {
   runner: MockRunner;
 }
 
+/**
+ * One read of a run, before it is rendered for anybody in particular.
+ *
+ * `header` is exactly the scalar half of `FlowStatusOutput`, kept as one object
+ * so `status()` can spread it and the viewer can pass it through — neither
+ * restates the `flow_status` derivation, which is the part that would drift.
+ * `map` is the engine's own `FlowMap`, unprojected.
+ */
+export interface FlowRunView {
+  map: FlowMap;
+  next: StepOutcome;
+  referenceDataKeys: string[];
+  header: Omit<
+    FlowStatusOutput,
+    | "sequence"
+    | "extra_steps"
+    | "missed_steps"
+    | "next"
+    | "reference_data_keys"
+    | "events"
+  >;
+}
+
 export class FlowService {
   readonly #sessions: SessionService;
   readonly #catalog: CatalogService;
@@ -329,6 +376,8 @@ export class FlowService {
   readonly #runLocks = new Map<string, Promise<unknown>>();
 
   readonly #feedback: FeedbackObserver | undefined;
+  readonly #metrics: Metrics | undefined;
+  readonly #mirror: RunMirror | undefined;
 
   constructor(options: FlowServiceOptions) {
     this.#sessions = options.sessions;
@@ -343,6 +392,8 @@ export class FlowService {
     this.#receiverPublicUrl = options.receiverPublicUrl.replace(/\/+$/, "");
     this.#mockSubscriberId = options.mockSubscriberId;
     this.#feedback = options.feedback;
+    this.#metrics = options.metrics;
+    this.#mirror = options.mirror;
   }
 
   /**
@@ -418,6 +469,25 @@ export class FlowService {
       autoAdvance,
     });
 
+    // `started` cannot come off the journal the way the other three statuses do
+    // — **nothing journals a run opening**. `flow_start` deliberately persists
+    // no transaction, so there is no `TRANSACTION_BOUND` yet and there may
+    // never be one: a run that opens and is immediately `BLOCKED` produces no
+    // journal line at all. Gated on the binding being new, so resuming a run
+    // (which `flow_start` does on purpose) is not counted as a second start.
+    if (existing === undefined) {
+      this.#metrics?.flowRuns.inc({ flow_id: args.flowId, status: "started" });
+      // Tap three of the mirror, and **not optional**: this is the only signal
+      // a run ever existed. A run that opens and is immediately `BLOCKED` — the
+      // most interesting row in a triage corpus — journals nothing at all.
+      this.#mirror?.noteRunStarted(session.session_id, {
+        flowId: args.flowId,
+        attempt: binding.attempt,
+        autoAdvance: binding.autoAdvance,
+        startedAt: binding.startedAt,
+      });
+    }
+
     const record =
       binding.transactionId === undefined
         ? this.#placeholderRecord(session, binding)
@@ -442,9 +512,9 @@ export class FlowService {
 
     this.#logger.info(
       {
-        sessionId: session.session_id,
-        flowId: args.flowId,
-        transactionId: binding.transactionId ?? null,
+        session_id: session.session_id,
+        flow_id: args.flowId,
+        transaction_id: binding.transactionId ?? null,
         mockRole: session.mock_role,
         autoAdvance,
       },
@@ -698,8 +768,8 @@ export class FlowService {
 
     this.#logger.info(
       {
-        sessionId: session.session_id,
-        flowId: args.flowId,
+        session_id: session.session_id,
+        flow_id: args.flowId,
         abandonedTransactionId,
         attempt,
         reason: args.reason ?? null,
@@ -748,9 +818,9 @@ export class FlowService {
       if (!(error instanceof NotFoundError)) throw error;
       this.#logger.warn(
         {
-          sessionId: session.session_id,
-          flowId: binding.flowId,
-          transactionId,
+          session_id: session.session_id,
+          flow_id: binding.flowId,
+          transaction_id: transactionId,
         },
         "restarted a run whose transaction had already expired; nothing to seal",
       );
@@ -761,6 +831,60 @@ export class FlowService {
 
   async status(sessionId: string, ref: FlowRef): Promise<FlowStatusOutput> {
     const runtime = await this.load(sessionId, ref);
+    const view = await this.#buildView(runtime);
+    const { mock_role: mockRole } = runtime.session;
+
+    return {
+      ...view.header,
+      sequence: view.map.sequence.map((step) =>
+        toStepState(step, mockRole, runtime.config),
+      ),
+      extra_steps: (view.map.extraSteps ?? []).map((step) =>
+        toStepState(step, mockRole, runtime.config),
+      ),
+      missed_steps: view.map.missedSteps.map(toMissedStep),
+      next: view.next,
+      reference_data_keys: view.referenceDataKeys,
+    };
+  }
+
+  /**
+   * Every run this session has opened, bound or not.
+   *
+   * Exposed on the service rather than reaching for `FlowRepository`, because
+   * the container publishes services and not repositories — and because an
+   * unbound run is invisible to `listTransactionIds`, so this is the only
+   * honest answer to "what has this session started?".
+   */
+  listRuns(sessionId: string): Promise<FlowBinding[]> {
+    return this.#repository.listRuns(sessionId);
+  }
+
+  /**
+   * The same read as `status()`, stopping one step earlier.
+   *
+   * `status()` builds the engine's `FlowMap` and then projects it into
+   * `FlowStepState` — a shape sized for a tool result, where a model is paying
+   * for every field. A browser is not, and the viewer's step renderer is a port
+   * of the same mapper this engine is a port of, so it consumes `MappedStep`
+   * directly. Handing it the pre-projection map is both less work and less
+   * lossy.
+   *
+   * Read-only, like `status()`: `describeNext` describes without arming.
+   */
+  async flowView(sessionId: string, ref: FlowRef): Promise<FlowRunView> {
+    return this.#buildView(await this.load(sessionId, ref));
+  }
+
+  /**
+   * Everything both readers need, computed once.
+   *
+   * Extracted so `status()` and `flowView()` cannot answer differently about
+   * the same run — they are two renderings of one read, and a second
+   * implementation of the `flow_status` derivation below is a bug waiting for
+   * somebody to notice the two disagree.
+   */
+  async #buildView(runtime: FlowRuntime): Promise<FlowRunView> {
     const { session, record, flow } = runtime;
     const transactionId = record.transactionId;
 
@@ -789,33 +913,29 @@ export class FlowService {
         map.sequence.length > 0);
 
     return {
-      // Null, not the placeholder's candidate: an unbound run has no id.
-      transaction_id: runtime.bound ? transactionId : null,
-      flow_id: record.flowId,
-      flow_status:
-        record.abandoned !== undefined || flowStatus === "SUSPENDED"
-          ? "BLOCKED"
-          : complete
-            ? "COMPLETE"
-            : record.apiList.length === 0
-              ? "NOT_STARTED"
-              : "IN_PROGRESS",
-      mock_role: session.mock_role,
-      attempt: runtime.binding.attempt,
-      ...(record.abandoned ? { abandoned: record.abandoned } : {}),
-      seq: record.seq,
-      sequence: map.sequence.map((step) =>
-        toStepState(step, session.mock_role, runtime.config),
-      ),
-      extra_steps: (map.extraSteps ?? []).map((step) =>
-        toStepState(step, session.mock_role, runtime.config),
-      ),
-      missed_steps: map.missedSteps.map(toMissedStep),
+      map,
       next,
-      reference_data_keys: Object.entries(map.reference_data ?? {})
+      referenceDataKeys: Object.entries(map.reference_data ?? {})
         .filter(([, value]) => value !== undefined && value !== null)
         .map(([key]) => key),
-      ...(record.attention ? { attention: record.attention } : {}),
+      header: {
+        // Null, not the placeholder's candidate: an unbound run has no id.
+        transaction_id: runtime.bound ? transactionId : null,
+        flow_id: record.flowId,
+        flow_status:
+          record.abandoned !== undefined || flowStatus === "SUSPENDED"
+            ? "BLOCKED"
+            : complete
+              ? "COMPLETE"
+              : record.apiList.length === 0
+                ? "NOT_STARTED"
+                : "IN_PROGRESS",
+        mock_role: session.mock_role,
+        attempt: runtime.binding.attempt,
+        ...(record.abandoned ? { abandoned: record.abandoned } : {}),
+        seq: record.seq,
+        ...(record.attention ? { attention: record.attention } : {}),
+      },
     };
   }
 
@@ -899,7 +1019,7 @@ export class FlowService {
       // Same contract as `RecordService#journal`: telemetry may not fail a
       // protocol call. The model's answer is already computed at this point.
       this.#logger.warn(
-        { err: observerError, sessionId: args.sessionId },
+        { err: observerError, session_id: args.sessionId },
         "the feedback observer threw; the flow outcome is unaffected",
       );
     }
@@ -953,7 +1073,11 @@ export class FlowService {
           await this.chainNext(args.sessionId, transactionId);
         } catch (error) {
           this.#logger.error(
-            { err: error, sessionId: args.sessionId, transactionId },
+            {
+              err: error,
+              session_id: args.sessionId,
+              transaction_id: transactionId,
+            },
             "auto-advance chain after a send failed",
           );
 
@@ -1259,8 +1383,8 @@ export class FlowService {
 
     this.#logger.warn(
       {
-        sessionId: args.sessionId,
-        flowId: runtime.binding.flowId,
+        session_id: args.sessionId,
+        flow_id: runtime.binding.flowId,
         afterSeq: args.afterSeq,
         highWater,
       },
@@ -1362,7 +1486,7 @@ export class FlowService {
       lines = await this.#records.readEvents(sessionId, afterSeq);
     } catch (error) {
       this.#logger.warn(
-        { err: error, sessionId },
+        { err: error, session_id: sessionId },
         "could not read the session journal while parked; staying parked",
       );
       return [];
@@ -1480,7 +1604,7 @@ export class FlowService {
       bindings = await this.#repository.listRuns(session.session_id);
     } catch (error) {
       this.#logger.warn(
-        { err: error, sessionId: session.session_id },
+        { err: error, session_id: session.session_id },
         "could not list this session's runs; skipping the re-arm sweep",
       );
       return;
@@ -1497,8 +1621,8 @@ export class FlowService {
         this.#logger.warn(
           {
             err: error,
-            sessionId: session.session_id,
-            flowId: binding.flowId,
+            session_id: session.session_id,
+            flow_id: binding.flowId,
           },
           "could not re-arm one run's expectation during the session sweep",
         );
@@ -1564,8 +1688,8 @@ export class FlowService {
 
     this.#logger.info(
       {
-        sessionId: runtime.session.session_id,
-        flowId: runtime.binding.flowId,
+        session_id: runtime.session.session_id,
+        flow_id: runtime.binding.flowId,
         action: target.step.actionType,
       },
       "re-arming a lapsed expectation before a long wait",
@@ -1733,7 +1857,7 @@ export class FlowService {
       await this.#journalCompletion(runtime);
     } catch (error) {
       this.#logger.warn(
-        { err: error, sessionId, transactionId },
+        { err: error, session_id: sessionId, transaction_id: transactionId },
         "could not check whether the flow had completed",
       );
     }
@@ -2435,15 +2559,16 @@ export class FlowService {
 
         this.#logger.warn(
           {
-            sessionId: session.session_id,
-            transactionId: txnId,
-            stepKey: step.actionId,
+            session_id: session.session_id,
+            transaction_id: txnId,
+            step_key: step.actionId,
             paths: overridden,
           },
           "outbound payload patched by payload_overrides; this step is not a clean step",
         );
       }
-      const patched = overridden.length > 0 ? { overrides: [...overridden] } : {};
+      const patched =
+        overridden.length > 0 ? { overrides: [...overridden] } : {};
 
       if (bound) {
         // A run that already has an id keeps it for the rest of the flow.
@@ -2521,9 +2646,9 @@ export class FlowService {
         // unspoken for.
         this.#logger.warn(
           {
-            sessionId: session.session_id,
-            transactionId: txnId,
-            stepKey: step.actionId,
+            session_id: session.session_id,
+            transaction_id: txnId,
+            step_key: step.actionId,
             findings: validation.findings.length,
           },
           "outbound payload failed protocol validation; not sending it",
@@ -2797,9 +2922,9 @@ export class FlowService {
 
     this.#logger.info(
       {
-        sessionId: session.session_id,
-        flowId: binding.flowId,
-        transactionId,
+        session_id: session.session_id,
+        flow_id: binding.flowId,
+        transaction_id: transactionId,
       },
       "minted the transaction id for this flow's first action",
     );
@@ -2896,9 +3021,9 @@ export class FlowService {
 
     this.#logger.warn(
       {
-        sessionId: runtime.session.session_id,
-        transactionId: expected,
-        stepKey: step.actionId,
+        session_id: runtime.session.session_id,
+        transaction_id: expected,
+        step_key: step.actionId,
         generated,
       },
       "the step's generate rewrote context.transaction_id; correcting it",

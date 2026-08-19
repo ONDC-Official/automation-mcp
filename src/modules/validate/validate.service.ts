@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Logger } from "pino";
 import type { CacheStore } from "@/lib/cache/cache-store.js";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import type { Session } from "@/modules/session/session.schema.js";
 import { readContext, type ValidationGateway } from "@/modules/validate/validate.gateway.js";
 import {
@@ -85,6 +86,8 @@ export interface ValidateServiceOptions {
   cacheTtlMs: number;
   mode: ValidationMode;
   logger: Logger;
+  /** Optional; absent in unit tests. The verdict never depends on it. */
+  metrics?: Metrics;
 }
 
 export class ValidateService {
@@ -93,12 +96,14 @@ export class ValidateService {
   readonly #cacheTtlMs: number;
   readonly #mode: ValidationMode;
   readonly #logger: Logger;
+  readonly #metrics: Metrics | undefined;
 
   constructor(options: ValidateServiceOptions) {
     this.#cache = options.cache;
     this.#cacheTtlMs = options.cacheTtlMs;
     this.#mode = options.mode;
     this.#logger = options.logger;
+    this.#metrics = options.metrics;
 
     this.register(new ProtocolCheck(options.gateway));
   }
@@ -131,7 +136,13 @@ export class ValidateService {
 
     const cacheKey = this.#cacheKey(request);
     const cached = await this.#read(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      // Counted, because a cached verdict is still a verdict a gate acted on.
+      // Counting only cache misses would make the ratio of `invalid` to `valid`
+      // a fact about the cache rather than about the payloads.
+      this.#count(cached, request.direction);
+      return cached;
+    }
 
     const runnable: ValidationCheck[] = [];
     const unchecked: UncheckedLayer[] = [];
@@ -194,7 +205,37 @@ export class ValidateService {
     );
 
     await this.#write(cacheKey, verdict);
+    this.#count(verdict, request.direction);
     return verdict;
+  }
+
+  /**
+   * One verdict, and every finding in it.
+   *
+   * `verdict` and `direction` are both closed enums. `code` is not — it comes
+   * from upstream's compiled `x-validations` and a participant with a novel
+   * defect is how a new value arrives — so it goes through the shared cap. The
+   * hundredth-and-first distinct code becomes `other`, which is a worse
+   * dashboard than the alternative and a much better one than a scrape that
+   * times out.
+   *
+   * Never throws. This sits in the ACK window; a metrics failure must not
+   * become a NACK.
+   */
+  #count(verdict: ValidationVerdict, direction: "inbound" | "outbound"): void {
+    const metrics = this.#metrics;
+    if (metrics === undefined) return;
+    try {
+      metrics.validationVerdicts.inc({ verdict: verdict.status, direction });
+      for (const finding of verdict.findings) {
+        metrics.validationFindings.inc({
+          layer: finding.layer,
+          code: metrics.findingCode(finding.code),
+        });
+      }
+    } catch (error) {
+      this.#logger.debug({ err: error }, "could not count a validation verdict");
+    }
   }
 
   /**

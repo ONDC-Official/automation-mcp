@@ -182,7 +182,7 @@ export class CatalogService {
     const totalBytes = JSON.stringify(config).length;
 
     this.#logger.debug(
-      { flowId, cached: cached !== undefined, totalBytes },
+      { flow_id: flowId, cached: cached !== undefined, totalBytes },
       "mock config resolved",
     );
 

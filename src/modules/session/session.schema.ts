@@ -131,8 +131,29 @@ export const CreateSessionInput = z.object({
 });
 export type CreateSessionInput = z.infer<typeof CreateSessionInput>;
 
+/**
+ * A page the human driving this test can open to watch it happen.
+ *
+ * On both session outputs and not on `Session` itself, because it is derived
+ * from where this process is deployed and from a token that may be minted per
+ * process — storing it would leave a link that looks right and no longer works.
+ * Absent when the viewer is switched off.
+ */
+const ViewerUrlField = {
+  viewer_url: z
+    .string()
+    .optional()
+    .describe(
+      "A page showing this session's flows, payloads and events, live. Give " +
+        "it to the person you are testing for — it is the only view they have " +
+        "of the run that is not you describing it. Read-only: driving the flow " +
+        "is still yours.",
+    ),
+};
+
 export const CreateSessionOutput = z.object({
   session: Session,
+  ...ViewerUrlField,
   flows: z
     .array(FlowSummary)
     .describe("Every flow published for this build, ready to start."),
@@ -149,6 +170,7 @@ export type GetSessionInput = z.infer<typeof GetSessionInput>;
 
 export const GetSessionOutput = z.object({
   session: Session,
+  ...ViewerUrlField,
   ...EventsField,
 });
 export type GetSessionOutput = z.infer<typeof GetSessionOutput>;

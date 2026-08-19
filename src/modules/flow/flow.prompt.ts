@@ -42,7 +42,11 @@ const LOOP = `
    actually reach it. A loopback URL only works for a participant on this
    machine.
 2. \`session_create\` — the participant's subscriber URL and whether it is a BAP
-   or a BPP. This server takes the opposite role automatically.
+   or a BPP. This server takes the opposite role automatically. **Give the
+   \`viewer_url\` it returns straight to the person you are testing for**, before
+   you do anything else. It is a live page showing every flow, every payload and
+   every event in this session, and it is the only view of the run they have
+   that is not you describing it. You keep driving; they get to watch.
 3. \`catalog_list_flows\` — pick a flow. \`catalog_describe_flow\` shows who owns
    each step.
 4. \`flow_start\` — opens the run. Give the participant the \`callback_url\` it

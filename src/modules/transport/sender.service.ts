@@ -2,6 +2,7 @@ import type { Dispatcher } from "undici";
 import { request } from "undici";
 import type { Logger } from "pino";
 import { UpstreamError } from "@/lib/errors.js";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import type { AckStatus } from "@/modules/record/record.schema.js";
 
 /**
@@ -76,6 +77,8 @@ export interface SenderServiceOptions {
   signer?: RequestSigner;
   /** Shared undici agent. Injected in tests as a `MockAgent`. */
   dispatcher?: Dispatcher;
+  /** Optional; absent in unit tests. A send behaves the same either way. */
+  metrics?: Metrics;
 }
 
 export class SenderService {
@@ -83,12 +86,14 @@ export class SenderService {
   readonly #timeoutMs: number;
   readonly #signer: RequestSigner;
   readonly #dispatcher: Dispatcher | undefined;
+  readonly #metrics: Metrics | undefined;
 
   constructor(options: SenderServiceOptions) {
     this.#logger = options.logger;
     this.#timeoutMs = options.timeoutMs;
     this.#signer = options.signer ?? new NoopSigner();
     this.#dispatcher = options.dispatcher;
+    this.#metrics = options.metrics;
   }
 
   async send(
@@ -99,6 +104,9 @@ export class SenderService {
     const url = `${subscriberUrl.replace(/\/+$/, "")}/${action}`;
     const sentBytes = JSON.stringify(payload);
     const authorization = await this.#signer.sign(sentBytes, action);
+    // The clock starts after signing, so the histogram measures the wire and
+    // not our own crypto — the two have different owners and different fixes.
+    const started = performance.now();
 
     let response: Dispatcher.ResponseData;
     try {
@@ -118,6 +126,12 @@ export class SenderService {
       // The exchange did not complete, so the model has no body to learn from.
       // `delivery` is what tells the caller whether to withdraw the entry it
       // recorded before this call or keep it as "outcome unknown".
+      //
+      // Counted with the *same* `delivery` classification the caller acts on,
+      // not with a generic `error`: "nothing crossed" and "we cannot tell" are
+      // the two facts an operator needs, and they are already distinguished
+      // here and nowhere else.
+      this.#record(action, classifyDelivery(error), started);
       throw new UpstreamError(
         "network-participant",
         `could not reach ${url}: ${
@@ -135,6 +149,7 @@ export class SenderService {
       // answer is lost. Wrapped rather than left raw so the caller sees the same
       // error shape (and the same `delivery` field) it sees for every other
       // transport failure.
+      this.#record(action, "uncertain", started);
       throw new UpstreamError(
         "network-participant",
         `${url} answered ${String(response.statusCode)} but the body never arrived: ${
@@ -152,7 +167,33 @@ export class SenderService {
       "sent protocol call",
     );
 
+    this.#record(action, ack, started);
     return { httpStatus: response.statusCode, ack, body, sentBytes, url };
+  }
+
+  /**
+   * One outbound call, counted and timed.
+   *
+   * **Only the histogram is here; the counter is not.** `ondc_outbound_sends_total`
+   * comes off the journal (`MetricsObserver`), which sees the same sends and
+   * already knows which were chained. Counting in both places would double
+   * every send, and the histogram is the half the journal genuinely cannot
+   * produce.
+   *
+   * `outcome` deliberately spans two vocabularies — `ACK`/`NACK`/`UNPARSEABLE`
+   * from a completed exchange, `unreachable`/`uncertain` from one that threw.
+   * Both are bounded enums, and collapsing them into "success/failure" would
+   * lose the only distinction that tells an operator whether a duplicate call
+   * is possible.
+   */
+  #record(action: string, outcome: string, startedAt: number): void {
+    const metrics = this.#metrics;
+    if (metrics === undefined) return;
+    const seconds = (performance.now() - startedAt) / 1_000;
+    metrics.outboundDuration.observe(
+      { action: metrics.action(action), outcome },
+      seconds,
+    );
   }
 }
 

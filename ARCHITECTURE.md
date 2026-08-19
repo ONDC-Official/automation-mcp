@@ -60,15 +60,15 @@ makes this a faithful mock rather than an approximation.
 This is the whole idea. Everything in the codebase follows from which column a
 responsibility falls into.
 
-| Deterministic — code, always      | Model — via tools                       |
-| --------------------------------- | --------------------------------------- |
-| Generating the payload (the flow's own `generate`) | Deciding **when** a step goes |
-| Auth header sign + verify _(seam only today)_ | Filling the inputs a step declares |
-| L0 JSON-schema validation         | Choosing which unsolicited/extra action to fire |
-| L1 contextual rule validation     | L2 business/semantic judgement on inbound _(not built)_ |
-| Sequence matching + ACK/NACK      | Filling a counterparty's form           |
-| Recording payloads + business data | Narrating a compliance report _(not built)_ |
-| Computing the report _(not built)_ | Narrating an incident report            |
+| Deterministic — code, always                      | Model — via tools                                      |
+| ------------------------------------------------- | ------------------------------------------------------ |
+| Generating the payload (the flow's own`generate`) | Deciding**when** a step goes                           |
+| Auth header sign + verify_(seam only today)_      | Filling the inputs a step declares                     |
+| L0 JSON-schema validation                         | Choosing which unsolicited/extra action to fire        |
+| L1 contextual rule validation                     | L2 business/semantic judgement on inbound_(not built)_ |
+| Sequence matching + ACK/NACK                      | Filling a counterparty's form                          |
+| Recording payloads + business data                | Narrating a compliance report_(not built)_             |
+| Computing the report_(not built)_                 | Narrating an incident report                           |
 
 The model's job is **inputs and judgement, not JSON.** It decides when a step
 goes, supplies the values the flow declares, and reads what comes back. The
@@ -78,11 +78,11 @@ a model's draft can.
 
 ### Three decisions that fix the shape of the system
 
-| Decision | Choice |
-| --- | --- |
-| **Spec source** | The **live config-service**. `CONFIG_SERVICE_URL` is the single source of builds, flows and mock configs; responses are cached in-process. Nothing is bundled — if it is unreachable, sessions cannot be created and `/ready` says so. |
-| **Wire ownership** | **Full NP.** The Fastify app hosts real receiver routes (resolve → validate → ACK/NACK) and signs and POSTs real outbound calls. It replaces api-service + ONIX for the mock side. |
-| **ACK/NACK authority** | **Deterministic**, with an LLM override hook planned (`nack_rules`). No model round trip inside the ACK window. |
+| Decision               | Choice                                                                                                                                                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Spec source**        | The**live config-service**. `CONFIG_SERVICE_URL` is the single source of builds, flows and mock configs; responses are cached in-process. Nothing is bundled — if it is unreachable, sessions cannot be created and `/ready` says so. |
+| **Wire ownership**     | **Full NP.** The Fastify app hosts real receiver routes (resolve → validate → ACK/NACK) and signs and POSTs real outbound calls. It replaces api-service + ONIX for the mock side.                                                    |
+| **ACK/NACK authority** | **Deterministic**, with an LLM override hook planned (`nack_rules`). No model round trip inside the ACK window.                                                                                                                       |
 
 ---
 
@@ -102,11 +102,13 @@ flowchart LR
     RX["inbound receiver<br/>POST /{domain}/{version}/{role}/{action}"]
     TX["outbound sender<br/>POST {subscriber_url}/{action}"]
     FM["hosted forms<br/>GET/POST /forms/…"]
+    UI["viewer read model<br/>GET /ui/api/… + SSE"]
     W["mock-engine<br/>worker_threads sandbox"]
     T --> S --> R
     RX --> S
     S --> TX
     FM --> S
+    UI --> S
     S --> W
   end
 
@@ -116,6 +118,7 @@ flowchart LR
     NP["the participant under test<br/>(a real BAP or BPP)"]
     RD[("Redis — optional")]
     SP[["feedback spool / ingest"]]
+    BR["the human's browser<br/>on a page hosted elsewhere"]
   end
 
   M <-->|JSON-RPC over stdio or Streamable HTTP| T
@@ -125,7 +128,11 @@ flowchart LR
   NP -->|beckn callback| RX
   R <--> RD
   S --> SP
+  BR -->|token-gated JSON + SSE| UI
 ```
+
+Note where the browser sits: it reaches **this** process directly. The page it
+runs is served by somebody else, but no payload ever passes through them.
 
 ### Two transports, one server definition
 
@@ -145,14 +152,56 @@ so every capability works identically on either.
   `buildMcpServer` must stay cheap and everything expensive lives in the
   container.
 
-### Three HTTP surfaces, deliberately different
+### Four HTTP surfaces, deliberately different
 
-| Surface | Path | Auth | Called by |
-| --- | --- | --- | --- |
-| MCP | `/mcp` | `AUTH_MODE` (JWT in production, refused as `none`) + DNS-rebinding host/origin checks | the model's client |
-| Receiver | `/{domain}/{version}/{buyer\|seller}/{action}` | **none** — authenticity is the ONDC signature (`verifyAuth` seam), not an MCP bearer token | the third-party participant |
-| Hosted forms | `/forms/{domain}/{formId}[/submit]` | **none** | a human following a link out of a beckn payload |
-| Health | `/health`, `/ready` | none | a load balancer |
+| Surface      | Path                                           | Auth                                                                                       | Called by                                       |
+| ------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| MCP          | `/mcp`                                         | `AUTH_MODE` (JWT in production, refused as `none`) + DNS-rebinding host/origin checks      | the model's client                              |
+| Receiver     | `/{domain}/{version}/{buyer\|seller}/{action}` | **none** — authenticity is the ONDC signature (`verifyAuth` seam), not an MCP bearer token | the third-party participant                     |
+| Hosted forms | `/forms/{domain}/{formId}[/submit]`            | **none**                                                                                   | a human following a link out of a beckn payload |
+| Viewer       | `/ui/api/…`                                    | its own constant-time bearer token, plus CORS for the page's origin                        | a browser, on a page hosted somewhere else      |
+| Health       | `/health`, `/ready`                            | none                                                                                       | a load balancer                                 |
+
+The viewer is the only one of these reached by a browser, and every difference
+follows from that: it is the only surface with CORS, the only one that answers a
+Private Network Access preflight, and the only one that translates `AppError`
+into an HTTP status — the others either answer through the MCP tool channel or
+speak beckn's own ACK/NACK. `app.authenticate` is the wrong tool for it for the
+same reason it is wrong for `/metrics`: it answers with an RFC 9728 discovery
+pointer, and a `fetch` cannot follow one.
+
+### The viewer: the page is hosted, the data is not
+
+A human driving this server through a model sees only what the model narrates.
+The viewer is the other channel: `session_create` returns a `viewer_url`, the
+prompt tells the model to hand it over, and opening it shows the session's
+flows, each step's state, both directions' payloads, the business data and the
+journal, live.
+
+The page itself lives in `ONDC-Official/automation-frontend` (`main-tech`, route
+`/mcp-session`) — **this repo grows no frontend**. That is what keeps the change
+small: no bundler, no `@fastify/static`, no Dockerfile change, and helmet's
+app-wide `default-src 'none'` stays honest because nothing here serves HTML. It
+works because `flow/engine/` is a port of the very mapper that page's step
+renderer was written against, so `FlowService.flowView` can hand over the
+`FlowMap` that `status()` would otherwise project away, and the existing
+components consume it unchanged.
+
+Four consequences worth keeping:
+
+- **The browser fetches straight from this process.** Payload bodies never pass
+  through whoever hosts the page. It also decides who can open a link: an engine
+  on a laptop yields one only that person can open; an engine on a public URL
+  yields one anybody holding it can.
+- **The link's parameters ride in the `#` fragment.** A query string is sent to
+  the page's host in the request line, so the token — a credential for *this*
+  server — would land in somebody else's access logs.
+- **Reads are cursor-neutral.** `readEvents`, never `drainEvents`: that cursor is
+  how the model is told what happened, and a viewer that consumed it would leave
+  the model deaf while a human watched the callbacks arrive.
+- **It is invisible to the model** — no tool, no resource, no line in
+  `capabilities.ts`, exactly as the mirror is. The viewer is not part of the
+  transaction.
 
 The receiver and forms mount under `container.receiverRoutePrefix`, derived from
 `RECEIVER_PUBLIC_URL`'s pathname, so a deployment behind `https://host/api-service`
@@ -199,10 +248,10 @@ It also lifts W3C trace context (`traceparent`/`tracestate`/`baggage`) out of
 
 ### Two error channels — pick by _who can fix it_
 
-| Failure | Channel |
-| --- | --- |
+| Failure                                                                   | Channel                                                                                   |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | Model-fixable — bad payload, unknown flow, upstream down, validation NACK | `{ isError: true }` tool result. The model must be able to read it and retry differently. |
-| Client-fixable — auth, unknown method, malformed JSON-RPC | JSON-RPC error |
+| Client-fixable — auth, unknown method, malformed JSON-RPC                 | JSON-RPC error                                                                            |
 
 A validation NACK is **always** the tool channel.
 
@@ -225,14 +274,14 @@ factory performs no I/O, so this property cannot quietly regress.
 
 What lives there, and why it has to:
 
-| Thing | Why here |
-| --- | --- |
-| `undici.Agent` (`httpAgent`) | one connection pool per process. Built per request it would be a capacity cliff under load, not a failing test. |
-| `stateStore: CacheStore` | Redis when `REDIS_URL` is set, in-process otherwise. Sessions, transactions, payloads, business data, expectations, journal. |
-| `catalogCache: CacheStore` | **always in-process.** `FlowService.load()` reads a ~330KB mock config on every `flow_proceed` and every inbound callback; through Redis that is a 330KB transfer plus a parse per loop iteration, one of them inside the ACK window. The data is derived, TTL'd, and re-fetched transparently on a miss. Also holds validation verdicts, keyed on payload bytes. |
-| `MockEngine` | holds live `worker_threads`, not data. Nothing spawns until a flow actually runs; `dispose()` must terminate the pool or a stdio process never exits. |
-| `TransactionEvents` | holds parked waiters, not data. Released in `dispose()`. |
-| services, repositories, receiver lifecycle, health checks | assembled once, injected everywhere |
+| Thing                                                     | Why here                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `undici.Agent` (`httpAgent`)                              | one connection pool per process. Built per request it would be a capacity cliff under load, not a failing test.                                                                                                                                                                                                                                                   |
+| `stateStore: CacheStore`                                  | Redis when`REDIS_URL` is set, in-process otherwise. Sessions, transactions, payloads, business data, expectations, journal.                                                                                                                                                                                                                                       |
+| `catalogCache: CacheStore`                                | **always in-process.** `FlowService.load()` reads a ~330KB mock config on every `flow_proceed` and every inbound callback; through Redis that is a 330KB transfer plus a parse per loop iteration, one of them inside the ACK window. The data is derived, TTL'd, and re-fetched transparently on a miss. Also holds validation verdicts, keyed on payload bytes. |
+| `MockEngine`                                              | holds live`worker_threads`, not data. Nothing spawns until a flow actually runs; `dispose()` must terminate the pool or a stdio process never exits.                                                                                                                                                                                                              |
+| `TransactionEvents`                                       | holds parked waiters, not data. Released in`dispose()`.                                                                                                                                                                                                                                                                                                           |
+| services, repositories, receiver lifecycle, health checks | assembled once, injected everywhere                                                                                                                                                                                                                                                                                                                               |
 
 **Do not merge the two `CacheStore`s.** The split is load-bearing and the
 container says so in place. The cost of the split is stated honestly there too:
@@ -249,11 +298,11 @@ returned.
 
 `/ready` runs one probe per external dependency.
 
-| Probe | Optional | Reasoning |
-| --- | --- | --- |
-| `config-service` | no | every flow comes from it; unreachable means sessions cannot be created |
-| `cache-store` | no | the only store that can be remote |
-| `validation-service` | **yes** | validation fails open. Degrading readiness would pull the instance out of rotation and turn a partial loss of function into a total outage, mid-transaction. |
+| Probe                | Optional | Reasoning                                                                                                                                                    |
+| -------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `config-service`     | no       | every flow comes from it; unreachable means sessions cannot be created                                                                                       |
+| `cache-store`        | no       | the only store that can be remote                                                                                                                            |
+| `validation-service` | **yes**  | validation fails open. Degrading readiness would pull the instance out of rotation and turn a partial loss of function into a total outage, mid-transaction. |
 
 ---
 
@@ -261,12 +310,12 @@ returned.
 
 ### Four identities, and they are not the same thing
 
-| Identity | Scope |
-| --- | --- |
-| `session_id` | one mock-NP session: one participant, one build, one role. Many transactions. |
+| Identity                | Scope                                                                                                                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `session_id`            | one mock-NP session: one participant, one build, one role. Many transactions.                                                                                                                                |
 | `(session_id, flow_id)` | **one flow run** — the handle every loop tool takes. A run exists _before_ its transaction does, which is why it needs a name of its own. Stored as a `FlowBinding` under `flow_run::{sessionId}::{flowId}`. |
-| `transaction_id` | one attempt of one flow. **New** id for a flow's first action, **same** id for the rest. |
-| `message_id` | unique per call |
+| `transaction_id`        | one attempt of one flow.**New** id for a flow's first action, **same** id for the rest.                                                                                                                      |
+| `message_id`            | unique per call                                                                                                                                                                                              |
 
 ### The transaction id belongs to whoever sends the flow's first action
 
@@ -277,10 +326,10 @@ no id. It writes a binding, arms an expectation if the first step is the
 participant's, and returns `transaction_id: null`. The id is fixed at exactly one
 of two moments:
 
-| First action is | Where the id comes from | Bind site |
-| --- | --- | --- |
-| ours to send | `context.transaction_id` on the **generated** payload, read back after `generate`, before `send` | `flow.service.ts#bindOutbound` |
-| theirs to send | `context.transaction_id` on their call, adopted verbatim | `flow.service.ts#adoptTransaction`, from the receiver's expectation branch |
+| First action is | Where the id comes from                                                                          | Bind site                                                                  |
+| --------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| ours to send    | `context.transaction_id` on the **generated** payload, read back after `generate`, before `send` | `flow.service.ts#bindOutbound`                                             |
+| theirs to send  | `context.transaction_id` on their call, adopted verbatim                                         | `flow.service.ts#adoptTransaction`, from the receiver's expectation branch |
 
 This is the workbench's own shape (`startNewFlowController` writes nothing to
 cache; the transaction is created once a payload has crossed). Minting an id up
@@ -303,10 +352,10 @@ Consequences that fall out of it:
 
 ### Two stores per transaction, on purpose
 
-| Store | Key | Holds |
-| --- | --- | --- |
-| Transaction record | `{transaction_id}::{subscriber_url}` | the **sequence of exchanges** — slim `ApiEntry`/`FormEntry` rows, one per call, enough for the engine to replay |
-| Business data | `MOCK_DATA::{transaction_id}::{subscriber_url}` | the **values carried between steps** — the provider id from `on_search` that `select` must quote back |
+| Store              | Key                                             | Holds                                                                                                          |
+| ------------------ | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Transaction record | `{transaction_id}::{subscriber_url}`            | the**sequence of exchanges** — slim `ApiEntry`/`FormEntry` rows, one per call, enough for the engine to replay |
+| Business data      | `MOCK_DATA::{transaction_id}::{subscriber_url}` | the**values carried between steps** — the provider id from `on_search` that `select` must quote back           |
 
 They are read at different times by different things: the record is replayed on
 every status read, the business data is fed to the config's `generate`. Merging
@@ -322,21 +371,21 @@ lets `record_get_payload` slice with JSONPath and cap the bytes reaching the mod
 
 `record.repository.ts` is the one file that knows every key.
 
-| Key | Contents |
-| --- | --- |
-| `{txn}::{sub}` | `TransactionRecord` |
-| `MOCK_DATA::{txn}::{sub}` | business data |
-| `FLOW_STATUS_{txn}::{sub}` | `WORKING` / `AVAILABLE` / `SUSPENDED` marker |
-| `EXTRA_FLOW_STATUS_{txn}::{sub}::{stepKey}` | the same, per extras step |
-| `payload::{id}` | one stored body |
-| `expect::{DOMAIN}::{version}::{role}` | the list of armed `Expectation`s on one endpoint |
-| `txn_index::{id}` | `TransactionLocation[]` — where a transaction lives, by id alone |
-| `session_txns::{sessionId}` | the session's transaction ids |
-| `flow_run::{sessionId}::{flowId}` | the `FlowBinding` — **and** the `TransactionEvents` key an unbound wait parks on |
-| `journal::{sessionId}` | the session event journal (capped 500) — **and** the session-scope wait key |
-| `journal_seq::{sessionId}` | the journal's atomic counter |
-| `journal_cursor::{sessionId}` | how much has been delivered to the model |
-| `once::{name}` | one-shot marker behind `claimFirst` |
+| Key                                         | Contents                                                                        |
+| ------------------------------------------- | ------------------------------------------------------------------------------- |
+| `{txn}::{sub}`                              | `TransactionRecord`                                                             |
+| `MOCK_DATA::{txn}::{sub}`                   | business data                                                                   |
+| `FLOW_STATUS_{txn}::{sub}`                  | `WORKING` / `AVAILABLE` / `SUSPENDED` marker                                    |
+| `EXTRA_FLOW_STATUS_{txn}::{sub}::{stepKey}` | the same, per extras step                                                       |
+| `payload::{id}`                             | one stored body                                                                 |
+| `expect::{DOMAIN}::{version}::{role}`       | the list of armed`Expectation`s on one endpoint                                 |
+| `txn_index::{id}`                           | `TransactionLocation[]` — where a transaction lives, by id alone                |
+| `session_txns::{sessionId}`                 | the session's transaction ids                                                   |
+| `flow_run::{sessionId}::{flowId}`           | the`FlowBinding` — **and** the `TransactionEvents` key an unbound wait parks on |
+| `journal::{sessionId}`                      | the session event journal (capped 500) —**and** the session-scope wait key      |
+| `journal_seq::{sessionId}`                  | the journal's atomic counter                                                    |
+| `journal_cursor::{sessionId}`               | how much has been delivered to the model                                        |
+| `once::{name}`                              | one-shot marker behind`claimFirst`                                              |
 
 Keeping the workbench's literal shapes means the day this server shares a Redis
 with the real workbench it is a configuration change, not a migration. Set
@@ -405,10 +454,10 @@ step's `generate` reads declared field names straight off it
 (`sessionData.user_inputs?.city_code`). Upstream publishes two declaration shapes
 that mean opposite things:
 
-| Shape | Where the field names are |
-| --- | --- |
-| `{name, schema:{properties}}` (TRV11) | in `schema.properties` — `name` is a wrapper |
-| `{name, label, type}` (FIS12) | `name` **is** the field |
+| Shape                                 | Where the field names are                   |
+| ------------------------------------- | ------------------------------------------- |
+| `{name, schema:{properties}}` (TRV11) | in`schema.properties` — `name` is a wrapper |
+| `{name, label, type}` (FIS12)         | `name` **is** the field                     |
 
 Handing the raw declaration to a model cost a run: it read
 `{name: "ExampleInputId", schema:{properties:{city_code}}}` as an instruction to
@@ -440,12 +489,12 @@ Every step of a published flow carries three base64 JavaScript functions authore
 against the workbench's contract. `src/lib/mock-engine/` runs them in
 `@ondc/automation-mock-runner`'s worker sandbox.
 
-| Function | Where it runs |
-| --- | --- |
-| `generate(defaultPayload, sessionData)` | `flow_proceed` — produces the outbound payload before signing and sending |
-| `validate(target, sessionData)` | the receiver, inside the ACK window — its verdict _is_ the ACK/NACK |
-| `meetsRequirements(sessionData)` | `flow_proceed`, before generating — an unmet precondition returns `BLOCKED` to the model rather than an error payload to the counterparty |
-| `saveData` JSONPath / `EVAL#` | `record.saveBusinessData`, after every accepted exchange in both directions |
+| Function                                | Where it runs                                                                                                                             |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `generate(defaultPayload, sessionData)` | `flow_proceed` — produces the outbound payload before signing and sending                                                                 |
+| `validate(target, sessionData)`         | the receiver, inside the ACK window — its verdict_is_ the ACK/NACK                                                                        |
+| `meetsRequirements(sessionData)`        | `flow_proceed`, before generating — an unmet precondition returns `BLOCKED` to the model rather than an error payload to the counterparty |
+| `saveData` JSONPath / `EVAL#`           | `record.saveBusinessData`, after every accepted exchange in both directions                                                               |
 
 Three things this adapter exists to get right:
 
@@ -516,16 +565,16 @@ silently reintroduced the same bug from our own side.
 `engine/pending-step.ts` is the most load-bearing function in the engine. Read
 `subscriberType === step.owner` as **"the participant under test owns this"**.
 
-| Step at the cursor | Status | Meaning |
-| --- | --- | --- |
-| not at the cursor | `WAITING` | not reached yet |
-| form, NP owns it | `INPUT-REQUIRED` | they host it; we submit |
-| form, we own it | `WAITING-SUBMISSION` | we host it; they submit |
-| NP owns it | `LISTENING` | arm an expectation, wait |
-| ours, declares inputs | `INPUT-REQUIRED` | blocked on a value |
-| ours, `manual` | `INPUT-REQUIRED` | blocked on an explicit trigger (`{id: "<step_key>"}`) |
-| ours, `unsolicited` | `INPUT-REQUIRED` | fire-and-forget, auto-triggered |
-| ours, plain | `RESPONDING` | send it now |
+| Step at the cursor    | Status               | Meaning                                               |
+| --------------------- | -------------------- | ----------------------------------------------------- |
+| not at the cursor     | `WAITING`            | not reached yet                                       |
+| form, NP owns it      | `INPUT-REQUIRED`     | they host it; we submit                               |
+| form, we own it       | `WAITING-SUBMISSION` | we host it; they submit                               |
+| NP owns it            | `LISTENING`          | arm an expectation, wait                              |
+| ours, declares inputs | `INPUT-REQUIRED`     | blocked on a value                                    |
+| ours,`manual`         | `INPUT-REQUIRED`     | blocked on an explicit trigger (`{id: "<step_key>"}`) |
+| ours,`unsolicited`    | `INPUT-REQUIRED`     | fire-and-forget, auto-triggered                       |
+| ours, plain           | `RESPONDING`         | send it now                                           |
 
 Actionable = `{LISTENING, RESPONDING, INPUT-REQUIRED, WAITING-SUBMISSION}`.
 `LISTENING` only arms an expectation. A `WORKING` flow-status marker turns the
@@ -543,16 +592,16 @@ mid-transaction (an extra instalment, a repeat).
 A tagged union, not a bag of optionals. Every turn of the loop ends in exactly
 one, and the tag says which tool to reach for next.
 
-| `outcome` | What happened | What to do next |
-| --- | --- | --- |
-| `SENT` | payload generated and POSTed | `flow_await` for the reply |
-| `DRAFTED` | dry run — generated, not sent | inspect, then re-run without `dry_run` |
-| `READY` | a step is ours and needs nothing | `flow_proceed` |
-| `INPUT_REQUIRED` | the step needs values | call again with `inputs` |
-| `FORM_PENDING` | a form stands between here and there | `form_fetch` / `form_submit`, or wait |
-| `WAITING` | the participant's move | `flow_await` |
-| `COMPLETE` | the flow is finished | `report_generate` _(not built)_ |
-| `BLOCKED` | preconditions unmet, or an error | read `details`, fix, retry |
+| `outcome`        | What happened                        | What to do next                       |
+| ---------------- | ------------------------------------ | ------------------------------------- |
+| `SENT`           | payload generated and POSTed         | `flow_await` for the reply            |
+| `DRAFTED`        | dry run — generated, not sent        | inspect, then re-run without`dry_run` |
+| `READY`          | a step is ours and needs nothing     | `flow_proceed`                        |
+| `INPUT_REQUIRED` | the step needs values                | call again with`inputs`               |
+| `FORM_PENDING`   | a form stands between here and there | `form_fetch` / `form_submit`, or wait |
+| `WAITING`        | the participant's move               | `flow_await`                          |
+| `COMPLETE`       | the flow is finished                 | `report_generate` _(not built)_       |
+| `BLOCKED`        | preconditions unmet, or an error     | read`details`, fix, retry             |
 
 `READY` only ever comes back from the _describing_ calls (`flow_get_status`,
 `flow_await`). `flow_proceed` would have dispatched it, so it never answers
@@ -604,16 +653,16 @@ sequenceDiagram
 Each step in `#dispatch` is placed where it is for a reason that has already been
 paid for once.
 
-| Order | Why not later / earlier |
-| --- | --- |
-| **inputs before requirements** | requirements' own view of the world _is_ `sessionData`, so it would be answering about the wrong one. A wrong-shaped `inputs` reaches `generate` as an absent value and a generator that assigns it deletes a field the default payload had right. This is the last point at which the real cause is visible. |
-| **requirements before generate** | an unmet precondition is ours to fix. The workbench sends an error payload at the counterparty; we return `BLOCKED` to the model, because telling the participant teaches it nothing. |
-| **overrides after generate, before the gate** | they patch the bytes the config actually produced, and the gate judges the **patched** payload — an override is not a validation bypass. |
-| **transaction id settled before the gate** | validating earlier would judge a payload that is not the one we send. |
-| **`dry_run` returns after the gate, ungated** | a draft exists to be inspected, and one that fails validation is the most useful kind to look at. It persists a payload but binds nothing. |
-| **gate before bind/record/send** | a blocked step costs the run nothing but the attempt; an unbound run stays unbound. |
-| **`appendApiEntry` BEFORE the socket write** | see below. |
-| **`saveBusinessData` before the send** | the receiver feeds business data to the inbound validator, so anything this step saves must be there before their next call can be judged against it. |
+| Order                                         | Why not later / earlier                                                                                                                                                                                                                                                                                      |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **inputs before requirements**                | requirements' own view of the world_is_ `sessionData`, so it would be answering about the wrong one. A wrong-shaped `inputs` reaches `generate` as an absent value and a generator that assigns it deletes a field the default payload had right. This is the last point at which the real cause is visible. |
+| **requirements before generate**              | an unmet precondition is ours to fix. The workbench sends an error payload at the counterparty; we return`BLOCKED` to the model, because telling the participant teaches it nothing.                                                                                                                         |
+| **overrides after generate, before the gate** | they patch the bytes the config actually produced, and the gate judges the**patched** payload — an override is not a validation bypass.                                                                                                                                                                      |
+| **transaction id settled before the gate**    | validating earlier would judge a payload that is not the one we send.                                                                                                                                                                                                                                        |
+| **`dry_run` returns after the gate, ungated** | a draft exists to be inspected, and one that fails validation is the most useful kind to look at. It persists a payload but binds nothing.                                                                                                                                                                   |
+| **gate before bind/record/send**              | a blocked step costs the run nothing but the attempt; an unbound run stays unbound.                                                                                                                                                                                                                          |
+| **`appendApiEntry` BEFORE the socket write**  | see below.                                                                                                                                                                                                                                                                                                   |
+| **`saveBusinessData` before the send**        | the receiver feeds business data to the inbound validator, so anything this step saves must be there before their next call can be judged against it.                                                                                                                                                        |
 
 ### Recording an outbound call before it is sent
 
@@ -641,10 +690,10 @@ matches against it early. **Over-recording is the harmless direction.**
 `SenderService` classifies every transport failure onto
 `UpstreamError.details.delivery`:
 
-| `delivery` | Meaning | Entry |
-| --- | --- | --- |
-| `unreachable` | connection never came up (refused, DNS, TLS) | withdrawn — the step is still owed |
-| `uncertain` | request written, answer lost (timeouts, reset) — **the default** | kept, `sendState: "failed"` |
+| `delivery`    | Meaning                                                         | Entry                              |
+| ------------- | --------------------------------------------------------------- | ---------------------------------- |
+| `unreachable` | connection never came up (refused, DNS, TLS)                    | withdrawn — the step is still owed |
+| `uncertain`   | request written, answer lost (timeouts, reset) —**the default** | kept,`sendState: "failed"`         |
 
 The allow-list direction is deliberate: everything in the `unreachable` list
 describes a connection that was never established. Anything unrecognised falls
@@ -702,20 +751,20 @@ A rejected-but-well-formed call is a **successful HTTP exchange that carried a
 protocol-level refusal**. Collapsing the two makes a NACK indistinguishable from
 a proxy failure.
 
-| Situation | Status | Body |
-| --- | --- | --- |
-| Accepted | 200 | `{message:{ack:{status:"ACK"}}}` |
-| Step validator rejected it | **200** | NACK + `error{code,message}` |
-| Validator crashed / broke its contract | **200** | NACK `VALIDATION_FUNCTION_ERROR` |
-| Not a step the flow is waiting for | **200** | NACK `OUT_OF_SEQUENCE` — recorded anyway, as evidence |
-| `context.action` ≠ the URL's action segment | **200** | NACK `ACTION_MISMATCH` — resolved and recorded first; the call did arrive |
-| `transaction_id` ≠ the one this flow was bound to | **200** | NACK `TRANSACTION_MISMATCH` — expectation put back, body stored out of line, surfaced as `attention` |
-| The attempt it names was abandoned | **200** | NACK `TRANSACTION_ABANDONED` — stored out of line, never chained |
-| Signature invalid / expired | 401 | _(seam only; `verifyAuth` is a no-op today)_ |
-| Malformed context | **400** | NACK envelope — _deliberate divergence: the workbench panics with 500 on a missing `message_id`_ |
-| Transaction belongs to another domain/version/role | 412 | NACK `WRONG_ENDPOINT`, naming the endpoint it does belong to |
-| Expectation named an expired session | 412 | NACK `SESSION_EXPIRED` |
-| Unknown transaction, no expectation | 412 | NACK `NO_EXPECTATION` |
+| Situation                                          | Status  | Body                                                                                                |
+| -------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------- |
+| Accepted                                           | 200     | `{message:{ack:{status:"ACK"}}}`                                                                    |
+| Step validator rejected it                         | **200** | NACK +`error{code,message}`                                                                         |
+| Validator crashed / broke its contract             | **200** | NACK`VALIDATION_FUNCTION_ERROR`                                                                     |
+| Not a step the flow is waiting for                 | **200** | NACK`OUT_OF_SEQUENCE` — recorded anyway, as evidence                                                |
+| `context.action` ≠ the URL's action segment        | **200** | NACK`ACTION_MISMATCH` — resolved and recorded first; the call did arrive                            |
+| `transaction_id` ≠ the one this flow was bound to  | **200** | NACK`TRANSACTION_MISMATCH` — expectation put back, body stored out of line, surfaced as `attention` |
+| The attempt it names was abandoned                 | **200** | NACK`TRANSACTION_ABANDONED` — stored out of line, never chained                                     |
+| Signature invalid / expired                        | 401     | _(seam only; `verifyAuth` is a no-op today)_                                                        |
+| Malformed context                                  | **400** | NACK envelope —_deliberate divergence: the workbench panics with 500 on a missing `message_id`_     |
+| Transaction belongs to another domain/version/role | 412     | NACK`WRONG_ENDPOINT`, naming the endpoint it does belong to                                         |
+| Expectation named an expired session               | 412     | NACK`SESSION_EXPIRED`                                                                               |
+| Unknown transaction, no expectation                | 412     | NACK`NO_EXPECTATION`                                                                                |
 
 `handle()` never throws: an unhandled error would answer 500 with no record of
 what arrived, so everything becomes a status plus a body.
@@ -794,10 +843,10 @@ invisible.** Everything has to be shaped like a pull.
 
 So there are two mechanisms, and both are pull-shaped:
 
-| | What it is | When it helps |
-| --- | --- | --- |
-| **The journal** | a diary the server keeps, stapled to the receipt of every tool call | the model is calling tools anyway |
-| **`flow_await`** | a tool call that blocks until something happens | the model has nothing to do but wait |
+|                  | What it is                                                          | When it helps                        |
+| ---------------- | ------------------------------------------------------------------- | ------------------------------------ |
+| **The journal**  | a diary the server keeps, stapled to the receipt of every tool call | the model is calling tools anyway    |
+| **`flow_await`** | a tool call that blocks until something happens                     | the model has nothing to do but wait |
 
 ### The journal, in plain terms
 
@@ -836,10 +885,10 @@ timeout is an ordinary outcome, not an error.
 
 This is the part that confuses everyone, so it is worth slowing down on.
 
-| Counter | Counts | Lives on |
-| --- | --- | --- |
-| **run seq** | exchanges on **this one transaction** | the transaction record |
-| **journal seq** | lines in **the whole session's diary** — every flow, plus things no flow owns | `journal_seq::{sessionId}` |
+| Counter         | Counts                                                                       | Lives on                   |
+| --------------- | ---------------------------------------------------------------------------- | -------------------------- |
+| **run seq**     | exchanges on**this one transaction**                                         | the transaction record     |
+| **journal seq** | lines in**the whole session's diary** — every flow, plus things no flow owns | `journal_seq::{sessionId}` |
 
 Chapter page numbers versus book line numbers. Both are called "seq". They are
 **not comparable**, and the journal's always runs far ahead.
@@ -861,8 +910,8 @@ reality              → this run has seen 3 exchanges. Its counter goes 4, 5, 6
 
 The callback **arrived**. It was **on the record**. But the waiter was parked on a
 number the run could never reach, so it went deaf to every future event and sat
-out the full timeout — and the model then reported that *the participant never
-called*. A participant that did exactly the right thing was blamed for silence.
+out the full timeout — and the model then reported that _the participant never
+called_. A participant that did exactly the right thing was blamed for silence.
 
 Two fixes, and note that both are affordances rather than warnings:
 
@@ -873,7 +922,7 @@ Two fixes, and note that both are affordances rather than warnings:
    the wrong one. Two counters and one field name is a trap.
 2. **An `after_seq` that cannot be this run's is discarded, not clamped**, and the
    answer says so via `after_seq_adjusted`. Clamping would still skip the awaited
-   callback, because that callback *is* the newest thing. Better to ignore the bad
+   callback, because that callback _is_ the newest thing. Better to ignore the bad
    cursor and name the number to use next time.
 
 The rule this generalises to: **whenever a result carries a number from one
@@ -959,12 +1008,12 @@ cause produced the same symptom, and it is the worst one this server has: **a
 participant that did exactly the right thing became indistinguishable from one
 that never called**, which is a compliance report blaming the wrong side.
 
-| Fact | Consequence |
-| --- | --- |
-| **`after_seq` above `record.seq` is discarded, not clamped** (`after_seq_adjusted`), and **every loop answer carries the run's own `seq`** — the pair explained above | entry seq is `record.seq + 1`, so no cursor a run issues can exceed it — a larger one is the journal's counter, always further along. `notify` wakes on `event.seq > afterSeq`, so taking it at face value went deaf to every future event. Clamping would still skip the awaited callback, because that callback *is* the high-water mark. |
-| **A run-scoped wait does not park when `next` is not `WAITING`** unless an explicit `timeout_ms` says to | both observed stalls were on `COMPLETE` and `INPUT_REQUIRED` — runs owing the *caller* the next move, where parking can only run out the clock. The escape hatch is real: an unsolicited extra step may still arrive after the sequence is done. |
-| **The park races `journal::{sessionId}`** for `POSSIBLY_RELATED` and `ATTENTION` only | a refused call is filed against no transaction, so it publishes no run event. Every other journal kind *is* followed by one, and waking on those would answer "nothing arrived" a beat before something did. |
-| **`timeout_ms` defaults to 60s**; `AWAIT_MAX_WAIT_MS` (300s) is only the cap | the pair is built to long-poll and every outcome says "call again", so a long default is paid for entirely by mistakes. It also keeps the window clear of `EXPECTATION_TTL_MS`, itself 300s. |
+| Fact                                                                                                                                                                  | Consequence                                                                                                                                                                                                                                                                                                                                |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`after_seq` above `record.seq` is discarded, not clamped** (`after_seq_adjusted`), and **every loop answer carries the run's own `seq`** — the pair explained above | entry seq is`record.seq + 1`, so no cursor a run issues can exceed it — a larger one is the journal's counter, always further along. `notify` wakes on `event.seq > afterSeq`, so taking it at face value went deaf to every future event. Clamping would still skip the awaited callback, because that callback _is_ the high-water mark. |
+| **A run-scoped wait does not park when `next` is not `WAITING`** unless an explicit `timeout_ms` says to                                                              | both observed stalls were on`COMPLETE` and `INPUT_REQUIRED` — runs owing the _caller_ the next move, where parking can only run out the clock. The escape hatch is real: an unsolicited extra step may still arrive after the sequence is done.                                                                                            |
+| **The park races `journal::{sessionId}`** for `POSSIBLY_RELATED` and `ATTENTION` only                                                                                 | a refused call is filed against no transaction, so it publishes no run event. Every other journal kind*is* followed by one, and waking on those would answer "nothing arrived" a beat before something did.                                                                                                                                |
+| **`timeout_ms` defaults to 60s**; `AWAIT_MAX_WAIT_MS` (300s) is only the cap                                                                                          | the pair is built to long-poll and every outcome says "call again", so a long default is paid for entirely by mistakes. It also keeps the window clear of`EXPECTATION_TTL_MS`, itself 300s.                                                                                                                                                |
 
 `flow_await` emits MCP progress notifications while parked, because the real
 ceiling on a blocking tool call is the **client's** timeout, and clients that
@@ -1008,12 +1057,12 @@ the model for work it did not ask for.
 A form step is the one place a beckn flow leaves the protocol and goes through a
 web page. Which side hosts the page decides everything.
 
-| | We host it | They host it |
-| --- | --- | --- |
-| URL | built by the config's own `createFormURL` — `{mockBaseUrl}/forms/{domain}/{formId}/?transaction_id=…&session_id=…` — and already baked into a payload we sent | carried in their payload |
-| What we do | render the config's `formHtml` through **ejs** (what those templates are authored against), accept the POST, mint a `submission_id`, advance | fetch it, screen it (`validateFormHtml`), parse its fields, fill them, POST back |
-| Tool | none needed — the participant opens the URL we already sent | `form_fetch` / `form_submit` |
-| Step status | `WAITING-SUBMISSION` | `INPUT-REQUIRED` |
+|             | We host it                                                                                                                                                   | They host it                                                                     |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| URL         | built by the config's own`createFormURL` — `{mockBaseUrl}/forms/{domain}/{formId}/?transaction_id=…&session_id=…` — and already baked into a payload we sent | carried in their payload                                                         |
+| What we do  | render the config's`formHtml` through **ejs** (what those templates are authored against), accept the POST, mint a `submission_id`, advance                  | fetch it, screen it (`validateFormHtml`), parse its fields, fill them, POST back |
+| Tool        | none needed — the participant opens the URL we already sent                                                                                                  | `form_fetch` / `form_submit`                                                     |
+| Step status | `WAITING-SUBMISSION`                                                                                                                                         | `INPUT-REQUIRED`                                                                 |
 
 Either way the step completes the same way any other does: a `submission_id`
 lands in business data under the step's key, and `flow_proceed` moves on. That is
@@ -1052,12 +1101,12 @@ is **10.7 MB** for one build, and consuming it means re-implementing the
 
 Four things about the oracle are load-bearing:
 
-| Fact | Consequence |
-| --- | --- |
-| Two grammars — L0 plain text (`at '/p': got x, want y`), L1 markdown (`#### **CODE**`) — and **L0 short-circuits L1** | the layer is _inferred_, not guessed. `validate.parse.ts` is the only thing that produces a code or a JSONPath, so it is the file with the tests |
-| `error.code` is always the literal `"Bad Request"`; `error.paths` is always empty | nothing structured to fall back on. The parser never throws and never answers a rejection with zero findings — an empty list reads exactly like `valid` |
-| No `context.transaction_id` ⇒ **HTTP 500** | guarded locally |
-| A `protocol_validation=false` cookie makes ONIX **skip L1 and answer ACK** | we send no cookies. `validate.live.test.ts` asserts a known-bad payload still fails — that is what would catch this |
+| Fact                                                                                                                  | Consequence                                                                                                                                            |
+| --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Two grammars — L0 plain text (`at '/p': got x, want y`), L1 markdown (`#### **CODE**`) — and **L0 short-circuits L1** | the layer is_inferred_, not guessed. `validate.parse.ts` is the only thing that produces a code or a JSONPath, so it is the file with the tests        |
+| `error.code` is always the literal `"Bad Request"`; `error.paths` is always empty                                     | nothing structured to fall back on. The parser never throws and never answers a rejection with zero findings — an empty list reads exactly like`valid` |
+| No`context.transaction_id` ⇒ **HTTP 500**                                                                             | guarded locally                                                                                                                                        |
+| A`protocol_validation=false` cookie makes ONIX **skip L1 and answer ACK**                                             | we send no cookies.`validate.live.test.ts` asserts a known-bad payload still fails — that is what would catch this                                     |
 
 ### The composition point is `ValidationCheck`
 
@@ -1130,12 +1179,12 @@ because of a typo nothing in this repo can fix.
 `payload_overrides` is a map of JSONPath → value, applied after `generate` and
 before the gate.
 
-| Fact | Consequence |
-| --- | --- |
-| **Not a validation bypass.** The gate runs on the _patched_ payload, so an override that does not fix the finding still blocks | sending a payload we already know violates L0 would write our defect into the participant's compliance report and teach neither side anything |
-| **Concrete paths only, all-or-nothing, `$.context.transaction_id` refused** | a wildcard selects a set and `jsonpath.value` writes to one member silently; the transaction id keys every record and expectation |
-| **Scoped to one call.** `chainNext` builds its own args and cannot inherit them; a non-dispatch branch refuses them by name | auto-advance sends with nobody watching, and a chained step carrying a patch nobody re-stated is bytes on a third party's wire that neither the config nor the model chose |
-| **A patched step is recorded as patched** — `ApiEntry.overrides`, the journal line, and the outcome | the compliance report has to be able to say the participant was tested against a payload this flow's config did not produce. The corpus splits `RECOVERED_WITH_OVERRIDE` from `RECOVERED` for the same reason |
+| Fact                                                                                                                           | Consequence                                                                                                                                                                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Not a validation bypass.** The gate runs on the _patched_ payload, so an override that does not fix the finding still blocks | sending a payload we already know violates L0 would write our defect into the participant's compliance report and teach neither side anything                                                                |
+| **Concrete paths only, all-or-nothing, `$.context.transaction_id` refused**                                                    | a wildcard selects a set and`jsonpath.value` writes to one member silently; the transaction id keys every record and expectation                                                                             |
+| **Scoped to one call.** `chainNext` builds its own args and cannot inherit them; a non-dispatch branch refuses them by name    | auto-advance sends with nobody watching, and a chained step carrying a patch nobody re-stated is bytes on a third party's wire that neither the config nor the model chose                                   |
+| **A patched step is recorded as patched** — `ApiEntry.overrides`, the journal line, and the outcome                            | the compliance report has to be able to say the participant was tested against a payload this flow's config did not produce. The corpus splits`RECOVERED_WITH_OVERRIDE` from `RECOVERED` for the same reason |
 
 When the gate blocks, `suggestOverrides(findings)` names the way out beside the
 reason it is needed — before that, a model that correctly diagnosed a defect in a
@@ -1164,12 +1213,12 @@ model remembered".
 
 Four things are load-bearing and easy to undo:
 
-| Fact | Consequence |
-| --- | --- |
-| **Code redacts, the model narrates.** Payload leaves become type tokens; only an explicit allowlist survives | asking a model to strip PII from a payload it is holding is unverifiable and fails open. `feedback.redact.ts` is this module's `validate.parse.ts` |
-| **`RECOVERED` is derived, never claimed** — an incident closes when a _later, successful_ exchange for the same action is journaled | "did the model fix it?" is the most valuable column in the corpus and the one the model is least able to answer about itself. `Narration.outcome` records the belief beside it; disagreement is itself a finding |
-| **`RECOVERED_WITH_OVERRIDE` is a different row**, set when the journaled send carries `overrides` | "worked around a defect in a **published** config" and "was wrong and then was not" are opposite findings, and only the first is actionable outside this repo |
-| **Detection must not double-count.** The journal side declines `OUTBOUND_SENT`-with-NACK and `CHAIN_PAUSED`; a findings-bearing `BLOCKED` is normalised onto `VALIDATION_FINDINGS` | `chainNext` re-enters `proceed`, so a chained step is observed once. `occurrences` is the number that says how hard something was fought |
+| Fact                                                                                                                                                                               | Consequence                                                                                                                                                                                                     |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Code redacts, the model narrates.** Payload leaves become type tokens; only an explicit allowlist survives                                                                       | asking a model to strip PII from a payload it is holding is unverifiable and fails open.`feedback.redact.ts` is this module's `validate.parse.ts`                                                               |
+| **`RECOVERED` is derived, never claimed** — an incident closes when a _later, successful_ exchange for the same action is journaled                                                | "did the model fix it?" is the most valuable column in the corpus and the one the model is least able to answer about itself.`Narration.outcome` records the belief beside it; disagreement is itself a finding |
+| **`RECOVERED_WITH_OVERRIDE` is a different row**, set when the journaled send carries `overrides`                                                                                  | "worked around a defect in a**published** config" and "was wrong and then was not" are opposite findings, and only the first is actionable outside this repo                                                    |
+| **Detection must not double-count.** The journal side declines `OUTBOUND_SENT`-with-NACK and `CHAIN_PAUSED`; a findings-bearing `BLOCKED` is normalised onto `VALIDATION_FINDINGS` | `chainNext` re-enters `proceed`, so a chained step is observed once. `occurrences` is the number that says how hard something was fought                                                                        |
 
 **Redaction is default-deny, not a deny-list.** A deny-list is only as good as the
 imagination of whoever wrote it, and ONDC payloads are somebody else's schema.
@@ -1264,11 +1313,11 @@ then the rule stands: **do not add a fourth** — reach for the primitives.
 
 All built from one helper, `withKeyLock` in `record.service.ts`.
 
-| Lock | Race it closes |
-| --- | --- |
-| `RecordService#expectationLocks` | `arm` runs on the MCP tool path and `consume` on the receiver path, so a callback landing mid-arm can resurrect an entry that was just consumed |
-| `RecordService#recordLocks` | every write to one `TransactionRecord`. `saveTransaction` is a load-modify-save over the whole record, and the receiver appending an inbound call genuinely races `flow_proceed` appending or settling an outbound one — made likelier by the two-phase outbound append |
-| `FlowService#runLocks` | serialises `flow_proceed` per run when named by `flow_id`, because an unbound run has nothing durable to contend on. For a flow's *first* action, losing that race means a second minted id, a second transaction, and a duplicate call on a third party's wire |
+| Lock                             | Race it closes                                                                                                                                                                                                                                                         |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RecordService#expectationLocks` | `arm` runs on the MCP tool path and `consume` on the receiver path, so a callback landing mid-arm can resurrect an entry that was just consumed                                                                                                                        |
+| `RecordService#recordLocks`      | every write to one`TransactionRecord`. `saveTransaction` is a load-modify-save over the whole record, and the receiver appending an inbound call genuinely races `flow_proceed` appending or settling an outbound one — made likelier by the two-phase outbound append |
+| `FlowService#runLocks`           | serialises`flow_proceed` per run when named by `flow_id`, because an unbound run has nothing durable to contend on. For a flow's _first_ action, losing that race means a second minted id, a second transaction, and a duplicate call on a third party's wire         |
 
 The per-step `WORKING`/`AVAILABLE` marker is the other guard, and an **expired**
 marker deliberately reads as `AVAILABLE`: a dispatch that crashed without writing
@@ -1281,13 +1330,13 @@ record onto its own atomic `listAppend` key.
 
 ### Fail-open, and where it is said out loud
 
-| Dependency down | Behaviour | Said where |
-| --- | --- | --- |
-| Validation oracle | verdict `unavailable`, payload proceeds | outcome (`validation.status`), journal line for chained/inbound |
-| Config-service | sessions cannot be created; `/ready` 503 | tool error, health |
-| State store | `UpstreamError`, never a silent `undefined` | tool error |
-| Feedback sink | logged and dropped | logs only — telemetry may never fail a protocol call |
-| Journal append | logged and dropped | logs only — nothing is derived from the journal |
+| Dependency down   | Behaviour                                   | Said where                                                      |
+| ----------------- | ------------------------------------------- | --------------------------------------------------------------- |
+| Validation oracle | verdict`unavailable`, payload proceeds      | outcome (`validation.status`), journal line for chained/inbound |
+| Config-service    | sessions cannot be created;`/ready` 503     | tool error, health                                              |
+| State store       | `UpstreamError`, never a silent `undefined` | tool error                                                      |
+| Feedback sink     | logged and dropped                          | logs only — telemetry may never fail a protocol call            |
+| Journal append    | logged and dropped                          | logs only — nothing is derived from the journal                 |
 
 ### Persistence
 
@@ -1312,29 +1361,29 @@ are set **honestly**, because clients auto-approve on them — `flow_proceed` an
 `form_submit` are neither read-only nor idempotent: re-running either puts a
 second call on a third party's wire.
 
-| Tool | Read-only | What it does |
-| --- | --- | --- |
-| `receiver_start` | no (idempotent) | ensure the inbound endpoint is live; returns the callback URL and whether the participant can plausibly reach it |
-| `receiver_stop` | no (**destructive** — a flow mid-transaction loses its callbacks) | close the standalone listener (stdio only; explains itself under HTTP) |
-| `catalog_list_builds` | yes | every published domain / version / use-case |
-| `catalog_list_flows` | yes | flow summaries with per-actor step counts |
-| `catalog_describe_flow` | yes | the full sequence; every step tagged `actor: mock \| np \| unknown` |
-| `catalog_load_flow_config` | no (idempotent) | fetch + cache a flow's mock config; returns a summary and a `cache_key`, **never** the config |
-| `session_create` | no | participant URL + `np_type` + build → `session_id`, derived `mock_role`, `callback_url`, available flows |
-| `session_get` | yes | the session: participant, mock role, build, callback URL, expiry |
-| `flow_start` | no | validates the flow, writes the binding, arms the first expectation, returns the first `StepOutcome`. `transaction_id` comes back **null** |
-| `flow_proceed` | **no** | the loop driver — requirements → generate → patch → bind → record → save → send → settle |
-| `flow_await` | yes-ish (not idempotent) | bounded blocking wait; run scope or session scope |
-| `flow_get_status` | yes | the derived flow map: every step's status and owner, off-sequence exchanges, what the loop needs next |
-| `flow_restart` | no | abandon this attempt, open a fresh one, keep the evidence |
-| `form_fetch` | yes | read a participant-hosted form (usually from the receiver's pre-fetch) |
-| `form_submit` | **no** | fill and POST it, then advance the step |
-| `payload_validate` | yes | judge a payload against the session's build without sending it |
-| `record_get_payload` | yes | a stored payload by handle, with optional JSONPath slice and a byte cap |
-| `record_get_data` | yes | accumulated business data; oversized values are named, not returned |
-| `record_get_events` | yes | re-read the session journal **without** consuming it |
-| `feedback_submit_report` | **no** | the model's account of one incident — `diagnosis`, `attempted`, `outcome`, `suspected_cause`, `tooling_gap` |
-| `feedback_list_reports` | yes | every incident in the session; `include_body` renders exactly what would be uploaded |
+| Tool                       | Read-only                                                         | What it does                                                                                                                             |
+| -------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `receiver_start`           | no (idempotent)                                                   | ensure the inbound endpoint is live; returns the callback URL and whether the participant can plausibly reach it                         |
+| `receiver_stop`            | no (**destructive** — a flow mid-transaction loses its callbacks) | close the standalone listener (stdio only; explains itself under HTTP)                                                                   |
+| `catalog_list_builds`      | yes                                                               | every published domain / version / use-case                                                                                              |
+| `catalog_list_flows`       | yes                                                               | flow summaries with per-actor step counts                                                                                                |
+| `catalog_describe_flow`    | yes                                                               | the full sequence; every step tagged`actor: mock \| np \| unknown`                                                                       |
+| `catalog_load_flow_config` | no (idempotent)                                                   | fetch + cache a flow's mock config; returns a summary and a`cache_key`, **never** the config                                             |
+| `session_create`           | no                                                                | participant URL +`np_type` + build → `session_id`, derived `mock_role`, `callback_url`, available flows                                  |
+| `session_get`              | yes                                                               | the session: participant, mock role, build, callback URL, expiry                                                                         |
+| `flow_start`               | no                                                                | validates the flow, writes the binding, arms the first expectation, returns the first`StepOutcome`. `transaction_id` comes back **null** |
+| `flow_proceed`             | **no**                                                            | the loop driver — requirements → generate → patch → bind → record → save → send → settle                                                 |
+| `flow_await`               | yes-ish (not idempotent)                                          | bounded blocking wait; run scope or session scope                                                                                        |
+| `flow_get_status`          | yes                                                               | the derived flow map: every step's status and owner, off-sequence exchanges, what the loop needs next                                    |
+| `flow_restart`             | no                                                                | abandon this attempt, open a fresh one, keep the evidence                                                                                |
+| `form_fetch`               | yes                                                               | read a participant-hosted form (usually from the receiver's pre-fetch)                                                                   |
+| `form_submit`              | **no**                                                            | fill and POST it, then advance the step                                                                                                  |
+| `payload_validate`         | yes                                                               | judge a payload against the session's build without sending it                                                                           |
+| `record_get_payload`       | yes                                                               | a stored payload by handle, with optional JSONPath slice and a byte cap                                                                  |
+| `record_get_data`          | yes                                                               | accumulated business data; oversized values are named, not returned                                                                      |
+| `record_get_events`        | yes                                                               | re-read the session journal**without** consuming it                                                                                      |
+| `feedback_submit_report`   | **no**                                                            | the model's account of one incident —`diagnosis`, `attempted`, `outcome`, `suspected_cause`, `tooling_gap`                               |
+| `feedback_list_reports`    | yes                                                               | every incident in the session;`include_body` renders exactly what would be uploaded                                                      |
 
 ### Resources — read-only grounding, no side effects
 
@@ -1349,14 +1398,29 @@ model alternate `flow_proceed` / `flow_await` correctly instead of polling.
 
 ### HTTP routes
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST/GET/DELETE` | `/mcp` | MCP Streamable HTTP |
-| `POST` | `{prefix}/{domain}/{version}/{buyer\|seller}/{action}` | the receiver |
-| `GET` | `{prefix}/{domain}/{version}/{buyer\|seller}` | endpoint probe — curling the URI we handed over should say something |
-| `GET` | `{prefix}/forms/{domain}/{formId}` | render a hosted form |
-| `POST` | `{prefix}/forms/{domain}/{formId}/submit` | accept its submission |
-| `GET` | `/health`, `/ready` | liveness, readiness |
+| Method            | Path                                                   | Purpose                                                              |
+| ----------------- | ------------------------------------------------------ | -------------------------------------------------------------------- |
+| `POST/GET/DELETE` | `/mcp`                                                 | MCP Streamable HTTP                                                  |
+| `POST`            | `{prefix}/{domain}/{version}/{buyer\|seller}/{action}` | the receiver                                                         |
+| `GET`             | `{prefix}/{domain}/{version}/{buyer\|seller}`          | endpoint probe — curling the URI we handed over should say something |
+| `GET`             | `{prefix}/forms/{domain}/{formId}`                     | render a hosted form                                                 |
+| `POST`            | `{prefix}/forms/{domain}/{formId}/submit`              | accept its submission                                                |
+| `GET`             | `/ui/api/sessions`                                     | recent sessions, newest first                                        |
+| `GET`             | `/ui/api/sessions/{id}`                                | one session, its published flows and a row per run                   |
+| `GET`             | `/ui/api/sessions/{id}/flows/{flowId}`                 | the engine's own `FlowMap`, unprojected                              |
+| `GET`             | `/ui/api/sessions/{id}/payloads/{payloadId}`           | one payload and the ACK/NACK exchanged for it                        |
+| `GET`             | `/ui/api/sessions/{id}/data`                           | business data on one transaction                                     |
+| `GET`             | `/ui/api/sessions/{id}/events`                         | the journal since a cursor — **never consuming**                     |
+| `GET`             | `/ui/api/sessions/{id}/stream`                         | the journal as it happens (SSE)                                      |
+| `GET`             | `/health`, `/ready`                                    | liveness, readiness                                                  |
+| `GET`             | `/metrics`                                             | Prometheus exposition                                                |
+
+The `/ui/api` and `/metrics` rows are **not** under `{prefix}`. That prefix
+exists so the URLs we advertise to a counterparty resolve; nobody advertises
+these, so they sit at the root beside `/health`. The cost is that `ui` is now
+reserved as a first path segment — the same caveat already recorded for `forms`,
+and for the same reason: a static segment beats the receiver's parametric
+`/:domain`.
 
 ---
 
@@ -1364,22 +1428,25 @@ model alternate `flow_proceed` / `flow_await` correctly instead of polling.
 
 `src/config/env.ts` is the **single** place that reads `process.env`. Parsed once
 at import; invalid config exits non-zero rather than booting into an undefined
-state. Two refinements fail at boot rather than on the first request:
-`AUTH_MODE=jwt` without issuer/audience/JWKS, and `AUTH_MODE=none` under
-`NODE_ENV=production`.
+state. Four refinements fail at boot rather than on the first request:
+`AUTH_MODE=jwt` without issuer/audience/JWKS; `AUTH_MODE=none` under
+`NODE_ENV=production`; and, under production, `METRICS_ENABLED` or `UI_ENABLED`
+without a token. The last three are the same refusal — this process is built to
+be internet-reachable, and each of those endpoints hands something out.
 
-| Group | Variables |
-| --- | --- |
-| Runtime | `NODE_ENV`, `LOG_LEVEL`, `PORT`, `HOST`, `REQUEST_TIMEOUT_MS` |
-| MCP | `MCP_PUBLIC_URL`, `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, `AUTH_MODE`, `AUTH_ISSUER`, `AUTH_AUDIENCE`, `AUTH_JWKS_URL`, `AUTH_REQUIRED_SCOPES`, `RATE_LIMIT_*` |
-| Catalog | `CONFIG_SERVICE_URL`, `CONFIG_SERVICE_TIMEOUT_MS`, `CATALOG_CACHE_TTL_MS` |
-| Sessions | `SESSION_TTL_MS` (48h) |
-| Wire presence | `RECEIVER_PORT`, `RECEIVER_PUBLIC_URL`, `RECEIVER_ROUTE_PREFIX`, `MOCK_SUBSCRIBER_ID` |
-| Loop timings | `SEND_TIMEOUT_MS`, `AWAIT_MAX_WAIT_MS`, `FLOW_STATUS_TTL_MS`, `RUNNER_CACHE_TTL_MS`, `RUNNER_FETCH_ALLOWLIST`, `FORM_FETCH_TIMEOUT_MS`, `TRANSACTION_TTL_MS`, `EXPECTATION_TTL_MS` |
-| Validation | `VALIDATION_SERVICE_URL`, `VALIDATION_TIMEOUT_MS`, `VALIDATION_MODE`, `VALIDATION_CACHE_TTL_MS` |
-| Feedback | `FEEDBACK_DISABLED`, `FEEDBACK_ENDPOINT_URL`, `FEEDBACK_API_KEY`, `FEEDBACK_SPOOL_DIR`, `FEEDBACK_TIMEOUT_MS`, `FEEDBACK_SPOOL_MAX_FILES`, `FEEDBACK_SALT` |
-| State | `REDIS_URL`, `REDIS_KEY_PREFIX`, `REDIS_COMMAND_TIMEOUT_MS` |
-| Arriving with signing | `ONDC_SUBSCRIBER_ID`, `ONDC_UNIQUE_KEY_ID`, `ONDC_SIGNING_PRIVATE_KEY`, `ONDC_SIGNING_PUBLIC_KEY`, `ONDC_COUNTERPARTY_KEYS` |
+| Group                 | Variables                                                                                                                                                                          |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime               | `NODE_ENV`, `LOG_LEVEL`, `PORT`, `HOST`, `REQUEST_TIMEOUT_MS`                                                                                                                      |
+| MCP                   | `MCP_PUBLIC_URL`, `MCP_ALLOWED_HOSTS`, `MCP_ALLOWED_ORIGINS`, `AUTH_MODE`, `AUTH_ISSUER`, `AUTH_AUDIENCE`, `AUTH_JWKS_URL`, `AUTH_REQUIRED_SCOPES`, `RATE_LIMIT_*`                 |
+| Catalog               | `CONFIG_SERVICE_URL`, `CONFIG_SERVICE_TIMEOUT_MS`, `CATALOG_CACHE_TTL_MS`                                                                                                          |
+| Sessions              | `SESSION_TTL_MS` (48h)                                                                                                                                                             |
+| Wire presence         | `RECEIVER_PORT`, `RECEIVER_PUBLIC_URL`, `RECEIVER_ROUTE_PREFIX`, `MOCK_SUBSCRIBER_ID`                                                                                              |
+| Loop timings          | `SEND_TIMEOUT_MS`, `AWAIT_MAX_WAIT_MS`, `FLOW_STATUS_TTL_MS`, `RUNNER_CACHE_TTL_MS`, `RUNNER_FETCH_ALLOWLIST`, `FORM_FETCH_TIMEOUT_MS`, `TRANSACTION_TTL_MS`, `EXPECTATION_TTL_MS` |
+| Validation            | `VALIDATION_SERVICE_URL`, `VALIDATION_TIMEOUT_MS`, `VALIDATION_MODE`, `VALIDATION_CACHE_TTL_MS`                                                                                    |
+| Feedback              | `FEEDBACK_DISABLED`, `FEEDBACK_ENDPOINT_URL`, `FEEDBACK_API_KEY`, `FEEDBACK_SPOOL_DIR`, `FEEDBACK_TIMEOUT_MS`, `FEEDBACK_SPOOL_MAX_FILES`, `FEEDBACK_SALT`                         |
+| Viewer                | `UI_ENABLED`, `UI_TOKEN`, `UI_BASE_URL`, `UI_ENGINE_URL`, `UI_ALLOWED_ORIGINS`                                                                                                     |
+| State                 | `REDIS_URL`, `REDIS_KEY_PREFIX`, `REDIS_COMMAND_TIMEOUT_MS`                                                                                                                        |
+| Arriving with signing | `ONDC_SUBSCRIBER_ID`, `ONDC_UNIQUE_KEY_ID`, `ONDC_SIGNING_PRIVATE_KEY`, `ONDC_SIGNING_PUBLIC_KEY`, `ONDC_COUNTERPARTY_KEYS`                                                        |
 
 Timeout budgets are chosen relative to each other, not independently:
 `VALIDATION_TIMEOUT_MS` (2s) and `REDIS_COMMAND_TIMEOUT_MS` (1.5s) are both far
@@ -1400,15 +1467,17 @@ config-service gateway by default; outbound calls go through an injected undici
 `MockAgent` (`senderDispatcher`); the validation gateway and feedback sink are
 injected too.
 
-| Layer | How |
-| --- | --- |
-| Service logic | plain unit tests |
-| Tools / resources / prompts | `src/test/harness.ts` — real MCP client ↔ real server over an in-memory transport |
-| HTTP and the receiver | `app.inject()` |
-| Outbound | injected undici `MockAgent` (`src/test/mock-participant.ts` scripts a counterparty) |
-| stdio | a real subprocess, asserting stdout carries only protocol bytes |
-| Live | opt-in via `RUN_LIVE_TESTS=1` (`catalog.live`, `flow.live`, `validate.live`) |
-| Redis | opt-in via `RUN_REDIS_TESTS=1`; both stores share `cache-store-contract.ts` |
+| Layer                       | How                                                                                |
+| --------------------------- | ---------------------------------------------------------------------------------- |
+| Service logic               | plain unit tests                                                                   |
+| Tools / resources / prompts | `src/test/harness.ts` — real MCP client ↔ real server over an in-memory transport  |
+| HTTP and the receiver       | `app.inject()`                                                                     |
+| Outbound                    | injected undici`MockAgent` (`src/test/mock-participant.ts` scripts a counterparty) |
+| stdio                       | a real subprocess, asserting stdout carries only protocol bytes                    |
+| The viewer's SSE stream     | a **bound port** and `fetch` — `app.inject()` buffers a whole response, so it cannot observe a stream that has not ended, which is every state this route has |
+| The standalone listener     | `container.receiver.start()` with `RECEIVER_PORT=0`; the lifecycle reports the port it actually bound. Nothing else exercises that host, and it is built by a different function from `app.ts` |
+| Live                        | opt-in via`RUN_LIVE_TESTS=1` (`catalog.live`, `flow.live`, `validate.live`)        |
+| Redis                       | opt-in via`RUN_REDIS_TESTS=1`; both stores share `cache-store-contract.ts`         |
 
 Two fixture sets, and the distinction matters:
 
@@ -1421,6 +1490,12 @@ Two fixture sets, and the distinction matters:
 The end-to-end test that matters is `flow/flow.loop.test.ts`: both directions
 real, payloads generated by config JavaScript in a worker, callbacks arriving
 through the actual routes, and the ACK/callback inversion driven deterministically.
+
+`ui.contract.test.ts` is a different kind of guard: it transcribes the *page's*
+types rather than importing them, because importing would make it true by
+construction. The contract it protects breaks silently — a field we stop sending
+renders an empty step list in a repo we do not control, and the obvious
+conclusion is that this engine is broken.
 
 Files that can be wrong in a way nothing downstream catches — and therefore the
 files with the tests: `validate.parse.ts`, `feedback.redact.ts`,
@@ -1436,16 +1511,16 @@ npm run typecheck && npm run lint && npm test    # before declaring anything don
 
 ## 20. Not built yet
 
-| Piece | What it is |
-| --- | --- |
-| `signing` | ed25519 over a BLAKE2b-512 digest, `header_sign` / `header_verify`, cross-checked against `../header-guide/` vectors, then dropped into the `RequestSigner` seam on `SenderService` and the `verifyAuth` hook on the receiver. **Both seams already exist and ship no-ops.** Counterparty public keys come from a local `KeyProvider` (file or env map); a registry-lookup provider can slot in later. |
-| `context` validation layer | bap/bpp id match, `message_id` format, timestamp window, TTL. Session-relative, so the oracle cannot answer it. Registers as one more `ValidationCheck`. |
-| `inbound_review` (L2) | the model's business/semantic verdict, recorded against an exchange. Post-ACK, never blocking. |
-| `report_generate` | per-step compliance over the recorded transaction. **A patched step must be reported as patched** — `ApiEntry.overrides` is recorded and waiting for this. |
-| `session_state` | live transactions, step statuses, accumulated business data |
-| Difficulty knobs | `sensitiveTTL`, `timeValidations`, `protocolValidations`, `headerValidation`, `stopAfterFirstNack` on `session_create`. Out of scope (workbench routing concerns): `useGateway`, `useCare`, `useTunnelForFIS`, `useGzip`, `encryptionValidation`. |
-| `nack_rules` | declarative predicates (action, JSONPath, condition, error code) evaluated by the deterministic path — how the model runs negative testing without sitting in the ACK window |
-| `ondc://schema/{domain}/{version}/{action}` | a schema resource |
+| Piece                                       | What it is                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `signing`                                   | ed25519 over a BLAKE2b-512 digest,`header_sign` / `header_verify`, cross-checked against `../header-guide/` vectors, then dropped into the `RequestSigner` seam on `SenderService` and the `verifyAuth` hook on the receiver. **Both seams already exist and ship no-ops.** Counterparty public keys come from a local `KeyProvider` (file or env map); a registry-lookup provider can slot in later. |
+| `context` validation layer                  | bap/bpp id match,`message_id` format, timestamp window, TTL. Session-relative, so the oracle cannot answer it. Registers as one more `ValidationCheck`.                                                                                                                                                                                                                                               |
+| `inbound_review` (L2)                       | the model's business/semantic verdict, recorded against an exchange. Post-ACK, never blocking.                                                                                                                                                                                                                                                                                                        |
+| `report_generate`                           | per-step compliance over the recorded transaction.**A patched step must be reported as patched** — `ApiEntry.overrides` is recorded and waiting for this.                                                                                                                                                                                                                                             |
+| `session_state`                             | live transactions, step statuses, accumulated business data                                                                                                                                                                                                                                                                                                                                           |
+| Difficulty knobs                            | `sensitiveTTL`, `timeValidations`, `protocolValidations`, `headerValidation`, `stopAfterFirstNack` on `session_create`. Out of scope (workbench routing concerns): `useGateway`, `useCare`, `useTunnelForFIS`, `useGzip`, `encryptionValidation`.                                                                                                                                                     |
+| `nack_rules`                                | declarative predicates (action, JSONPath, condition, error code) evaluated by the deterministic path — how the model runs negative testing without sitting in the ACK window                                                                                                                                                                                                                          |
+| `ondc://schema/{domain}/{version}/{action}` | a schema resource                                                                                                                                                                                                                                                                                                                                                                                     |
 
 `report_generate` is the **participant's** compliance report and stays on the
 machine; `feedback` is our own tooling telemetry and leaves it. They share
@@ -1462,7 +1537,7 @@ The session journal exists because of that.
 ```
 src/
   app.ts                 Fastify host; explicit registration order (security → auth →
-                         mcp → health → receiver → forms). Does not listen.
+                         mcp → health → metrics → ui → receiver → forms). Does not listen.
   container.ts           boot-once singletons, the two CacheStores, health probes, dispose
   config/env.ts          the only reader of process.env; fails fast at boot
   entrypoints/
@@ -1500,6 +1575,8 @@ src/
     feedback/    redact (default-deny) · detect (the trigger table as data) ·
                  repository · service (capture · resolve · narrate · flush) · sink
     health/      /health and /ready
+    ui/          the live viewer's read model — schema · token · service · routes.
+                 Invisible to the model: no tool, no resource, no capabilities line
     signing/     (not built)  ed25519 + blake2b-512, KeyProvider
     report/      (not built)  compliance report
 
@@ -1514,16 +1591,16 @@ src/
 
 ### Reference map (read-only siblings — never modify anything outside `automation-mcp/`)
 
-| Need | Look at |
-| --- | --- |
-| Flow engine, statuses, resolver chain, jobs | `../automation-framework/knowledge/protocol-workbench/frames/flow-state-machine.md`, `scripts/flow-execution.md` |
-| Which layer catches what | `frames/validation-layers.md` |
-| Signing algorithm, header format, live capture | `frames/signing-security.md` + `../header-guide/` |
-| Receiver step order, HTTP status semantics | `scripts/onix-request-lifecycle.md` |
-| Session / transaction / message identity | `frames/transaction-session.md` |
-| Difficulty knobs (all 10, with defaults) | `frames/session-difficulty.md` |
-| Generator / validator / requirements contract | `frames/mock-runner-lib.md`, `../automation-mock-runner-lib/src/lib/` |
-| Endpoint + state-machine reference for the mock | `../automation-mock-playground-service/docs/decision-flows.md` |
-| ACK/NACK body shapes, error payloads | `../automation-mock-playground-service/src/utils/{ackUtils,build-error-payload,create-generic-context}.ts` |
-| Symptom → cause → fix patterns | `.../knowledge/protocol-workbench/patterns/` (golden rule `fm-001`) |
-| Whole-system orientation | `.../knowledge/protocol-workbench/INDEX.md`, `LOCATOR.md` |
+| Need                                            | Look at                                                                                                          |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Flow engine, statuses, resolver chain, jobs     | `../automation-framework/knowledge/protocol-workbench/frames/flow-state-machine.md`, `scripts/flow-execution.md` |
+| Which layer catches what                        | `frames/validation-layers.md`                                                                                    |
+| Signing algorithm, header format, live capture  | `frames/signing-security.md` + `../header-guide/`                                                                |
+| Receiver step order, HTTP status semantics      | `scripts/onix-request-lifecycle.md`                                                                              |
+| Session / transaction / message identity        | `frames/transaction-session.md`                                                                                  |
+| Difficulty knobs (all 10, with defaults)        | `frames/session-difficulty.md`                                                                                   |
+| Generator / validator / requirements contract   | `frames/mock-runner-lib.md`, `../automation-mock-runner-lib/src/lib/`                                            |
+| Endpoint + state-machine reference for the mock | `../automation-mock-playground-service/docs/decision-flows.md`                                                   |
+| ACK/NACK body shapes, error payloads            | `../automation-mock-playground-service/src/utils/{ackUtils,build-error-payload,create-generic-context}.ts`       |
+| Symptom → cause → fix patterns                  | `.../knowledge/protocol-workbench/patterns/` (golden rule `fm-001`)                                              |
+| Whole-system orientation                        | `.../knowledge/protocol-workbench/INDEX.md`, `LOCATOR.md`                                                        |

@@ -220,6 +220,25 @@ reports about fixtures.
 carries an `events` block; nothing that happens on the wire reaches the model
 any other way unless it is parked in `flow_await` at the right moment.
 
+**The live viewer** — ✅ shipped (`modules/ui/`). A read-only JSON surface at
+`/ui/api`, read by a page hosted in `ONDC-Official/automation-frontend`
+(`main-tech`, route `/mcp-session`). **No tool, no resource, no line in
+`capabilities.ts`** — like the mirror, it is not part of the transaction, and a
+model that could see it would start reasoning about it. The one thing the model
+does see is `viewer_url` on `session_create` / `session_get`, and the prompt
+tells it to hand that straight to the human.
+
+The page is ours; the data is not. The browser fetches directly from this
+process, so payload bodies never pass through whoever hosts the page.
+
+| Fact                                                                                                                                                 | Consequence                                                                                                                                                                                                                                                              |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **It must never call `RecordService#drainEvents`** — `readEvents(sessionId, afterSeq)` is the cursor-neutral read                                    | that cursor is the **model's**: it is how the `events` block knows what has not been delivered. A viewer that drained it would consume the model's notifications, and the symptom is a model that stops hearing about callbacks while a human watches them arrive on screen |
+| **The page's `FlowMap` and our `engine-types.ts` are the same shape**, because `flow/engine/` is a port of the mapper the page was written against    | so `FlowService.flowView` serves the map *before* `status()` projects it into `FlowStepState`, and the page's existing step renderer consumes it unchanged. `ui.contract.test.ts` transcribes the page's types literally — that contract breaks silently, as an empty step list |
+| **Always token-gated**, minted per process when `UI_TOKEN` is unset, and `env.ts` refuses production without an explicit one                          | under stdio this rides the standalone receiver, which binds `0.0.0.0` on purpose. "Unset" therefore has to mean *a token you did not choose*, never *no token* — and in production replicas would each mint a different one, so a link would work only against whichever answered |
+| **The link's parameters are in the `#` fragment, not the query string**                                                                              | a query string is sent to the page's host in the request line, so the token — a credential for *this* server — would land in somebody else's access logs                                                                                                                 |
+| **The stream parks on `TransactionEvents`, and writes a `retry:` frame before anything else**                                                        | Node holds the response headers until the first byte, so a stream opened on a quiet session left the browser waiting on `fetch` rather than on an event. Watch the **reply** for `close`, not the request — Node closes a bodyless `IncomingMessage` immediately          |
+
 **Validation** — ✅ L0 + L1 shipped, **by delegation**. See §4.
 
 - `payload_validate` — judge a payload against the session's build without
@@ -665,6 +684,16 @@ src/lib/
                    that accumulates uses them, never read-modify-write
   events/          TransactionEvents — the wake-up primitive behind flow_await.
                    `JOURNAL` is the deliberately opaque session-scope kind
+  metrics/         Prometheus instruments and the registry `GET /metrics` renders.
+                   Its own `new Registry()`, **never** prom-client's global
+                   `register` — that is process state (§5) and a second
+                   container in one process throws on it, so the suite would
+                   fail on `createHarness`, not on the guilty line.
+                   `boundedLabel` is the cardinality cap for the two label
+                   spaces we do not own: `ValidationFinding.code` (upstream's
+                   compiled x-validations) and `action` (a free path segment on
+                   an unauthenticated endpoint). `metrics.test.ts` asserts over
+                   `getMetricsAsJSON()` that no instrument carries an identifier
   mock-engine/     the @ondc/automation-mock-runner adapter; worker pool lifetime
   stdout-guard.ts  rebinds console onto stderr before anything else loads (stdio)
 
@@ -690,7 +719,30 @@ src/modules/
   feedback/    ✅ the incident corpus: redact (default-deny, the file with the
                tests) · detect (the trigger table as data) · repository ·
                service (capture · resolve · narrate · flush) · sink
-               (NoopSink · SpoolSink · HttpSink · SpoolAndUploadSink)
+               (NoopSink · SpoolSink · HttpSink · SpoolAndUploadSink).
+               `IssueReport.correlation` is the whole of `TELEMETRY_CORRELATION`
+               — one nested key, assembled in `#renderReport`, and the flag is
+               never passed to `redact.ts`
+  metrics/     ✅ observer (counters off the journal, so a new journal kind is
+               counted the day it is added) + routes (`GET /metrics`: the one
+               un-schema'd 200 in the app, `rateLimit: false`, its own
+               `timingSafeEqual` bearer check). No tool, no resource
+  mirror/      ✅ the live mirror — invisible to the model, and **not** in
+               `capabilities.ts`: schema (wire format) · sink (bounded
+               drop-oldest queue, unref'd timer, one POST in flight) · service
+               (three taps: the journal, `createSession`, `FlowService.start`).
+               It must never call `RecordService#journal` (recursion) or
+               `drainEvents` (that is the model's cursor)
+  ui/          ✅ the live viewer's read model — also invisible to the model and
+               **not** in `capabilities.ts`: schema (DTOs; `FlowMap` passes
+               through unmodelled, because restating a ported type in zod
+               drifts silently and an object schema strips what it does not
+               know) · token (mint-or-read + `timingSafeEqual`) · service
+               (assembly only; `readEvents`, never `drainEvents`) · routes
+               (seven GETs and one SSE stream, root-mounted on **both** hosts).
+               `ui.contract.test.ts` is the file that catches a cross-repo
+               break, and it transcribes the page's types rather than importing
+               them — importing would make it true by construction
   signing/     ed25519 + blake2b-512, KeyProvider       (not built)
   report/      compliance report                        (not built)
 
@@ -719,7 +771,12 @@ Env (extend `src/config/env.ts`, keep the fail-fast-at-boot property). Live toda
 `VALIDATION_CACHE_TTL_MS`,
 `FEEDBACK_DISABLED`, `FEEDBACK_ENDPOINT_URL`, `FEEDBACK_API_KEY`,
 `FEEDBACK_SPOOL_DIR`, `FEEDBACK_TIMEOUT_MS`, `FEEDBACK_SPOOL_MAX_FILES`,
-`FEEDBACK_SALT`,
+`FEEDBACK_SALT`, `TELEMETRY_CORRELATION`,
+`METRICS_ENABLED`, `METRICS_TOKEN`,
+`UI_ENABLED`, `UI_TOKEN`, `UI_BASE_URL`, `UI_ENGINE_URL`,
+`UI_ALLOWED_ORIGINS`,
+`MIRROR_ENDPOINT_URL`, `MIRROR_API_KEY`, `MIRROR_TIMEOUT_MS`,
+`MIRROR_FLUSH_INTERVAL_MS`, `MIRROR_BATCH_SIZE`, `MIRROR_QUEUE_MAX`,
 `TRANSACTION_TTL_MS`, `EXPECTATION_TTL_MS`, `REDIS_URL`, `REDIS_KEY_PREFIX`,
 `REDIS_COMMAND_TIMEOUT_MS`. Arriving with signing: `ONDC_SUBSCRIBER_ID`,
 `ONDC_UNIQUE_KEY_ID`, `ONDC_SIGNING_PRIVATE_KEY`, `ONDC_SIGNING_PUBLIC_KEY`,
@@ -834,6 +891,51 @@ both gates' interaction with it, `ApiEntry.overrides`, the journal field and
 `RECOVERED_WITH_OVERRIDE`. The same triage fixed `#seedIdentity` seeding scalars
 where configs index `[0]`, the double-counted incident, and
 `record_get_payload`'s match list being read as the stored value.
+
+9b. ✅ **Operator telemetry — metrics, first-party correlation, the live
+mirror.** Three changes that share one seam and are therefore one phase: the
+`observers` list on `RecordService`, which by this point has three independent
+consumers of the journal feed (the corpus, the metrics tap, the mirror) with a
+`try` around each, so none can silence the others.
+
+    - **Prometheus** (`lib/metrics/`, `modules/metrics/`). Sixteen instruments,
+      `ondc_` prefixed, `_seconds` never `_ms`. Counters come almost free off
+      the journal; only durations and the moments nothing journals — a run
+      opening, a config-service fetch, a sandbox execution — hold a `Metrics`
+      directly. Two instruments deliberately do **not** exist and the file says
+      why: no `sessions_active` (it needs enumeration `CacheStore` cannot do,
+      and a per-process count lies after a restart and across replicas) and no
+      worker-pool gauge (the pool is opaque; cached-runner count is what can be
+      truthfully exported). `GET /metrics` is off `app.authenticate` on
+      purpose — a scraper cannot do RFC 9728 discovery — and `env.ts` refuses
+      to boot production with it open, mirroring the `AUTH_MODE=none` refusal.
+
+    - **`TELEMETRY_CORRELATION`** — clear `session_id` / `transaction_id` on
+      telemetry, under one nested key, so a dashboard can deep-link a report to
+      its run. Nested rather than flat *so a test can prove the blast radius*:
+      `{...report}` minus `correlation` is byte-identical to the flag-off
+      report. `REPORT_SCHEMA_VERSION` is deliberately **not** bumped — a pure
+      addition that forced the ingest to special-case a version would break the
+      "read a spool file from a version you have never seen" contract from the
+      other side. `feedback.redact.ts` is **byte-unchanged** and never sees the
+      flag; that is the safety property, not an accident.
+
+    - **The live mirror** (`modules/mirror/`) — a stream of small records to a
+      sibling service, **invisible to the model**: no tool, no resource, no line
+      in `capabilities.ts`. Three taps, and the third is the one that looks
+      droppable and is not: nothing journals a run *opening*, so a run that
+      starts and is immediately `BLOCKED` — the most interesting row in a triage
+      corpus — would otherwise leave no trace at all. `MirrorSink.emit` is
+      synchronous and `void` because its callers are on the hot path and have
+      nowhere to put a rejection; the type states the discipline.
+      `MIRROR_ENDPOINT_URL` unset is the only off switch, because a flag you can
+      turn on with nowhere to send reads as configured and does nothing.
+
+    One field carries real risk and has its own test on both sides:
+    **`SessionEvent.summary`** is free prose that quotes participant NACK
+    messages and mints transaction ids in plain text. `#renderReport` already
+    ran `scrubProse` over it; the mirror carries the same strings to the same
+    kind of destination and does the same thing.
 
 10. `signing` — `header_sign` / `header_verify`, cross-checked against the header-guide vectors, then dropped into the `RequestSigner` seam on `SenderService` and the `verifyAuth` hook on the receiver. Both seams already exist and ship no-ops.
 11. `report` + L2 — `inbound_review`, `report_generate`, `session_state`, and the difficulty knobs / `nack_rules` on `session_create`. Note that `report_generate` is the **participant's** compliance report and stays on the machine; `feedback` is our own tooling telemetry and leaves it. They share evidence; conflating their audiences would be the bug. **A patched step must be reported as patched** — `ApiEntry.overrides` is recorded and waiting for this.

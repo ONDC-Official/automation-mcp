@@ -6,6 +6,7 @@ import {
 } from "@ondc/automation-mock-runner";
 import type { Logger } from "pino";
 import { UpstreamError } from "@/lib/errors.js";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 
 /**
  * The adapter around `@ondc/automation-mock-runner`.
@@ -62,6 +63,8 @@ export interface MockEngineOptions {
   idleTtlMs: number;
   /** Injectable clock, so tests can cross the idle boundary without waiting. */
   now?: () => number;
+  /** Optional; absent in unit tests. Execution is identical without it. */
+  metrics?: Metrics;
 }
 
 interface CachedRunner {
@@ -69,11 +72,28 @@ interface CachedRunner {
   lastUsed: number;
 }
 
+/**
+ * The library's `ExecutionResult`, structurally.
+ *
+ * Named rather than left inline so `#run` and `#normalise` can agree on it.
+ * Deliberately not imported from the library: this is the shape we depend on,
+ * and stating it here means a library change that widens the real type does not
+ * silently widen ours.
+ */
+interface Execution {
+  success: boolean;
+  result?: unknown;
+  error?: { name: string; message: string; stack?: string };
+  logs?: { message: string }[];
+  validation?: { isValid: boolean; errors: string[] };
+}
+
 export class MockEngine {
   readonly #logger: Logger;
   readonly #idleTtlMs: number;
   readonly #now: () => number;
   readonly #allowedFetchBaseUrls: string[];
+  readonly #metrics: Metrics | undefined;
   readonly #runners = new Map<string, CachedRunner>();
   /** The shared worker pool, held so `dispose` can terminate exactly it. */
   #pool: { terminate: () => void } | undefined;
@@ -84,6 +104,7 @@ export class MockEngine {
     this.#idleTtlMs = options.idleTtlMs;
     this.#now = options.now ?? Date.now;
     this.#allowedFetchBaseUrls = [...options.allowedFetchBaseUrls];
+    this.#metrics = options.metrics;
   }
 
   /**
@@ -163,46 +184,36 @@ export class MockEngine {
   }
 
   /** `generate(defaultPayload, sessionData)` for one step. */
-  async runGenerate(
+  runGenerate(
     runner: MockRunner,
     actionId: string,
     sessionData: Record<string, unknown>,
   ): Promise<RunOutcome<Record<string, unknown>>> {
-    return this.#normalise(
-      "generate",
-      actionId,
-      await runner.runGeneratePayloadWithSession(actionId, sessionData),
+    return this.#run("generate", actionId, () =>
+      runner.runGeneratePayloadWithSession(actionId, sessionData),
     );
   }
 
   /** `validate(targetPayload, sessionData)` for one step. */
-  async runValidate(
+  runValidate(
     runner: MockRunner,
     actionId: string,
     payload: unknown,
     sessionData: Record<string, unknown>,
   ): Promise<RunOutcome<VerdictResult>> {
-    return this.#normalise(
-      "validate",
-      actionId,
-      await runner.runValidatePayloadWithSession(
-        actionId,
-        payload,
-        sessionData,
-      ),
+    return this.#run("validate", actionId, () =>
+      runner.runValidatePayloadWithSession(actionId, payload, sessionData),
     );
   }
 
   /** `meetsRequirements(sessionData)` for one step. */
-  async runRequirements(
+  runRequirements(
     runner: MockRunner,
     actionId: string,
     sessionData: Record<string, unknown>,
   ): Promise<RunOutcome<VerdictResult>> {
-    return this.#normalise(
-      "requirements",
-      actionId,
-      await runner.runMeetRequirementsWithSession(actionId, sessionData),
+    return this.#run("requirements", actionId, () =>
+      runner.runMeetRequirementsWithSession(actionId, sessionData),
     );
   }
 
@@ -212,16 +223,48 @@ export class MockEngine {
    * Static on the library because it needs no config — it is the escape hatch
    * a flow uses when a JSONPath cannot express what it wants to save.
    */
-  async runGetSave(
-    payload: unknown,
-    encodedExpression: string,
-  ): Promise<RunOutcome> {
+  runGetSave(payload: unknown, encodedExpression: string): Promise<RunOutcome> {
     this.#assertUsable();
     this.#boot();
-    return this.#normalise(
-      "getSave",
-      "(expression)",
-      await MockRunner.runGetSave(payload, encodedExpression),
+    // `save` on the metric, `getSave` in the logs: the metric names the family
+    // of thing (a `saveData` expression), the log names the library call.
+    return this.#run("save", "(expression)", () =>
+      MockRunner.runGetSave(payload, encodedExpression),
+    );
+  }
+
+  /**
+   * Run one sandboxed config function, timed and counted.
+   *
+   * The three outcomes are genuinely different and each has a different owner:
+   * `ok` is the config working, `failed` is the config's own JavaScript
+   * throwing or breaking its contract (the flow author's bug, and by far the
+   * most common), `threw` is the worker round trip itself failing (ours). A
+   * single `error` bucket would send every one of them to the wrong person.
+   */
+  async #run<T>(
+    fn: string,
+    actionId: string,
+    execute: () => Promise<Execution>,
+  ): Promise<RunOutcome<T>> {
+    const started = performance.now();
+    try {
+      const outcome = this.#normalise<T>(fn, actionId, await execute());
+      this.#count(fn, outcome.ok ? "ok" : "failed", started);
+      return outcome;
+    } catch (error) {
+      this.#count(fn, "threw", started);
+      throw error;
+    }
+  }
+
+  #count(fn: string, outcome: string, startedAt: number): void {
+    const metrics = this.#metrics;
+    if (metrics === undefined) return;
+    metrics.mockEngineExecutions.inc({ fn, outcome });
+    metrics.mockEngineDuration.observe(
+      { fn },
+      (performance.now() - startedAt) / 1_000,
     );
   }
 
@@ -237,13 +280,7 @@ export class MockEngine {
   #normalise<T>(
     kind: string,
     actionId: string,
-    execution: {
-      success: boolean;
-      result?: unknown;
-      error?: { name: string; message: string; stack?: string };
-      logs?: { message: string }[];
-      validation?: { isValid: boolean; errors: string[] };
-    },
+    execution: Execution,
   ): RunOutcome<T> {
     const logs = (execution.logs ?? []).map((entry) => entry.message);
     for (const line of logs) {

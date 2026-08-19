@@ -14,7 +14,10 @@ import {
   RecordRepository,
   transactionKey,
 } from "@/modules/record/record.repository.js";
-import { EVENTS_DELTA_LIMIT } from "@/modules/record/record.schema.js";
+import {
+  EVENTS_DELTA_LIMIT,
+  type SessionEvent,
+} from "@/modules/record/record.schema.js";
 import { RecordService } from "@/modules/record/record.service.js";
 
 /**
@@ -615,9 +618,7 @@ describe("record key layout", () => {
       "https://np.example.com:443",
       "  https://np.example.com  ",
     ]) {
-      expect(transactionKey("t1", spelling)).toBe(
-        "t1::https://np.example.com",
-      );
+      expect(transactionKey("t1", spelling)).toBe("t1::https://np.example.com");
     }
   });
 
@@ -902,6 +903,48 @@ describe("RecordService — the session journal", () => {
     ).resolves.toBeUndefined();
     // And a drain riding on someone else's tool call degrades the same way.
     await expect(broken.drainEvents(SESSION)).resolves.toBeUndefined();
+  });
+
+  /**
+   * The reason the seam is a list. Each observer is an independent consumer —
+   * the corpus, a live mirror, metrics — so one that throws must cost only
+   * itself, not the observers wired after it and not the journal line.
+   */
+  it("delivers to every observer even when one of them throws", async () => {
+    const seen: SessionEvent[] = [];
+    const withObservers = new RecordService({
+      repository: new RecordRepository({
+        cache,
+        transactionTtlMs: 172_800_000,
+        flowStatusTtlMs: 18_000_000,
+        expectationTtlMs: 300_000,
+        sessionTtlMs: 172_800_000,
+      }),
+      events,
+      mockEngine: engine,
+      expectationTtlMs: 300_000,
+      logger,
+      observers: [
+        {
+          onSessionEvent: (): void => {
+            throw new Error("mirror is down");
+          },
+        },
+        { onSessionEvent: (_sessionId, event): number => seen.push(event) },
+      ],
+    });
+
+    await expect(
+      withObservers.journal(SESSION, {
+        kind: "INBOUND_ACK",
+        summary: "arrived",
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(seen.map((event) => event.summary)).toEqual(["arrived"]);
+    // The append is upstream of the fan-out and stays untouched by it.
+    const stored = await withObservers.readEvents(SESSION);
+    expect(stored.map((entry) => entry.summary)).toEqual(["arrived"]);
   });
 
   describe("draining", () => {

@@ -24,13 +24,29 @@ import type { SessionService } from "@/modules/session/session.service.js";
  * for out of the attention the actual transaction needs.
  */
 
-/** One sentence, repeated wherever a user might reasonably ask. */
-function sharingNotice(): string {
+/**
+ * One sentence, repeated wherever a user might reasonably ask.
+ *
+ * The clause on the end is not decoration. Without it the notice says
+ * "identifiers are pseudonymised", which under `TELEMETRY_CORRELATION` is no
+ * longer the whole truth — the report also carries this session's and this
+ * transaction's ids in the clear. `feedback_list_reports` is documented as the
+ * honest answer to "what are you sending about me?", so the notice it returns
+ * has to change when the answer does.
+ */
+function sharingNotice(correlates: boolean): string {
   return (
     "Issue reports describe what failed, never what was in the payload: every " +
     "value is replaced by a type token and identifiers are pseudonymised " +
     "before anything is written. They are stored locally and, when this server " +
-    "is configured with an ingest URL, uploaded there to improve the tooling."
+    "is configured with an ingest URL, uploaded there to improve the tooling." +
+    (correlates
+      ? " This server also has TELEMETRY_CORRELATION on, so each report " +
+        "additionally carries this session's id and this run's transaction id " +
+        "in the clear, under `correlation`, so a report can be linked back to " +
+        "the run that produced it. Nothing else is affected — the payload and " +
+        "the participant are redacted exactly as above."
+      : "")
   );
 }
 
@@ -115,7 +131,7 @@ export function createFeedbackTools(
           state: updated.state,
           accepted: true,
           message:
-            `Recorded. ${sharingNotice()}` +
+            `Recorded. ${sharingNotice(feedback.correlates)}` +
             (agrees
               ? ""
               : ` Note that the run itself ended ${updated.state}, which does ` +
@@ -175,7 +191,7 @@ export function createFeedbackTools(
                 : {}),
             })),
           ),
-          sharing: sharingNotice(),
+          sharing: sharingNotice(feedback.correlates),
           ...(await eventsFor(records, input.session_id)),
         };
       },

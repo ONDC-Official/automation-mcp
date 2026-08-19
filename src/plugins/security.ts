@@ -7,9 +7,14 @@ import {
   localhostOriginValidation,
   originValidation as mcpOriginValidation,
 } from "@modelcontextprotocol/fastify";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import type { Config } from "@/config/env.js";
+import {
+  addPrivateNetworkPreflight,
+  UI_ROUTE_PREFIX,
+  uiCorsOrigins,
+} from "@/modules/ui/ui.routes.js";
 
 /**
  * Transport hardening.
@@ -47,16 +52,36 @@ export function originValidation(config: Config) {
 
 async function plugin(app: FastifyInstance, config: Config): Promise<void> {
   await app.register(helmet, {
-    // No browser UI is served here; a strict default CSP is still the right
-    // posture for the JSON endpoints and any error pages.
+    // Still `'none'`: this process serves JSON and the odd machine-generated
+    // form page, never an application UI. The viewer's page is hosted
+    // elsewhere and only *reads* `/ui/api`, so nothing here needs to load a
+    // script, a style or a font.
     contentSecurityPolicy: { directives: { "default-src": ["'none'"] } },
   });
 
+  addPrivateNetworkPreflight(app, config);
+
+  // One cors registration, path-aware, rather than a second one scoped to the
+  // viewer: `@fastify/cors` claims the `OPTIONS *` route, so registering it
+  // twice is a duplicate-route error at boot. The delegate form is how it
+  // supports differing per request, and it keeps both allow-lists in one place.
+  const uiOrigins = uiCorsOrigins(config);
+
   await app.register(cors, {
-    origin: config.MCP_ALLOWED_ORIGINS ?? false,
-    // Clients read the session/protocol headers off the response.
-    exposedHeaders: ["mcp-protocol-version", "www-authenticate"],
-    credentials: false,
+    // A thenable because `@fastify/cors` tells a promise-shaped delegate from a
+    // callback-shaped one by arity, and answers `Invalid CORS origin option`
+    // when a one-argument delegate returns something that is not one.
+    delegator: (request: FastifyRequest) =>
+      Promise.resolve({
+        origin: request.url.startsWith(UI_ROUTE_PREFIX)
+          ? uiOrigins
+          : (config.MCP_ALLOWED_ORIGINS ?? false),
+        // Clients read the session/protocol headers off the response.
+        exposedHeaders: ["mcp-protocol-version", "www-authenticate"],
+        // The viewer authenticates with a token it holds, never with a cookie —
+        // so nothing here should be sent ambiently by a browser.
+        credentials: false,
+      }),
   });
 
   await app.register(rateLimit, {

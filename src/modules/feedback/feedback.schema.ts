@@ -273,6 +273,40 @@ export type Incident = z.infer<typeof Incident>;
  */
 export const REPORT_SCHEMA_VERSION = 1;
 
+/**
+ * Clear identifiers, present only under `TELEMETRY_CORRELATION`.
+ *
+ * ## Why this is a nested object rather than two flat fields
+ *
+ * **The flag's entire blast radius has to be one key.** Nested, the difference
+ * between a flag-off report and a flag-on one is exactly `correlation` — which
+ * a test can state as `const {correlation, ...rest} = on; expect(rest).toEqual(off)`
+ * and have the assertion fail the moment the flag starts touching anything
+ * else. Two flat fields cannot express that: the test would have to list what
+ * it expects to differ, which is the same as trusting the reader to have
+ * noticed.
+ *
+ * ## What it is not
+ *
+ * It is not a redaction bypass. `feedback.redact.ts` never sees this flag, does
+ * not import `@/config/env.js`, and is byte-unchanged by its introduction. A
+ * `transaction_id` inside `evidence.payload_shape` is still pseudonymised, and
+ * one quoted inside a journal summary still goes through `scrubProse`. The
+ * report therefore carries both a pseudonym and a clear id for the same
+ * transaction, which is the intended result: the pseudonym exists to keep the
+ * **participant** unlinkable and the corpus internally consistent, not to
+ * protect a UUID this server minted.
+ *
+ * `flow_id` and `attempt` are already in the clear on `IssueReport` — a flow id
+ * is a public catalog coordinate — and are deliberately **not** duplicated
+ * here.
+ */
+export const Correlation = z.object({
+  session_id: z.string(),
+  transaction_id: z.string().optional(),
+});
+export type Correlation = z.infer<typeof Correlation>;
+
 export const IssueReport = z.object({
   schema_version: z.literal(REPORT_SCHEMA_VERSION),
   report_id: z.string(),
@@ -325,6 +359,17 @@ export const IssueReport = z.object({
 
   /** `null`, not absent, when the model never answered. The distinction matters. */
   narration: Narration.nullable(),
+
+  /**
+   * Clear ids, **only** under `TELEMETRY_CORRELATION`. Absent otherwise.
+   *
+   * A pure addition, so `REPORT_SCHEMA_VERSION` is deliberately **not** bumped:
+   * the version says "a field changed meaning", and the ingest has to be able
+   * to read a spool file written by a version it has never seen. Forcing the
+   * consumer to special-case a new version for a key it can ignore breaks that
+   * contract from the other direction.
+   */
+  correlation: Correlation.optional(),
 });
 export type IssueReport = z.infer<typeof IssueReport>;
 

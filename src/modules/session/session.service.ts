@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import { NotFoundError, ValidationError } from "@/lib/errors.js";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import type { BuildRef, NpType } from "@/modules/catalog/catalog.schema.js";
 import {
   oppositeRole,
@@ -47,6 +48,35 @@ export interface SessionServiceOptions {
    * registered once at boot and cannot vary per session.
    */
   receiverRoutePrefix: string;
+  /**
+   * The link a human opens to watch this session, or `undefined` when the
+   * viewer is off.
+   *
+   * Injected rather than built here, because it is assembled from things a
+   * session knows nothing about — where the page is hosted, how a browser
+   * reaches this process, and a token minted at boot. What the session owns is
+   * *when* to state it, which is every time it describes itself.
+   */
+  viewerUrl?: (sessionId: string) => string | undefined;
+  /**
+   * Optional, and absent in most unit tests. Nothing about a session depends on
+   * it — a run must behave identically whether or not anybody is counting.
+   */
+  metrics?: Metrics;
+  /** Optional, on the same terms. */
+  mirror?: SessionMirror;
+}
+
+/**
+ * The half of `MirrorService` this service uses.
+ *
+ * Declared here rather than imported, on the same reasoning as
+ * `FlowService`'s `FeedbackObserver`: the mirror watches sessions, sessions do
+ * not know about the mirror. `void`, because a session must not wait on
+ * telemetry.
+ */
+export interface SessionMirror {
+  noteSessionCreated(session: Session): void;
 }
 
 export class SessionService {
@@ -56,6 +86,9 @@ export class SessionService {
   readonly #ttl: number;
   readonly #receiverPublicUrl: string;
   readonly #routePrefix: string;
+  readonly #metrics: Metrics | undefined;
+  readonly #mirror: SessionMirror | undefined;
+  readonly #viewerUrl: ((sessionId: string) => string | undefined) | undefined;
 
   constructor(options: SessionServiceOptions) {
     this.#repository = options.repository;
@@ -64,6 +97,21 @@ export class SessionService {
     this.#ttl = options.sessionTtlMs;
     this.#receiverPublicUrl = options.receiverPublicUrl.replace(/\/+$/, "");
     this.#routePrefix = options.receiverRoutePrefix.replace(/\/+$/, "");
+    this.#metrics = options.metrics;
+    this.#mirror = options.mirror;
+    this.#viewerUrl = options.viewerUrl;
+  }
+
+  /**
+   * Where a human can watch this session, if anywhere.
+   *
+   * Computed on read rather than stored on the session, because a stored one
+   * would go stale the moment the process restarted with a freshly minted
+   * token — and a link that looks right and does not work is worse than no
+   * link at all.
+   */
+  viewerUrl(sessionId: string): string | undefined {
+    return this.#viewerUrl?.(sessionId);
   }
 
   async createSession(
@@ -119,11 +167,27 @@ export class SessionService {
     };
 
     await this.#repository.save(session, this.#ttl);
+
+    // Counted after the save, so what is counted is what exists. All three
+    // labels are catalog coordinates or our own enum, so the series count is
+    // the size of the published catalog and cannot grow with traffic.
+    this.#metrics?.sessionsCreated.inc({
+      domain: build.domain,
+      version: build.version,
+      mock_role: mockRole,
+    });
+
+    // After the save, for the same reason: what is mirrored is what exists.
+    // This is the only place a consumer can learn `expires_at` — `CacheStore`
+    // expiry is silent and there is no eviction callback, so without this the
+    // sibling would have to keep every session it ever saw.
+    this.#mirror?.noteSessionCreated(session);
+
     const flows = await this.#catalog.listFlows(build, mockRole);
 
     this.#logger.info(
       {
-        sessionId: session.session_id,
+        session_id: session.session_id,
         npType: input.np_type,
         mockRole,
         ...build,
@@ -132,7 +196,13 @@ export class SessionService {
       "session created",
     );
 
-    return { session, flows, total: flows.length };
+    const viewerUrl = this.viewerUrl(sessionId);
+    return {
+      session,
+      ...(viewerUrl !== undefined ? { viewer_url: viewerUrl } : {}),
+      flows,
+      total: flows.length,
+    };
   }
 
   /**
@@ -173,6 +243,28 @@ export class SessionService {
     for (const sessionId of [...candidates].reverse()) {
       if (live.length >= limit) break;
       if (await this.#repository.find(sessionId)) live.push(sessionId);
+    }
+    return live;
+  }
+
+  /**
+   * Live sessions, newest first — the viewer's landing page.
+   *
+   * Resolves each candidate rather than trusting the index, for the same reason
+   * `sessionsOnEndpoint` does: `delete` deliberately leaves the index alone and
+   * TTL expiry is silent, so an id that no longer resolves is the normal case,
+   * not an error. Returns the sessions themselves because every caller wants
+   * the build and the expiry, and re-reading them one by one afterwards would
+   * double the store traffic for no gain.
+   */
+  async recentSessions(limit = 50): Promise<Session[]> {
+    const candidates = await this.#repository.listRecent(limit * 2);
+
+    const live: Session[] = [];
+    for (const sessionId of candidates) {
+      if (live.length >= limit) break;
+      const session = await this.#repository.find(sessionId);
+      if (session) live.push(session);
     }
     return live;
   }

@@ -197,10 +197,18 @@ describe("the URI this mock advertises", () => {
 
   it("refuses a build that would not survive being a path segment", () => {
     expect(() =>
-      advertisedUri("https://mock.example.com", { ...build, domain: "a/b" }, "BAP"),
+      advertisedUri(
+        "https://mock.example.com",
+        { ...build, domain: "a/b" },
+        "BAP",
+      ),
     ).toThrow(ValidationError);
     expect(() =>
-      advertisedUri("https://mock.example.com", { ...build, version: "2 0" }, "BAP"),
+      advertisedUri(
+        "https://mock.example.com",
+        { ...build, version: "2 0" },
+        "BAP",
+      ),
     ).toThrow(ValidationError);
   });
 });

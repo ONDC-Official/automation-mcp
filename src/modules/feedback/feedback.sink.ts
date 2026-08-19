@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import { request, type Dispatcher } from "undici";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import type { IssueReport } from "@/modules/feedback/feedback.schema.js";
 
 /**
@@ -70,6 +71,15 @@ export interface SpoolSinkOptions {
   /** Entries kept before the oldest are pruned. */
   maxFiles: number;
   logger: Logger;
+  /**
+   * Optional; absent in unit tests.
+   *
+   * `ondc_feedback_reports_total` is counted **in the sinks** rather than in
+   * `FeedbackService`, because its three outcomes — spooled, uploaded, refused
+   * — are facts only a sink knows. The service hands a report over and never
+   * learns which of the three happened; that is the whole point of the port.
+   */
+  metrics?: Metrics;
 }
 
 /**
@@ -88,11 +98,13 @@ export class SpoolSink implements FeedbackSink {
   readonly #directory: string;
   readonly #maxFiles: number;
   readonly #logger: Logger;
+  readonly #metrics: Metrics | undefined;
 
   constructor(options: SpoolSinkOptions) {
     this.#directory = options.directory;
     this.#maxFiles = options.maxFiles;
     this.#logger = options.logger;
+    this.#metrics = options.metrics;
   }
 
   get directory(): string {
@@ -108,6 +120,7 @@ export class SpoolSink implements FeedbackSink {
 
       await writeFile(temporary, JSON.stringify(report, null, 2), "utf8");
       await rename(temporary, target);
+      this.#metrics?.feedbackReports.inc({ outcome: "spooled" });
       await this.#prune();
     } catch (error) {
       this.#logger.warn(
@@ -200,6 +213,8 @@ export interface HttpSinkOptions {
   /** The process-wide undici agent. A `MockAgent` in tests. */
   dispatcher?: Dispatcher;
   logger: Logger;
+  /** Optional; see `SpoolSinkOptions.metrics` for why counting lives here. */
+  metrics?: Metrics;
 }
 
 /**
@@ -219,6 +234,7 @@ export class HttpSink {
   readonly #timeoutMs: number;
   readonly #dispatcher: Dispatcher | undefined;
   readonly #logger: Logger;
+  readonly #metrics: Metrics | undefined;
 
   constructor(options: HttpSinkOptions) {
     this.#endpoint = options.endpoint;
@@ -226,6 +242,7 @@ export class HttpSink {
     this.#timeoutMs = options.timeoutMs;
     this.#dispatcher = options.dispatcher;
     this.#logger = options.logger;
+    this.#metrics = options.metrics;
   }
 
   async send(report: IssueReport): Promise<boolean> {
@@ -248,18 +265,26 @@ export class HttpSink {
       // protocol calls are also using.
       await response.body.text().catch(() => undefined);
 
-      if (response.statusCode >= 200 && response.statusCode < 300) return true;
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        this.#metrics?.feedbackReports.inc({ outcome: "uploaded" });
+        return true;
+      }
 
       this.#logger.warn(
         { status: response.statusCode, endpoint: this.#endpoint },
         "the issue-report ingest refused a report; it stays spooled",
       );
+      this.#metrics?.feedbackReports.inc({ outcome: "refused" });
       return false;
     } catch (error) {
       this.#logger.warn(
         { err: error, endpoint: this.#endpoint },
         "could not reach the issue-report ingest; the report stays spooled",
       );
+      // `refused` covers unreachable too: from the spool's point of view they
+      // are the same fact — the report is still pending and the next sweep
+      // will try it again.
+      this.#metrics?.feedbackReports.inc({ outcome: "refused" });
       return false;
     }
   }

@@ -160,6 +160,75 @@ describe("readiness when a dependency is down", () => {
   });
 });
 
+describe("the metrics endpoint", () => {
+  it("serves the Prometheus exposition as text, not as JSON", async () => {
+    await boot(testConfig());
+    const response = await app.inject({ method: "GET", url: "/metrics" });
+
+    expect(response.statusCode).toBe(200);
+    // The reason this route declares no response schema: `serializerCompiler`
+    // would turn the exposition into a JSON string with escaped newlines, and
+    // Prometheus would reject the scrape.
+    expect(response.headers["content-type"]).toMatch(/^text\/plain/);
+    expect(response.body).toContain("ondc_sessions_created_total");
+    expect(response.body).not.toMatch(/^"/);
+
+    // Both pull-shaped gauges have a source registered. They read things built
+    // *after* the registry — the mock engine, the mirror sink — so the
+    // container hands their readers over with `metrics.observe()`, and a second
+    // `observe()` call merges rather than replacing. Get that wrong and the
+    // gauge silently reports nothing at all, which reads as zero.
+    expect(response.body).toMatch(/^ondc_mock_engine_runners 0$/m);
+    expect(response.body).toMatch(/^ondc_mirror_queue_depth 0$/m);
+  });
+
+  it("challenges a scraper with no token when one is configured", async () => {
+    await boot(testConfig({ METRICS_TOKEN: "shhh" }));
+
+    const anonymous = await app.inject({ method: "GET", url: "/metrics" });
+    expect(anonymous.statusCode).toBe(401);
+    expect(anonymous.headers["www-authenticate"]).toContain("Bearer");
+  });
+
+  it("rejects a wrong token, including one of a different length", async () => {
+    await boot(testConfig({ METRICS_TOKEN: "shhh" }));
+
+    for (const presented of ["wrong", "shh", "shhhh", ""]) {
+      const response = await app.inject({
+        method: "GET",
+        url: "/metrics",
+        headers: { authorization: `Bearer ${presented}` },
+      });
+      // A length mismatch must be a 401, not the 500 an unguarded
+      // `timingSafeEqual` would throw — which would also leak the real length.
+      expect(response.statusCode, `token "${presented}"`).toBe(401);
+    }
+  });
+
+  it("serves the exposition to the right token", async () => {
+    await boot(testConfig({ METRICS_TOKEN: "shhh" }));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/metrics",
+      headers: { authorization: "Bearer shhh" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("ondc_flow_runs_total");
+  });
+
+  it("registers no route at all when metrics are switched off", async () => {
+    await boot(testConfig({ METRICS_ENABLED: "0" }));
+
+    // 404 and not 403: "there is nothing here" is the true answer, and it is
+    // the one that discloses least.
+    const response = await app.inject({ method: "GET", url: "/metrics" });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ error: { code: "not_found" } });
+  });
+});
+
 describe("mcp endpoint", () => {
   beforeEach(async () => {
     await boot(testConfig());

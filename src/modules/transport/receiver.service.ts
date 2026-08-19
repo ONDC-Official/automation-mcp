@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 import { NotFoundError } from "@/lib/errors.js";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import type { MockEngine } from "@/lib/mock-engine/mock-engine.js";
 import type { MappedStep } from "@/modules/flow/engine/engine-types.js";
 import { getFlowCompleteStatus } from "@/modules/flow/engine/flow-mapper.js";
@@ -30,6 +31,7 @@ import {
   type ValidationVerdict,
 } from "@/modules/validate/validate.schema.js";
 import type { ValidateService } from "@/modules/validate/validate.service.js";
+import { readAck } from "@/modules/transport/sender.service.js";
 
 const FORM_TYPES = new Set(["HTML_FORM", "DYNAMIC_FORM", "HTML_FORM_MULTI"]);
 
@@ -132,6 +134,8 @@ export interface ReceiverServiceOptions {
   /** L0 + L1 on what arrives, inside the ACK window. */
   validate: ValidateService;
   logger: Logger;
+  /** Optional; absent in unit tests. The verdict is the same either way. */
+  metrics?: Metrics;
 }
 
 interface BecknContext {
@@ -151,6 +155,7 @@ export class ReceiverService {
   readonly #mockEngine: MockEngine;
   readonly #validate: ValidateService;
   readonly #logger: Logger;
+  readonly #metrics: Metrics | undefined;
 
   constructor(options: ReceiverServiceOptions) {
     this.#sessions = options.sessions;
@@ -160,6 +165,7 @@ export class ReceiverService {
     this.#mockEngine = options.mockEngine;
     this.#validate = options.validate;
     this.#logger = options.logger;
+    this.#metrics = options.metrics;
   }
 
   /**
@@ -186,18 +192,53 @@ export class ReceiverService {
     body: unknown,
     headers: Record<string, unknown> = {},
   ): Promise<InboundResult> {
+    // The ACK window, measured end to end: everything between the participant's
+    // request landing and this mock deciding. It is the number their timeouts
+    // are set against, and the one thing the journal cannot reconstruct — a
+    // line says a call was ACKed, never how long their socket was held.
+    const started = performance.now();
     try {
-      return await this.#handle(request, body, headers);
+      const result = await this.#handle(request, body, headers);
+      this.#timeAck(request.action, result, started);
+      return result;
     } catch (error) {
       this.#logger.error({ err: error, ...request }, "inbound request failed");
-      return {
+      const failure: InboundResult = {
         status: 500,
         body: nack(
           "INTERNAL_ERROR",
           "The mock failed to process this request.",
         ),
       };
+      // Timed too. A 500 is the slowest and most interesting shape this
+      // endpoint has, and leaving it out of the histogram would make the tail
+      // look better exactly when it is worst.
+      this.#timeAck(request.action, failure, started);
+      return failure;
     }
+  }
+
+  /**
+   * Record how long one inbound call held the participant's connection.
+   *
+   * The `ack` label is read back off the body we are about to write rather than
+   * threaded down from wherever the decision was made — there are a dozen
+   * refusal branches and every one of them would otherwise have to remember to
+   * report itself, which is the kind of obligation that holds until someone
+   * adds the thirteenth.
+   *
+   * Only the histogram. `ondc_inbound_calls_total` comes off the journal, which
+   * carries the `nack_code` this cannot see.
+   */
+  #timeAck(action: string, result: InboundResult, startedAt: number): void {
+    const metrics = this.#metrics;
+    if (metrics === undefined) return;
+    metrics.inboundDuration.observe(
+      // `action` is a free path segment on an unauthenticated endpoint, so it
+      // is bounded rather than trusted. See `Metrics.action`.
+      { action: metrics.action(action), ack: readAck(result.body) },
+      (performance.now() - startedAt) / 1_000,
+    );
   }
 
   async #handle(
@@ -312,7 +353,12 @@ export class ReceiverService {
         summary: `NACKed ${action}: it arrived on the "${request.action}" endpoint. Recorded as a finding.`,
       });
       this.#logger.warn(
-        { sessionId, transactionId, pathAction: request.action, action },
+        {
+          session_id: sessionId,
+          transaction_id: transactionId,
+          pathAction: request.action,
+          action,
+        },
         "inbound action does not match the endpoint it arrived on",
       );
       return { status: 200, body: ackBody, transactionId };
@@ -374,7 +420,7 @@ export class ReceiverService {
         summary: `NACKed an unexpected ${action} — the flow is not waiting for it. Recorded as a finding.`,
       });
       this.#logger.warn(
-        { sessionId, transactionId, action },
+        { session_id: sessionId, transaction_id: transactionId, action },
         "inbound request matched no pending step",
       );
       return { status: 200, body: ackBody, transactionId };
@@ -501,8 +547,8 @@ export class ReceiverService {
       });
       this.#logger.info(
         {
-          sessionId,
-          transactionId,
+          session_id: sessionId,
+          transaction_id: transactionId,
           action,
           findings: protocol.findings.length,
           code,
@@ -618,12 +664,12 @@ export class ReceiverService {
       );
 
       this.#logger.info(
-        { transactionId, stepKey: next.actionId },
+        { transaction_id: transactionId, step_key: next.actionId },
         "pre-fetched the participant's form",
       );
     } catch (error) {
       this.#logger.warn(
-        { err: error, transactionId, stepKey: next.actionId },
+        { err: error, transaction_id: transactionId, step_key: next.actionId },
         "could not pre-fetch the participant's form; it will be fetched on demand",
       );
     }
@@ -823,9 +869,9 @@ export class ReceiverService {
 
     this.#logger.info(
       {
-        sessionId: session.session_id,
-        transactionId,
-        flowId: expectation.flowId,
+        session_id: session.session_id,
+        transaction_id: transactionId,
+        flow_id: expectation.flowId,
         action,
       },
       "opened a transaction from an armed expectation; the participant chose the id",
@@ -909,11 +955,11 @@ export class ReceiverService {
 
     this.#logger.warn(
       {
-        sessionId: session.session_id,
-        transactionId: expected,
+        session_id: session.session_id,
+        transaction_id: expected,
         quoted,
         action,
-        payloadId,
+        payload_id: payloadId,
       },
       "inbound call quotes a different transaction_id than the flow it belongs to",
     );
@@ -989,12 +1035,12 @@ export class ReceiverService {
 
     this.#logger.warn(
       {
-        sessionId: session.session_id,
-        transactionId,
-        flowId,
+        session_id: session.session_id,
+        transaction_id: transactionId,
+        flow_id: flowId,
         attempt,
         action,
-        payloadId,
+        payload_id: payloadId,
       },
       "inbound call arrived for an attempt that has been abandoned",
     );
@@ -1041,8 +1087,8 @@ export class ReceiverService {
     }
     this.#logger.warn(
       {
-        sessionId: session.session_id,
-        transactionId,
+        session_id: session.session_id,
+        transaction_id: transactionId,
         advertised: advertisedUri,
         registered: session.np.subscriber_url,
       },

@@ -7,6 +7,7 @@ import { InMemoryCacheStore } from "@/lib/cache/in-memory-cache-store.js";
 import { RedisCacheStore } from "@/lib/cache/redis-cache-store.js";
 import { TransactionEvents } from "@/lib/events/transaction-events.js";
 import { logger as rootLogger } from "@/lib/logger.js";
+import { createMetrics, type Metrics } from "@/lib/metrics/metrics.js";
 import { MockEngine } from "@/lib/mock-engine/mock-engine.js";
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
 import { HttpConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
@@ -26,8 +27,17 @@ import { FlowService } from "@/modules/flow/flow.service.js";
 import { FormsService } from "@/modules/forms/forms.service.js";
 import { RecordRepository } from "@/modules/record/record.repository.js";
 import { RecordService } from "@/modules/record/record.service.js";
+import { MetricsObserver } from "@/modules/metrics/metrics.observer.js";
+import { MirrorService } from "@/modules/mirror/mirror.service.js";
+import {
+  BufferedHttpMirrorSink,
+  NoopMirrorSink,
+  type MirrorSink,
+} from "@/modules/mirror/mirror.sink.js";
 import { CacheSessionRepository } from "@/modules/session/session.repository.js";
 import { SessionService } from "@/modules/session/session.service.js";
+import { UiService } from "@/modules/ui/ui.service.js";
+import { createViewerToken, type ViewerToken } from "@/modules/ui/ui.token.js";
 import { ReceiverLifecycle } from "@/modules/transport/receiver.lifecycle.js";
 import { ReceiverService } from "@/modules/transport/receiver.service.js";
 import {
@@ -114,8 +124,33 @@ export interface Container {
   readonly receiver: ReceiverLifecycle;
   /** Sandbox for the config-service's per-step JavaScript. */
   readonly mockEngine: MockEngine;
+  /**
+   * Prometheus instruments, and the registry `GET /metrics` renders.
+   *
+   * A `lib` in the same category as `logger` — held here so one registry serves
+   * the whole process and every emitter is handed the same one.
+   */
+  readonly metrics: Metrics;
   /** Wake-ups for `flow_await`. */
   readonly events: TransactionEvents;
+  /**
+   * The read model behind the hosted viewer page.
+   *
+   * Beside `services` rather than in it, and that is the same statement the
+   * mirror makes by not appearing here at all: the viewer is **not part of the
+   * transaction**. It registers no tool, no resource and no line in
+   * `capabilities.ts`, so a model driving a flow cannot see it and cannot start
+   * reasoning about it.
+   */
+  readonly ui: UiService;
+  /** The viewer's credential, minted at boot when none was configured. */
+  readonly uiToken: ViewerToken;
+  /**
+   * The link `session_create` hands the human, or `undefined` when the viewer
+   * is switched off. Built here because it needs `receiverPublicUrl`, which is
+   * itself derived at boot.
+   */
+  viewerUrl(sessionId: string): string | undefined;
   /** Probes run by `/ready`. Register one per external dependency. */
   readonly healthChecks: readonly HealthCheck[];
   /** Release every resource acquired at boot. Must be idempotent. */
@@ -164,6 +199,17 @@ export interface CreateContainerOptions {
    * operator's home directory, which no test may touch.
    */
   feedbackSink?: FeedbackSink;
+  /**
+   * Override the Prometheus registry, e.g. to assert on it without going
+   * through the HTTP route. Rarely needed: each container builds its own.
+   */
+  metrics?: Metrics;
+  /**
+   * Where mirror records go. Tests must pass one — and `createContainer`
+   * refuses to build a real one under `NODE_ENV=test` regardless, the same two
+   * guards the feedback sink has and for the same reason.
+   */
+  mirrorSink?: MirrorSink;
 }
 
 export async function createContainer(
@@ -171,6 +217,11 @@ export async function createContainer(
   options: CreateContainerOptions = {},
 ): Promise<Container> {
   const logger = options.logger ?? rootLogger;
+
+  // One registry per container, never prom-client's process-wide default —
+  // `lib/metrics/metrics.ts` explains what breaks otherwise, and it breaks in
+  // the test suite rather than in production, which is the worse direction.
+  const metrics = options.metrics ?? createMetrics();
 
   // ---- Expensive singletons go here -------------------------------------
   // One HTTP agent for the process. Built per request it would open a fresh
@@ -227,6 +278,7 @@ export async function createContainer(
       timeoutMs: config.CONFIG_SERVICE_TIMEOUT_MS,
       dispatcher: httpAgent,
       logger,
+      metrics,
     });
 
   const sessionRepository = new CacheSessionRepository(stateStore);
@@ -244,7 +296,13 @@ export async function createContainer(
     logger,
     allowedFetchBaseUrls: config.RUNNER_FETCH_ALLOWLIST,
     idleTtlMs: config.RUNNER_CACHE_TTL_MS,
+    metrics,
   });
+
+  // The runner-count gauge reads the engine at scrape time rather than the
+  // engine pushing on every change: a cache size is a level, and levels are
+  // sampled. See `MetricSources`.
+  metrics.observe({ runners: () => mockEngine.size() });
 
   const events = new TransactionEvents();
 
@@ -277,13 +335,119 @@ export async function createContainer(
     config.RECEIVER_ROUTE_PREFIX ?? new URL(receiverPublicUrl).pathname
   ).replace(/\/+$/, "");
 
+  const uiToken = createViewerToken(config.UI_TOKEN);
+  if (config.UI_ENABLED && !uiToken.configured) {
+    // Said out loud because the token is otherwise invisible: it exists only
+    // inside the links `session_create` hands out, so an operator who restarts
+    // this process needs to know why yesterday's link stopped working.
+    logger.info(
+      "viewer: no UI_TOKEN configured; minted one for this process, so links do not survive a restart",
+    );
+  }
+
+  /**
+   * The link a human opens.
+   *
+   * The page is hosted at `UI_BASE_URL`; the data is not, and never passes
+   * through it — the browser fetches straight from this process at
+   * `UI_ENGINE_URL`, which defaults to the address we already advertise to the
+   * participant, because that is the one known to be reachable from outside.
+   *
+   * **The parameters go in the fragment, not the query string.** A query string
+   * is sent to the page's host in the request line, so the token — a credential
+   * for *this* server — would land in somebody else's access logs, for a
+   * service deliberately built so their infrastructure never sees a payload. A
+   * fragment is never sent. The page clears it from the address bar on load.
+   */
+  const uiEngineUrl = (config.UI_ENGINE_URL ?? receiverPublicUrl).replace(
+    /\/+$/,
+    "",
+  );
+  const uiBaseUrl = config.UI_BASE_URL.replace(/\/+$/, "");
+  const viewerUrl = (sessionId: string): string | undefined => {
+    if (!config.UI_ENABLED) return undefined;
+    const params = new URLSearchParams({
+      engine: uiEngineUrl,
+      session: sessionId,
+      k: uiToken.value,
+    });
+    return `${uiBaseUrl}/mcp-session#${params.toString()}`;
+  };
+
+  /*
+   * One salt for every pseudonym this process emits.
+   *
+   * Hoisted out of `FeedbackService` because the mirror needs the *same* one:
+   * `subscriber_ref` on a mirror record and the `np_…` in an issue report are
+   * only joinable if they were derived from one key. Generated per process when
+   * unset, so pseudonyms are unlinkable across restarts until `FEEDBACK_SALT`
+   * pins one — which is what a real corpus wants.
+   */
+  const pseudonymSalt = config.FEEDBACK_SALT ?? randomUUID();
+
+  /*
+   * The live mirror. Built here, before the services that tap it.
+   *
+   * `MIRROR_ENDPOINT_URL` unset is the whole off switch — there is deliberately
+   * no second flag, because a flag you can turn on with nowhere to send reads
+   * as configured and does nothing. `NODE_ENV=test` is a hard refusal on top,
+   * matching the feedback sink: no suite may open a socket by forgetting to
+   * inject one, and `createHarness` injects a no-op as well because this guard
+   * is bypassed by any test that builds a container directly.
+   */
+  const mirrorSink: MirrorSink =
+    options.mirrorSink ??
+    (config.MIRROR_ENDPOINT_URL === undefined || config.NODE_ENV === "test"
+      ? new NoopMirrorSink()
+      : new BufferedHttpMirrorSink({
+          endpoint: config.MIRROR_ENDPOINT_URL,
+          ...(config.MIRROR_API_KEY !== undefined
+            ? { apiKey: config.MIRROR_API_KEY }
+            : {}),
+          timeoutMs: config.MIRROR_TIMEOUT_MS,
+          flushIntervalMs: config.MIRROR_FLUSH_INTERVAL_MS,
+          batchSize: config.MIRROR_BATCH_SIZE,
+          queueMax: config.MIRROR_QUEUE_MAX,
+          instanceId: randomUUID(),
+          dispatcher: httpAgent,
+          logger,
+          metrics,
+        }));
+
+  const mirror = new MirrorService({
+    sink: mirrorSink,
+    salt: pseudonymSalt,
+    correlation: config.TELEMETRY_CORRELATION,
+    logger,
+  });
+
+  metrics.observe({
+    mirrorQueueDepth: () => mirrorSink.depth?.() ?? 0,
+  });
+
+  // Said out loud at boot, beside the feedback line and for the same reason:
+  // something that ships diagnostics off the machine owes the operator a
+  // printed statement of where they go, not a line in a README.
+  if (config.MIRROR_ENDPOINT_URL === undefined) {
+    logger.info("mirror: off (no MIRROR_ENDPOINT_URL)");
+  } else {
+    logger.info(
+      { endpoint: config.MIRROR_ENDPOINT_URL },
+      "mirror: session, run and journal records are redacted and streamed there; " +
+        "unset MIRROR_ENDPOINT_URL to turn this off",
+    );
+  }
+
   const session = new SessionService({
     repository: sessionRepository,
     catalog,
     sessionTtlMs: config.SESSION_TTL_MS,
     receiverPublicUrl,
     receiverRoutePrefix,
+    viewerUrl,
     logger,
+    metrics,
+    mirror,
   });
 
   /*
@@ -334,6 +498,7 @@ export async function createContainer(
             directory: spoolDirectory,
             maxFiles: config.FEEDBACK_SPOOL_MAX_FILES,
             logger,
+            metrics,
           }),
           ...(config.FEEDBACK_ENDPOINT_URL !== undefined
             ? {
@@ -345,6 +510,7 @@ export async function createContainer(
                   timeoutMs: config.FEEDBACK_TIMEOUT_MS,
                   dispatcher: httpAgent,
                   logger,
+                  metrics,
                 }),
               }
             : {}),
@@ -365,6 +531,15 @@ export async function createContainer(
       "feedback: issue reports are captured, redacted and spooled; " +
         "set FEEDBACK_DISABLED=1 to turn this off",
     );
+    if (config.TELEMETRY_CORRELATION) {
+      // Said out loud on its own line, because it is the one setting that puts
+      // an identifier in the clear on something that leaves the machine.
+      logger.info(
+        "feedback: TELEMETRY_CORRELATION is on — reports also carry session_id " +
+          "and transaction_id in the clear, under `correlation`. Payload " +
+          "redaction is unaffected.",
+      );
+    }
   }
 
   // Annotated, not inferred: `feedback` and `record` reference each other, and
@@ -377,13 +552,16 @@ export async function createContainer(
     sink: feedbackSink,
     journal: (sessionId, entry): Promise<void> =>
       record.journal(sessionId, entry),
-    // Generated per process when unset, so pseudonyms are unlinkable across
-    // restarts until the spool persists one. Set `FEEDBACK_SALT` to make them
-    // stable, which is what a real corpus wants.
-    salt: config.FEEDBACK_SALT ?? randomUUID(),
+    // Shared with the mirror, so `np_…` in a report and `subscriber_ref` on a
+    // mirror record name the same participant.
+    salt: pseudonymSalt,
     repoRoot: process.cwd(),
     enabled: !config.FEEDBACK_DISABLED,
+    // Off by default. On, a report gains exactly one key — `correlation` — and
+    // nothing else changes; `feedback.redact.ts` never sees this flag.
+    correlation: config.TELEMETRY_CORRELATION,
     logger,
+    metrics,
   });
 
   const record: RecordService = new RecordService({
@@ -392,7 +570,11 @@ export async function createContainer(
     mockEngine,
     expectationTtlMs: config.EXPECTATION_TTL_MS,
     logger,
-    observer: feedback,
+    // Independent consumers of one feed. The corpus opens incidents; the
+    // metrics tap counts; the mirror streams. `RecordService` catches per
+    // observer, so none can silence the others — which is the whole reason this
+    // is a list.
+    observers: [feedback, new MetricsObserver(metrics), mirror],
   });
 
   // Protocol validation. The gateway shares the process-wide agent because the
@@ -404,6 +586,7 @@ export async function createContainer(
       timeoutMs: config.VALIDATION_TIMEOUT_MS,
       dispatcher: httpAgent,
       logger,
+      metrics,
     });
 
   const validate = new ValidateService({
@@ -415,10 +598,12 @@ export async function createContainer(
     cacheTtlMs: config.VALIDATION_CACHE_TTL_MS,
     mode: config.VALIDATION_MODE,
     logger,
+    metrics,
   });
 
   const sender = new SenderService({
     logger,
+    metrics,
     timeoutMs: config.SEND_TIMEOUT_MS,
     ...(options.senderDispatcher
       ? { dispatcher: options.senderDispatcher }
@@ -439,6 +624,8 @@ export async function createContainer(
     receiverPublicUrl,
     mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
     feedback,
+    metrics,
+    mirror,
   });
 
   const forms = new FormsService({
@@ -469,6 +656,15 @@ export async function createContainer(
     forms,
     mockEngine,
     validate,
+    logger,
+    metrics,
+  });
+
+  const ui = new UiService({
+    sessions: session,
+    catalog,
+    flows: flow,
+    records: record,
     logger,
   });
 
@@ -516,7 +712,11 @@ export async function createContainer(
     logger,
     services,
     mockEngine,
+    metrics,
     events,
+    ui,
+    uiToken,
+    viewerUrl,
     inbound,
     receiver,
     receiverPublicUrl,
@@ -525,9 +725,28 @@ export async function createContainer(
     async dispose(): Promise<void> {
       if (disposed) return;
       disposed = true;
+      /*
+       * The order carries two invariants, and neither is obvious from reading
+       * the calls:
+       *
+       * 1. **Everything that can still write a journal line is quiesced before
+       *    `mirror.close()`.** The mirror observes the journal, and
+       *    `feedback.drain()` writes `ISSUE_OPEN` lines for incidents that
+       *    never resolved — the last thing this process does is often the most
+       *    interesting thing it has to say. Closing the mirror first would
+       *    drop exactly those.
+       * 2. **`mirror.close()` precedes `httpAgent.close()`**, because its final
+       *    flush goes out through that agent. Reversed, the last batch fails on
+       *    a closed dispatcher and the records are lost silently.
+       */
       await receiver.dispose();
       await feedback.drain();
+      await mirror.close();
       mockEngine.dispose();
+      // Releases the GC observer and event-loop-delay histogram that
+      // `collectDefaultMetrics` installs on the *process* — `registry.clear()`
+      // alone leaves both running. See `lib/metrics/metrics.ts`.
+      metrics.dispose();
       events.close();
       await stateStore.close();
       await catalogCache.close();

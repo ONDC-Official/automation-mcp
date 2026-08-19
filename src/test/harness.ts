@@ -7,6 +7,7 @@ import {
   type CreateContainerOptions,
 } from "@/container.js";
 import { NoopSink } from "@/modules/feedback/feedback.sink.js";
+import { NoopMirrorSink } from "@/modules/mirror/mirror.sink.js";
 import { buildMcpServer } from "@/mcp/server.js";
 import {
   createFakeConfigServiceGateway,
@@ -58,6 +59,9 @@ export async function createHarness(
     // spool under `NODE_ENV=test` as well — two guards, because this one is
     // bypassed by any test that builds a container directly.
     feedbackSink: new NoopSink(),
+    // Same rule again: no test may open a socket to a mirror ingest. Pass your
+    // own `NoopMirrorSink` to assert on what would have been streamed.
+    mirrorSink: new NoopMirrorSink(),
     ...options,
   });
   const server = buildMcpServer(container);

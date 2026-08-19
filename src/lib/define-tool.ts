@@ -94,6 +94,31 @@ function traceFieldsFrom(ctx: ServerContext): Record<string, string> {
   return fields;
 }
 
+/** The input keys worth correlating on, in the wire spelling logs now use. */
+const CORRELATION_KEYS = ["session_id", "flow_id", "transaction_id"] as const;
+
+/**
+ * Join keys off a tool's input.
+ *
+ * By name, and that works because the names are already uniform across every
+ * session-scoped tool — `session_id`, `flow_id`, `transaction_id`. One function
+ * here correlates every tool's log lines without touching a single tool.
+ *
+ * The alternative was each handler remembering to tag its own logger, which is
+ * a convention that holds right up until someone adds a tool.
+ */
+export function correlationFields(input: unknown): Record<string, string> {
+  if (typeof input !== "object" || input === null) return {};
+
+  const source = input as Record<string, unknown>;
+  const fields: Record<string, string> = {};
+  for (const key of CORRELATION_KEYS) {
+    const value = source[key];
+    if (typeof value === "string") fields[key] = value;
+  }
+  return fields;
+}
+
 export function defineTool<
   I extends StandardSchemaWithJSON,
   O extends StandardSchemaWithJSON,
@@ -113,6 +138,7 @@ export function defineTool<
           tool: spec.name,
           method: ctx.mcpReq.method,
           ...traceFieldsFrom(ctx),
+          ...correlationFields(input),
         });
 
         const started = performance.now();

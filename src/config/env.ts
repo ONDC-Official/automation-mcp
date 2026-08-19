@@ -122,6 +122,104 @@ const EnvSchema = z
       .positive()
       .default(900_000),
 
+    /* ---- Prometheus ---- */
+
+    /**
+     * Whether `GET /metrics` is registered at all.
+     *
+     * False does not answer 403; it registers no route, so the endpoint 404s
+     * like any other path this app does not serve. "There is nothing here" and
+     * "there is something here you may not have" are different disclosures, and
+     * only one of them is true.
+     */
+    METRICS_ENABLED: z
+      .stringbool({
+        truthy: ["1", "true", "yes"],
+        falsy: ["0", "false", "no", ""],
+      })
+      .default(true),
+    /**
+     * Bearer token a scraper must present.
+     *
+     * Not `app.authenticate`: that answers with an RFC 9728 discovery pointer,
+     * and a Prometheus scraper cannot do discovery — it can send one static
+     * header. Compared with `timingSafeEqual`.
+     */
+    METRICS_TOKEN: z.string().min(1).optional(),
+
+    /* ---- The live viewer (a read-only JSON surface for a hosted page) ---- */
+
+    /**
+     * Whether the `/ui/api` routes are registered at all.
+     *
+     * Same reasoning as `METRICS_ENABLED`: off registers no route, so a probe
+     * gets the app's ordinary 404 rather than a 403 confirming there is
+     * something here worth asking for.
+     */
+    UI_ENABLED: z
+      .stringbool({
+        truthy: ["1", "true", "yes"],
+        falsy: ["0", "false", "no", ""],
+      })
+      .default(true),
+    /**
+     * Token the viewer must present, minted per process when unset.
+     *
+     * Minted rather than absent, because this surface serves **payload bodies** —
+     * the participant's real transaction data — and under stdio it rides the
+     * standalone receiver, which binds `0.0.0.0` on purpose so a third party can
+     * reach it. An unset token must therefore mean "a token you did not choose",
+     * never "no token". Set it explicitly when the process restarts often enough
+     * that a changing link is a nuisance, or when several replicas share one URL.
+     */
+    UI_TOKEN: z.string().min(1).optional(),
+    /**
+     * Where the viewer page is hosted — the origin of the link handed to the
+     * human. The page is ours; the data never passes through it.
+     */
+    UI_BASE_URL: z.url().default("https://workbench.ondc.tech"),
+    /**
+     * How the **browser** reaches this engine. Defaults at container build to
+     * `RECEIVER_PUBLIC_URL`, which is already the address this process is known
+     * to be reachable on. Set it separately only when the viewer and the
+     * participant should reach us by different routes.
+     */
+    UI_ENGINE_URL: optionalUrl,
+    /**
+     * Origins allowed to call `/ui/api`. Defaults at container build to the
+     * origin of `UI_BASE_URL`, so the common case needs no configuration.
+     */
+    UI_ALLOWED_ORIGINS: csv.optional(),
+
+    /* ---- Live mirror (telemetry to a sibling service) ---- */
+
+    /**
+     * Where mirror records are POSTed. **Unset means mirroring is off.**
+     *
+     * Deliberately the only switch: a second `MIRROR_ENABLED` flag would let an
+     * operator turn it "on" with nowhere to send, which is a setting that reads
+     * as configured and does nothing.
+     */
+    MIRROR_ENDPOINT_URL: optionalUrl,
+    /** Bearer token for the mirror ingest, if it wants one. */
+    MIRROR_API_KEY: z.string().min(1).optional(),
+    /**
+     * Ceiling on one batch POST. Small, and never on the ACK path — but it
+     * shares the process-wide agent with protocol calls, so a hung mirror
+     * request holds a connection slot they are also using.
+     */
+    MIRROR_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+    /** How often a partial batch is flushed. The timer is `unref`'d. */
+    MIRROR_FLUSH_INTERVAL_MS: z.coerce.number().int().positive().default(2_000),
+    /** Records that trigger an immediate (still off-thread) flush. */
+    MIRROR_BATCH_SIZE: z.coerce.number().int().positive().default(100),
+    /**
+     * Queue ceiling. Full means the **oldest** record is dropped, and the count
+     * of drops rides the next batch — a gap in the corpus that says so beats a
+     * gap that does not.
+     */
+    MIRROR_QUEUE_MAX: z.coerce.number().int().positive().default(1_000),
+
     /* ---- Issue reporting (the incident corpus) ---- */
 
     /**
@@ -174,6 +272,34 @@ const EnvSchema = z
      * installation in the corpus.
      */
     FEEDBACK_SALT: z.string().min(1).optional(),
+
+    /**
+     * Carry `session_id` and `transaction_id` in the clear on telemetry.
+     *
+     * Off by default. On, an issue report and a mirror record gain **exactly
+     * one key** — `correlation`, holding those two ids — so a dashboard can
+     * deep-link a report back to the run that produced it. Nothing else
+     * changes: `{...report}` minus `correlation` is byte-identical to the
+     * flag-off report, which `feedback.firstparty.test.ts` asserts rather than
+     * merely claims.
+     *
+     * It does **not** relax redaction. Payload leaves are still type tokens,
+     * the participant is still pseudonymised, and ids quoted inside prose are
+     * still scrubbed — the flag is not passed to `feedback.redact.ts` at all,
+     * which is what makes that guarantee structural rather than a promise.
+     *
+     * The result is a report carrying both a pseudonym and a clear id for one
+     * transaction, and that is fine: the pseudonym's job was never to protect a
+     * UUID we minted ourselves, it was to keep the *participant* unlinkable and
+     * the corpus internally consistent. Both still hold. Only turn this on for
+     * telemetry about your own installation.
+     */
+    TELEMETRY_CORRELATION: z
+      .stringbool({
+        truthy: ["1", "true", "yes"],
+        falsy: ["0", "false", "no", ""],
+      })
+      .default(false),
 
     /* ---- Shared state store ---- */
 
@@ -294,6 +420,46 @@ const EnvSchema = z
       message:
         "AUTH_MODE=none is refused when NODE_ENV=production — configure AUTH_MODE=jwt",
       path: ["AUTH_MODE"],
+    },
+  )
+  // The same refusal as `AUTH_MODE=none`, for the same reason. This process is
+  // built to be internet-reachable — `RECEIVER_PUBLIC_URL` exists precisely so a
+  // third-party participant can call it — and an unauthenticated `/metrics`
+  // publishes a map of what is being tested: every flow, every build, every
+  // participant's failure rate. Catch it at boot, not on the first scrape by
+  // somebody who was not meant to see it.
+  .refine(
+    (env) =>
+      !(
+        env.NODE_ENV === "production" &&
+        env.METRICS_ENABLED &&
+        env.METRICS_TOKEN === undefined
+      ),
+    {
+      message:
+        "METRICS_TOKEN is required when NODE_ENV=production and METRICS_ENABLED " +
+        "is on — set a token, or set METRICS_ENABLED=0 to serve no endpoint at all",
+      path: ["METRICS_TOKEN"],
+    },
+  )
+  // The `METRICS_TOKEN` refusal again, and for a stronger reason. A minted
+  // token is safe on a laptop, where the link and the process live and die
+  // together. In production the process outlives any one link, replicas each
+  // mint their own so a link works only against whichever answered, and what is
+  // behind the token is not a counter but the participant's payloads. Say so at
+  // boot rather than shipping a viewer nobody can open reliably.
+  .refine(
+    (env) =>
+      !(
+        env.NODE_ENV === "production" &&
+        env.UI_ENABLED &&
+        env.UI_TOKEN === undefined
+      ),
+    {
+      message:
+        "UI_TOKEN is required when NODE_ENV=production and UI_ENABLED is on — " +
+        "set a token, or set UI_ENABLED=0 to serve no viewer at all",
+      path: ["UI_TOKEN"],
     },
   );
 

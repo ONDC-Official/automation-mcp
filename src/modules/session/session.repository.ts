@@ -29,6 +29,19 @@ export interface SessionRepository {
    * that no longer resolves is simply a session that has expired.
    */
   listByEndpoint(scope: ExpectationScope): Promise<string[]>;
+  /**
+   * Every session this process knows of, newest first.
+   *
+   * There is no other way to ask. `CacheStore` has no `keys()` or `scan()` —
+   * deliberately, since a Redis `SCAN` across a shared keyspace is the kind of
+   * call that is fine until it is not — and `listByEndpoint` needs a
+   * domain/version/role you do not have when all you were given is "show me
+   * what is running". So this index exists purely to answer the viewer's
+   * landing page, and like the endpoint index it is a list of candidates: ids
+   * only, resolved one by one, and an entry that no longer resolves is simply a
+   * session that has expired.
+   */
+  listRecent(limit: number): Promise<string[]>;
   /** Dependency probe surfaced through `/ready`. */
   ping(): Promise<boolean>;
 }
@@ -40,6 +53,15 @@ export interface SessionRepository {
  * likely to still be running are the ones created most recently.
  */
 export const ENDPOINT_INDEX_LIMIT = 500;
+
+/**
+ * How many sessions the process-wide index remembers.
+ *
+ * Smaller than the per-endpoint index because this one is read to render a
+ * list a human scrolls, not to attribute a call. Trimmed oldest-first, which is
+ * the right end to lose.
+ */
+export const RECENT_INDEX_LIMIT = 200;
 
 export class CacheSessionRepository implements SessionRepository {
   readonly #cache: CacheStore;
@@ -70,6 +92,10 @@ export class CacheSessionRepository implements SessionRepository {
         session.session_id,
         { ttlMs, maxLength: ENDPOINT_INDEX_LIMIT },
       );
+      await this.#cache.listAppend(recentIndexKey(), session.session_id, {
+        ttlMs,
+        maxLength: RECENT_INDEX_LIMIT,
+      });
     }
   }
 
@@ -89,6 +115,14 @@ export class CacheSessionRepository implements SessionRepository {
     ];
   }
 
+  async listRecent(limit: number): Promise<string[]> {
+    const ids = [
+      ...new Set(await this.#cache.listRange<string>(recentIndexKey())),
+    ];
+    // Appended oldest-first, read newest-first: the tail is what a viewer wants.
+    return ids.reverse().slice(0, Math.max(0, limit));
+  }
+
   ping(): Promise<boolean> {
     return this.#cache.ping();
   }
@@ -96,6 +130,17 @@ export class CacheSessionRepository implements SessionRepository {
   #key(sessionId: string): string {
     return cacheKey("session", sessionId);
   }
+}
+
+/**
+ * Every session, in creation order.
+ *
+ * One key rather than one per anything: the question it answers ("what is
+ * running?") has no other axis, and a single bounded list is cheaper than a
+ * scan the store cannot do.
+ */
+export function recentIndexKey(): string {
+  return cacheKey("sessions_recent");
 }
 
 /** Sessions bucketed by the endpoint their callbacks arrive on. */

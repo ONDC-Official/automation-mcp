@@ -1,5 +1,6 @@
 import { request, type Dispatcher } from "undici";
 import type { Logger } from "pino";
+import type { Metrics } from "@/lib/metrics/metrics.js";
 import { parseValidationMessage } from "@/modules/validate/validate.parse.js";
 import {
   UpstreamValidationResponse,
@@ -65,6 +66,8 @@ export interface HttpValidationGatewayOptions {
   logger: Logger;
   /** Shared undici Agent from the container — worth ~80ms per call. */
   dispatcher?: Dispatcher | undefined;
+  /** Optional; absent in unit tests. */
+  metrics?: Metrics | undefined;
 }
 
 /**
@@ -83,17 +86,43 @@ export class HttpValidationGateway implements ValidationGateway {
   readonly #timeoutMs: number;
   readonly #logger: Logger;
   readonly #dispatcher: Dispatcher | undefined;
+  readonly #metrics: Metrics | undefined;
 
   constructor(options: HttpValidationGatewayOptions) {
     this.#baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.#timeoutMs = options.timeoutMs;
     this.#logger = options.logger;
     this.#dispatcher = options.dispatcher;
+    this.#metrics = options.metrics;
   }
 
+  /**
+   * Time the round trip and label it with the verdict it produced.
+   *
+   * Wrapped here rather than in `ValidateService` because this is the only
+   * layer that actually leaves the process — the service's own timing would be
+   * dominated by its cache, and it is the *oracle's* tail that is paid inside
+   * the participant's ACK window.
+   *
+   * A guard rejection (no `transaction_id`, an unusable path segment) never
+   * reaches the wire, so it is deliberately not timed: a sub-microsecond
+   * `unavailable` in the same histogram as a 2s timeout would flatten exactly
+   * the percentile anyone looks at.
+   */
   async validate(input: ValidationRequest): Promise<GatewayResult> {
     const guard = this.#guard(input);
     if (guard !== undefined) return guard;
+
+    const started = performance.now();
+    const result = await this.#call(input);
+    this.#metrics?.validationDuration.observe(
+      { outcome: result.status },
+      (performance.now() - started) / 1_000,
+    );
+    return result;
+  }
+
+  async #call(input: ValidationRequest): Promise<GatewayResult> {
 
     const url =
       `${this.#baseUrl}/${input.domain}/${input.version}/test/${input.action}`;

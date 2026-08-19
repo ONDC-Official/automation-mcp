@@ -86,7 +86,7 @@ export function receiverRoutes(container: Container) {
             .chainNext(chainSession, transactionId)
             .catch((error: unknown) => {
               container.logger.error(
-                { err: error, transactionId },
+                { err: error, transaction_id: transactionId },
                 "auto-advance chain failed",
               );
             });

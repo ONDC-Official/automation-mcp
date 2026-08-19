@@ -52,12 +52,19 @@ import {
 /**
  * Something that watches every journal line as it is written.
  *
- * Exactly one implementation today — `FeedbackService`, which opens an incident
- * from the lines that describe a failure. It is a tap rather than a set of
- * calls scattered through the receiver and the flow service, because the
- * journal is *already* the place every noteworthy thing goes: the guarantee
- * "if the model is told, the corpus is told" holds by construction instead of
- * by remembering.
+ * `FeedbackService` is the first implementation — it opens an incident from the
+ * lines that describe a failure. It is a tap rather than a set of calls
+ * scattered through the receiver and the flow service, because the journal is
+ * *already* the place every noteworthy thing goes: the guarantee "if the model
+ * is told, the corpus is told" holds by construction instead of by
+ * remembering.
+ *
+ * **The seam takes a list, not one observer.** A live-state mirror and a
+ * metrics tap both want the same feed, and they want it on the terms below —
+ * independently. One list with a `try` around each entry is what makes a
+ * mirror that throws cost the corpus nothing, and a corpus that throws cost
+ * the mirror nothing; a single observer forwarding to others would put that
+ * guarantee inside whichever one happened to be registered first.
  *
  * Two obligations on the implementer, neither of which this service enforces:
  *
@@ -100,8 +107,11 @@ export interface RecordServiceOptions {
   /** Lifetime of an armed expectation; this service owns `expireAt`. */
   expectationTtlMs: number;
   logger: Logger;
-  /** Optional; absent in most tests and when feedback reporting is disabled. */
-  observer?: SessionEventObserver;
+  /**
+   * Optional; empty in most tests and when feedback reporting is disabled.
+   * Order is delivery order, and no observer can see another's failure.
+   */
+  observers?: readonly SessionEventObserver[];
 }
 
 export interface CreateTransactionInput {
@@ -259,7 +269,7 @@ export class RecordService {
    */
   readonly #recordLocks = new Map<string, Promise<unknown>>();
 
-  readonly #observer: SessionEventObserver | undefined;
+  readonly #observers: readonly SessionEventObserver[];
 
   constructor(options: RecordServiceOptions) {
     this.#repository = options.repository;
@@ -267,7 +277,7 @@ export class RecordService {
     this.#mockEngine = options.mockEngine;
     this.#expectationTtl = options.expectationTtlMs;
     this.#logger = options.logger;
-    this.#observer = options.observer;
+    this.#observers = options.observers ?? [];
   }
 
   /* ----------------------------- transactions ----------------------------- */
@@ -454,7 +464,7 @@ export class RecordService {
         if (!record || entry?.entryType !== "API") {
           this.#logger.warn(
             {
-              transactionId: input.transactionId,
+              transaction_id: input.transactionId,
               seq: input.seq,
             },
             "could not settle an in-flight entry; it is no longer on the record",
@@ -747,7 +757,7 @@ export class RecordService {
       this.#events.notify(journalKey(sessionId), { seq, kind: "JOURNAL" });
     } catch (error) {
       this.#logger.warn(
-        { err: error, sessionId, kind: entry.kind },
+        { err: error, session_id: sessionId, kind: entry.kind },
         "could not journal a session event; the record itself is unaffected",
       );
     }
@@ -765,25 +775,31 @@ export class RecordService {
   }
 
   /**
-   * Hand the line to the observer, absorbing anything it does wrong.
+   * Hand the line to every observer, absorbing anything each one does wrong.
    *
    * Same contract as `journal` itself, one level down: this runs after the ACK
    * is decided, so an observer that throws must not become a 500 the
    * participant records as our non-compliance.
+   *
+   * The `try` is **inside** the loop, which is the whole reason the seam is a
+   * list. Observers are independent consumers of one feed — the corpus, a live
+   * mirror, metrics — and a shared `try` would let whichever one throws first
+   * silently unsubscribe all the rest, in the order they happen to be wired.
    */
   #notifyObserver(
     sessionId: string,
     event: SessionEvent,
     diagnostics: SessionEventDiagnostics | undefined,
   ): void {
-    if (this.#observer === undefined) return;
-    try {
-      this.#observer.onSessionEvent(sessionId, event, diagnostics);
-    } catch (error) {
-      this.#logger.warn(
-        { err: error, sessionId, kind: event.kind },
-        "a session event observer threw; the journal itself is unaffected",
-      );
+    for (const observer of this.#observers) {
+      try {
+        observer.onSessionEvent(sessionId, event, diagnostics);
+      } catch (error) {
+        this.#logger.warn(
+          { err: error, session_id: sessionId, kind: event.kind },
+          "a session event observer threw; the journal itself is unaffected",
+        );
+      }
     }
   }
 
@@ -823,7 +839,7 @@ export class RecordService {
       // journal problem into a failed `flow_proceed`, which is precisely the
       // inversion this whole mechanism exists to avoid.
       this.#logger.warn(
-        { err: error, sessionId },
+        { err: error, session_id: sessionId },
         "could not drain session events; the tool result carries none",
       );
       return undefined;
@@ -945,7 +961,7 @@ export class RecordService {
         }
       } catch (error) {
         this.#logger.warn(
-          { transactionId, key, path, err: error },
+          { transaction_id: transactionId, key, path, err: error },
           "skipped a save-data key",
         );
       }
@@ -1047,7 +1063,7 @@ export class RecordService {
           {
             scope,
             action: entry.expectedAction,
-            sessionId: entry.sessionId,
+            session_id: entry.sessionId,
             alsoArmed: clash.map((candidate) => candidate.sessionId),
           },
           "another session is already armed for this action on this endpoint",

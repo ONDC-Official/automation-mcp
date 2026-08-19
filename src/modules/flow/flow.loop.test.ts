@@ -19,6 +19,7 @@ import {
   counterpartyContext,
   receiverPath,
 } from "@/test/mock-participant.js";
+import { NoopMirrorSink } from "@/modules/mirror/mirror.sink.js";
 import {
   RUNNABLE_BUILD,
   RUNNABLE_CHAIN_FLOW_ID,
@@ -1951,5 +1952,141 @@ describe("a wait that could never have ended", () => {
     // And the body is kept, because "what did they actually send?" is the only
     // question worth asking next.
     expect(line?.payload_id).toBeDefined();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Metrics                                                                     */
+/* -------------------------------------------------------------------------- */
+
+describe("the exposition after a real run", () => {
+  it("counts both directions and quotes no transaction id", async () => {
+    acceptsAction(agent, NP, "search");
+    acceptsAction(agent, NP, "select");
+    await start();
+    await sendFirstAction();
+    await post("on_search", callbackFor("on_search", CATALOG, 1_000));
+    await container.services.flow.proceed({
+      sessionId,
+      transactionId,
+      inputs: { loan_amount: 50_000 },
+    });
+    await post(
+      "on_select",
+      callbackFor("on_select", { order: { id: "order-1" } }, 3_000),
+    );
+
+    const exposition = await app
+      .inject({ method: "GET", url: "/metrics" })
+      .then((response) => response.body);
+
+    // Outbound comes off the journal via `MetricsObserver`; inbound likewise.
+    // Both are asserted here rather than in a unit test because the wiring —
+    // observer in the list, container passing one registry to everybody — is
+    // the part that can silently come undone.
+    expect(exposition).toMatch(
+      /ondc_outbound_sends_total\{action="search",outcome="ACK"\} 1/,
+    );
+    expect(exposition).toMatch(
+      /ondc_outbound_sends_total\{action="select",outcome="ACK"\} 1/,
+    );
+    expect(exposition).toMatch(
+      /ondc_inbound_calls_total\{action="on_search",ack="ACK",nack_code=""\} 1/,
+    );
+    expect(exposition).toMatch(
+      /ondc_inbound_calls_total\{action="on_select",ack="ACK",nack_code=""\} 1/,
+    );
+    // The ACK window was measured, which is the one thing the journal cannot say.
+    expect(exposition).toContain(
+      'ondc_inbound_duration_seconds_count{action="on_search",ack="ACK"}',
+    );
+
+    /*
+     * The cardinality canary, blunt on purpose.
+     *
+     * A transaction id in the exposition means some label is per-transaction,
+     * and a scrape that grows without bound is the kind of failure that shows
+     * up as an outage in a monitoring system rather than as a failing test.
+     * Asserting on the whole text rather than on a list of label names catches
+     * the instrument nobody remembered to check.
+     */
+    expect(transactionId.length).toBeGreaterThan(0);
+    expect(exposition).not.toContain(transactionId);
+    expect(exposition).not.toContain(sessionId);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The mirror's run tap                                                        */
+/* -------------------------------------------------------------------------- */
+
+describe("a run that opens and immediately blocks", () => {
+  /**
+   * The case the mirror's third tap exists for.
+   *
+   * `flow_start` persists no transaction, so there is no `TRANSACTION_BOUND`;
+   * a blocked dispatch persists nothing either, so there is no `OUTBOUND_SENT`.
+   * This run therefore journals **nothing at all** — and it is the most
+   * interesting shape in a triage corpus, because it is a flow that could not
+   * even open. Without an explicit tap in `FlowService.start` it would be
+   * invisible to a live view.
+   */
+  it("is mirrored as RUN_STARTED and never as TRANSACTION_BOUND", async () => {
+    const search = acceptsAction(agent, NP, "search");
+    const mirror = new NoopMirrorSink();
+
+    const blocked = await createContainer(config, {
+      configServiceGateway: createFakeConfigServiceGateway(),
+      validationGateway: (() => {
+        const gateway = createFakeValidationGateway();
+        gateway.setResult(invalidFrom(L1_MULTI_RULE));
+        return gateway;
+      })(),
+      senderDispatcher: agent,
+      mirrorSink: mirror,
+    });
+
+    try {
+      const created = await blocked.services.session.createSession({
+        subscriber_url: NP,
+        np_type: "BPP",
+        domain: RUNNABLE_BUILD.domain,
+        version: RUNNABLE_BUILD.version,
+        usecase: RUNNABLE_BUILD.usecase,
+      });
+
+      await blocked.services.flow.start({
+        sessionId: created.session.session_id,
+        flowId: RUNNABLE_FLOW_ID,
+        autoAdvance: false,
+      });
+      const outcome = await blocked.services.flow.proceed({
+        sessionId: created.session.session_id,
+        flowId: RUNNABLE_FLOW_ID,
+      });
+
+      expect(outcome).toMatchObject({
+        outcome: "BLOCKED",
+        reason: "validation_failed",
+      });
+      expect(search.seen).toHaveLength(0);
+
+      const kinds = mirror.emitted.map((entry) =>
+        entry.kind === "JOURNAL"
+          ? `JOURNAL(${entry.event?.kind ?? "?"})`
+          : entry.kind,
+      );
+      expect(kinds).toContain("RUN_STARTED");
+      expect(kinds).not.toContain("JOURNAL(TRANSACTION_BOUND)");
+      expect(kinds).not.toContain("JOURNAL(OUTBOUND_SENT)");
+
+      const run = mirror.emitted.find((entry) => entry.kind === "RUN_STARTED");
+      expect(run?.run).toMatchObject({
+        flow_id: RUNNABLE_FLOW_ID,
+        attempt: 1,
+      });
+    } finally {
+      await blocked.dispose();
+    }
   });
 });
