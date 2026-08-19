@@ -5,6 +5,7 @@ import {
   type OAuthTokenVerifier,
 } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { timingSafeEqual } from "node:crypto";
 import type { Config } from "@/config/env.js";
 
 /**
@@ -98,8 +99,44 @@ export function createPermissiveVerifier(): OAuthTokenVerifier {
   };
 }
 
+/**
+ * Static API-key verifier: accepts any token that matches a configured key.
+ *
+ * Keys are compared with `timingSafeEqual` to prevent timing attacks.
+ * `AUTH_API_KEYS` is a comma-separated list; any match grants access.
+ */
+export function createApiKeyVerifier(config: Config): OAuthTokenVerifier {
+  if (config.AUTH_API_KEYS.length === 0) {
+    throw new Error(
+      "API key verifier requires at least one key in AUTH_API_KEYS",
+    );
+  }
+
+  const keys = config.AUTH_API_KEYS.map((k) => Buffer.from(k));
+
+  return {
+    verifyAccessToken(token: string): Promise<AuthInfo> {
+      const buf = Buffer.from(token);
+      const match = keys.some(
+        (k) => k.length === buf.length && timingSafeEqual(k, buf),
+      );
+      if (!match) {
+        throw new OAuthError(OAuthErrorCode.InvalidToken, "Invalid API key");
+      }
+      return Promise.resolve({
+        token,
+        clientId: "apikey-client",
+        scopes: ["mcp"],
+        expiresAt: Math.floor(Date.now() / 1000) + 86400 * 365,
+      });
+    },
+  };
+}
+
 export function createTokenVerifier(
   config: Config,
 ): OAuthTokenVerifier | undefined {
-  return config.AUTH_MODE === "jwt" ? createJwtVerifier(config) : undefined;
+  if (config.AUTH_MODE === "jwt") return createJwtVerifier(config);
+  if (config.AUTH_MODE === "apikey") return createApiKeyVerifier(config);
+  return undefined;
 }
