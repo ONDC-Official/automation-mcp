@@ -248,6 +248,16 @@ export async function createContainer(
         })
       : new InMemoryCacheStore());
 
+  /*
+   * Whether what we just built outlives the process.
+   *
+   * Derived from the store we actually chose rather than from `REDIS_URL`,
+   * because `options.cacheStore` overrides that env var and is in-process in
+   * every caller that uses it. Read by `FeedbackService#drain` alone, to decide
+   * whether shutdown may give a still-open incident a verdict.
+   */
+  const stateSurvivesShutdown = stateStore instanceof RedisCacheStore;
+
   // ---- Derived: the flow catalog -----------------------------------------
   // Always in-process, deliberately. `FlowService.load()` reads a flow's
   // ~330KB mock-runner config on every `flow_proceed` *and* every inbound
@@ -557,6 +567,11 @@ export async function createContainer(
     salt: pseudonymSalt,
     repoRoot: process.cwd(),
     enabled: !config.FEEDBACK_DISABLED,
+    // A fact about the deployment, not a preference: with Redis the session and
+    // its incidents outlive `dispose()`, so shutdown must not call a still-open
+    // incident `UNRESOLVED`. Without it the store dies with us and the run
+    // really has ended, so `drain` reports as it always has.
+    stateSurvivesShutdown,
     // Off by default. On, a report gains exactly one key — `correlation` — and
     // nothing else changes; `feedback.redact.ts` never sees this flag.
     correlation: config.TELEMETRY_CORRELATION,

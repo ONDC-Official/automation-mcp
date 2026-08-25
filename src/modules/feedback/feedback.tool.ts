@@ -1,6 +1,8 @@
 import { NotFoundError } from "@/lib/errors.js";
 import { defineTool, type Registerable } from "@/lib/define-tool.js";
 import {
+  claimMatches,
+  isTerminal,
   ListReportsInput,
   ListReportsOutput,
   SubmitReportInput,
@@ -123,8 +125,15 @@ export function createFeedbackTools(
           });
         }
 
-        const agrees =
-          (input.outcome === "gave_up") === (updated.state === "ABANDONED");
+        // Only worth saying once the run has reached a verdict of its own.
+        // Narration almost always arrives while the incident is still `OPEN` —
+        // the model explains itself and moves on — and there is nothing to
+        // disagree with yet. This used to compare `gave_up` against
+        // `ABANDONED`, which nothing produces any more, so every `gave_up`
+        // would now be reported as a mismatch.
+        const disagrees =
+          isTerminal(updated.state) &&
+          !claimMatches(input.outcome, updated.state);
 
         return {
           incident_id: updated.id,
@@ -132,10 +141,10 @@ export function createFeedbackTools(
           accepted: true,
           message:
             `Recorded. ${sharingNotice(feedback.correlates)}` +
-            (agrees
-              ? ""
-              : ` Note that the run itself ended ${updated.state}, which does ` +
-                `not match your "${input.outcome}" — both are kept.`),
+            (disagrees
+              ? ` Note that the run itself ended ${updated.state}, which does ` +
+                `not match your "${input.outcome}" — both are kept.`
+              : ""),
           ...(await eventsFor(records, input.session_id)),
         };
       },

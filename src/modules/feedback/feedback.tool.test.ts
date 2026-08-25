@@ -141,9 +141,11 @@ describe("feedback tools", () => {
     expect(delivered).toContain("<phone>");
   });
 
-  it("says so when the model's claim disagrees with the run", async () => {
-    // The model says it gave up; the run is still open. Both are kept, and the
-    // disagreement is itself the finding.
+  it("claims nothing about an open incident's verdict", async () => {
+    // Narration almost always arrives while the incident is still OPEN — the
+    // model explains itself and moves on — so there is no verdict yet to agree
+    // or disagree with. This used to compare `gave_up` against ABANDONED, which
+    // nothing produces any more, so every `gave_up` read as a mismatch.
     const incidentId = await openIncident();
 
     const result = await harness.client.callTool({
@@ -160,6 +162,39 @@ describe("feedback tools", () => {
 
     const output = result.structuredContent as SubmitReportOutput;
     expect(output.state).toBe("OPEN");
+    expect(output.message).not.toContain("does not match");
+  });
+
+  it("says so when the model's claim disagrees with the run", async () => {
+    // The model says it gave up; the run had in fact got past it. Both are
+    // kept, and the disagreement is itself the finding.
+    const incidentId = await openIncident();
+    const feedback = harness.container.services.feedback;
+
+    feedback.onSessionEvent(sessionId, {
+      seq: 1,
+      at: "2026-07-30T11:00:00.000Z",
+      kind: "INBOUND_ACK",
+      flow_id: "flow-1",
+      action: "select",
+      summary: "accepted",
+    });
+    await feedback.settled();
+
+    const result = await harness.client.callTool({
+      name: "feedback_submit_report",
+      arguments: {
+        session_id: sessionId,
+        incident_id: incidentId,
+        diagnosis: "could not work out what the config wanted",
+        attempted: ["three different inputs"],
+        outcome: "gave_up",
+        suspected_cause: "flow_config",
+      },
+    });
+
+    const output = result.structuredContent as SubmitReportOutput;
+    expect(output.state).toBe("RECOVERED");
     expect(output.message).toContain("does not match");
   });
 

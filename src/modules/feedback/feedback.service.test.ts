@@ -24,7 +24,11 @@ interface Harness {
 }
 
 function harness(
-  overrides: { enabled?: boolean; journal?: () => Promise<void> } = {},
+  overrides: {
+    enabled?: boolean;
+    journal?: () => Promise<void>;
+    stateSurvivesShutdown?: boolean;
+  } = {},
 ): Harness {
   const cache = new InMemoryCacheStore();
   const repository = new FeedbackRepository({ cache, sessionTtlMs: 60_000 });
@@ -49,6 +53,9 @@ function harness(
     },
     salt: "test-salt",
     enabled: overrides.enabled ?? true,
+    ...(overrides.stateSurvivesShutdown !== undefined
+      ? { stateSurvivesShutdown: overrides.stateSurvivesShutdown }
+      : {}),
     logger: logger.child({ silent: true }),
   });
 
@@ -197,17 +204,49 @@ describe("FeedbackService — resolution is derived, never claimed", () => {
     expect((await h.feedback.list(SESSION))[0]?.state).toBe("OPEN");
   });
 
-  it("marks ABANDONED on flow_restart — the give-up signal", async () => {
+  it("leaves everything open on flow_restart, and reports nothing", async () => {
+    // `flow_restart` is the sanctioned retry — the prompt tells the model to
+    // reach for it rather than `session_create` — so it is not a verdict on
+    // anything. It used to sweep the backlog into ABANDONED, which is terminal
+    // and therefore flushed every one of them unnarrated.
     const h = harness();
     await openOn(h, "select");
 
     h.feedback.onSessionEvent(SESSION, event({ kind: "FLOW_RESTARTED" }));
     await h.settle();
 
-    const abandoned = (await h.feedback.list(SESSION)).filter(
-      (incident) => incident.trigger === "INBOUND_NACK",
+    const incidents = await h.feedback.list(SESSION);
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]?.state).toBe("OPEN");
+    expect(incidents[0]?.trigger).toBe("INBOUND_NACK");
+    expect(h.sink.delivered).toHaveLength(0);
+  });
+
+  it("counts a wall hit again after a restart, instead of sticking", async () => {
+    // The story the old sweep destroyed. ABANDONED is sticky — `#note` re-opens
+    // only the recovered states — so attempt 2 hitting the same wall left the
+    // incident ABANDONED with `flushed_at` already set, and the real verdict
+    // could never ship.
+    const h = harness();
+    await openOn(h, "select");
+    h.feedback.onSessionEvent(SESSION, event({ kind: "FLOW_RESTARTED" }));
+    await h.settle();
+
+    await openOn(h, "select");
+
+    const [incident] = await h.feedback.list(SESSION);
+    expect(incident?.occurrences).toBe(2);
+    expect(incident?.state).toBe("OPEN");
+
+    h.feedback.onSessionEvent(
+      SESSION,
+      event({ kind: "INBOUND_ACK", action: "select", nack_code: undefined }),
     );
-    expect(abandoned[0]?.state).toBe("ABANDONED");
+    await h.settle();
+
+    expect((await h.feedback.list(SESSION))[0]?.state).toBe("RECOVERED");
+    expect(h.sink.delivered).toHaveLength(1);
+    expect(h.sink.delivered[0]?.incident.state).toBe("RECOVERED");
   });
 
   it("marks everything still open RECOVERED when the flow completes", async () => {
@@ -314,6 +353,55 @@ describe("FeedbackService — the report ships either way", () => {
     expect(h.sink.delivered).toHaveLength(1);
     expect(h.sink.delivered[0]?.narration).toBeNull();
     expect(h.sink.delivered[0]?.incident.state).toBe("UNRESOLVED");
+  });
+
+  it("defers a still-open incident when the store outlives the process", async () => {
+    // `drain` runs on every `dispose()`, including the `tsx watch` reload that
+    // fires on each file save. With Redis the session, the binding and this
+    // incident are all still there afterwards and the run carries on, so
+    // UNRESOLVED would be a verdict it never reached — and `flushed_at` would
+    // stop the true one ever shipping.
+    const h = harness({ stateSurvivesShutdown: true });
+    h.feedback.onSessionEvent(SESSION, event({ action: "select" }));
+    await h.settle();
+
+    await h.feedback.drain();
+
+    expect(h.sink.delivered).toHaveLength(0);
+    const [incident] = await h.feedback.list(SESSION);
+    expect(incident?.state).toBe("OPEN");
+    expect(incident?.flushed_at).toBeUndefined();
+  });
+
+  it("still gives a resolved-but-unsent incident its last push", async () => {
+    // Only the *open* ones are deferred. Anything that reached a verdict and
+    // failed to deliver is exactly what the final drain is for.
+    const failing = { delivered: [] as unknown[], calls: 0 };
+    const h = harness({ stateSurvivesShutdown: true });
+    const sink = h.sink as unknown as {
+      deliver: (report: unknown) => Promise<void>;
+    };
+    const real = sink.deliver.bind(sink);
+    sink.deliver = async (report: unknown): Promise<void> => {
+      failing.calls += 1;
+      if (failing.calls === 1) throw new Error("ingest down");
+      await real(report);
+    };
+
+    h.feedback.onSessionEvent(SESSION, event({ action: "select" }));
+    await h.settle();
+    h.feedback.onSessionEvent(
+      SESSION,
+      event({ kind: "INBOUND_ACK", action: "select", nack_code: undefined }),
+    );
+    await h.settle();
+
+    expect(h.sink.delivered).toHaveLength(0);
+
+    await h.feedback.drain();
+
+    expect(h.sink.delivered).toHaveLength(1);
+    expect(h.sink.delivered[0]?.incident.state).toBe("RECOVERED");
   });
 
   it("delivers on resolution, without waiting for shutdown", async () => {

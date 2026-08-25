@@ -46,8 +46,16 @@ import { ValidationFinding } from "@/modules/validate/validate.schema.js";
  * | `VALIDATION_UNAVAILABLE` | no verdict was reached and both gates failed open             |
  * | `CONFIG_DEFECT`          | the flow's own config did something it should not             |
  * | `AWAIT_TIMEOUT`          | a bounded wait lapsed with the run still on the same step     |
- * | `RUN_ABANDONED`          | `flow_restart` — the loudest "could not fix it" in the system |
+ * | `RUN_ABANDONED`          | **retired.** Nothing emits it — see below                     |
  * | `INFRA_ERROR`            | one of ours: a store blip, a check that threw, a sweep that failed |
+ *
+ * `RUN_ABANDONED` was opened on every `flow_restart`, on the reading that a
+ * restart is a give-up. It is not — it is the retry the prompt, the tool
+ * description and the dashboard's own run-status map all say it is, and the
+ * incident it produced held nothing but the restart's own summary line. It is
+ * kept in the enum, unemitted, because the corpus already holds rows carrying it
+ * and the dashboard orders its facets from this list; `CONFIG_DEFECT` and
+ * `AWAIT_TIMEOUT` are declared and never emitted for their own reasons.
  */
 export const TriggerKind = z.enum([
   "BLOCKED",
@@ -86,9 +94,24 @@ export const IncidentState = z.enum([
    * actually actionable — an upstream config someone else has to repair.
    */
   "RECOVERED_WITH_OVERRIDE",
-  /** `flow_restart`, or the flow finished with this step still not done. */
+  /**
+   * **Retired.** Nothing produces this.
+   *
+   * It was set by `flow_restart`, which turned the sanctioned retry into a
+   * verdict — and a sticky one, since `#note` re-opens only the recovered
+   * states. Kept in the enum for the rows already in the corpus, and because a
+   * narration of `gave_up` still matches it. The second half of its old
+   * description — "or the flow finished with this step still not done" — was
+   * never implemented: `FLOW_COMPLETE` maps to `RECOVERED`.
+   */
   "ABANDONED",
-  /** The session ended, or was disposed, with the run still parked. */
+  /**
+   * The run ended with nothing left that could resolve it.
+   *
+   * Set by `drain()` at shutdown. Not every shutdown: where the state store
+   * outlives the process the run may well carry on, so its incidents are left
+   * `OPEN` rather than given a verdict they never reached.
+   */
   "UNRESOLVED",
 ]);
 export type IncidentState = z.infer<typeof IncidentState>;
@@ -478,4 +501,32 @@ export function isTerminal(state: IncidentState): boolean {
  */
 export function isRecovered(state: IncidentState): boolean {
   return state === "RECOVERED" || state === "RECOVERED_WITH_OVERRIDE";
+}
+
+/**
+ * Whether the model's claim about an incident matches what the run actually did.
+ *
+ * The two vocabularies are deliberately separate — `NarrationOutcome` is
+ * believed, `IncidentState` is derived — so the mapping between them belongs
+ * here, beside both, rather than inline at the one call site that compares them.
+ *
+ * `gave_up` accepts `ABANDONED` as well as `UNRESOLVED`: nothing produces the
+ * former any more, but incidents carrying it predate the change.
+ *
+ * Callers must not ask this of an `OPEN` incident. The run has not reached a
+ * verdict, so there is nothing yet to agree or disagree with — and narration
+ * almost always arrives while the incident is still open.
+ */
+export function claimMatches(
+  outcome: NarrationOutcome,
+  state: IncidentState,
+): boolean {
+  switch (outcome) {
+    case "fixed":
+      return state === "RECOVERED";
+    case "worked_around":
+      return state === "RECOVERED_WITH_OVERRIDE";
+    case "gave_up":
+      return state === "UNRESOLVED" || state === "ABANDONED";
+  }
 }

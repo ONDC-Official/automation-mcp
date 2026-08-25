@@ -342,12 +342,6 @@ describe("detectFromEvent — every NACK code lands", () => {
     expect(candidate?.code).toBe("TRANSACTION_MISMATCH");
   });
 
-  it("reports a restart as the give-up signal it is", () => {
-    const candidate = detectFromEvent(event({ kind: "FLOW_RESTARTED" }));
-
-    expect(candidate?.trigger).toBe("RUN_ABANDONED");
-    expect(candidate?.code).toBe("flow_restart");
-  });
 });
 
 describe("detectFromEvent — what it deliberately ignores", () => {
@@ -361,6 +355,14 @@ describe("detectFromEvent — what it deliberately ignores", () => {
     "EXPECTATION_REARMED",
   ] as const)("says nothing about %s", (kind) => {
     expect(detectFromEvent(event({ kind }))).toBeUndefined();
+  });
+
+  it("says nothing about a restart — it is a retry, not a failure", () => {
+    // `flow_restart` is what the prompt tells the model to reach for to try a
+    // run again, so the line describes an intent to retry. It used to open a
+    // `RUN_ABANDONED` incident holding nothing but this summary, which nothing
+    // could ever resolve. The failure being retried has its own incident.
+    expect(detectFromEvent(event({ kind: "FLOW_RESTARTED" }))).toBeUndefined();
   });
 
   it("never opens an incident from its own ISSUE_OPEN line", () => {

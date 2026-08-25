@@ -32,6 +32,21 @@ import type { SessionEventDiagnostics } from "@/modules/record/record.service.js
  * Getting that wrong does not lose data — it double-counts it, which is worse:
  * `occurrences` is the field that says how hard a model fought something.
  *
+ * ## A restart is not a failure
+ *
+ * `FLOW_RESTARTED` used to open a `RUN_ABANDONED` incident, on the reading that
+ * reaching for `flow_restart` is the loudest give-up signal in the system. That
+ * reading was wrong, and everything else already said so: the prompt tells the
+ * model *"to try a run again, call `flow_restart` — never `session_create`"*
+ * (`flow.prompt.ts`), the tool describes itself as *"use it when a run has gone
+ * wrong and you want another go"*, and the dashboard's ingest maps the same
+ * journal line to the run status `restarted`, not `abandoned`.
+ *
+ * So the line describes an *intent to try again*, and the incident it opened had
+ * nothing in it but the restart's own summary — no step, no stack, no findings,
+ * no NACK — and nothing that could ever resolve it. The failure the model is
+ * retrying after already has an incident of its own, with the evidence.
+ *
  * The same rule binds *within* `detectFromOutcome`: the outbound gate and
  * `dry_run` describe one defect through two different outcome shapes, so a
  * findings-bearing `BLOCKED` is normalised onto `VALIDATION_FINDINGS` to give
@@ -47,8 +62,13 @@ export interface Candidate {
   readonly evidence: IncidentEvidence;
 }
 
-/** Journal kinds that describe a failure this session owns. */
-const FAILING_KINDS = new Set(["INBOUND_NACK", "ATTENTION", "FLOW_RESTARTED"]);
+/**
+ * Journal kinds that describe a failure this session owns.
+ *
+ * `FLOW_RESTARTED` is deliberately absent — see "A restart is not a failure"
+ * above.
+ */
+const FAILING_KINDS = new Set(["INBOUND_NACK", "ATTENTION"]);
 
 function pick(value: unknown, key: string): unknown {
   return typeof value === "object" && value !== null
@@ -337,15 +357,6 @@ export function detectFromEvent(
   }
 
   if (!FAILING_KINDS.has(event.kind)) return undefined;
-
-  if (event.kind === "FLOW_RESTARTED") {
-    return {
-      trigger: "RUN_ABANDONED",
-      code: "flow_restart",
-      ...base,
-      evidence: { message: event.summary, ...evidence },
-    };
-  }
 
   return {
     trigger: "INBOUND_NACK",

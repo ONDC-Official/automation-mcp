@@ -92,6 +92,15 @@ export interface FeedbackServiceOptions {
   /** False under `FEEDBACK_DISABLED`: capture stops at the front door. */
   enabled: boolean;
   /**
+   * Whether the state store outlives this process — `REDIS_URL` is set.
+   *
+   * Read only by `drain`, and it decides whether shutdown is allowed to mint a
+   * verdict. See the comment there; the short version is that a `tsx watch`
+   * reload is not a run ending, and saying it is both files a finding nobody
+   * made and sets `flushed_at`, which stops the real verdict ever shipping.
+   */
+  stateSurvivesShutdown?: boolean;
+  /**
    * `TELEMETRY_CORRELATION`: attach clear `session_id` / `transaction_id` to a
    * report, under one key and nowhere else.
    *
@@ -138,11 +147,27 @@ function resolutionFor(
   if (event.kind === "FLOW_COMPLETE") {
     return { state: "RECOVERED", scope: "flow" };
   }
-  // The loudest give-up signal in the system. Whatever was open when the model
-  // reached for `flow_restart` is precisely what it could not fix.
-  if (event.kind === "FLOW_RESTARTED") {
-    return { state: "ABANDONED", scope: "flow" };
-  }
+  /*
+   * `FLOW_RESTARTED` resolves nothing, and used to resolve everything.
+   *
+   * It was read as the loudest give-up signal in the system — whatever was open
+   * when the model reached for `flow_restart` being precisely what it could not
+   * fix. But `flow_restart` is the *sanctioned retry*: the prompt says "to try a
+   * run again, call `flow_restart` — never `session_create`", the tool says "use
+   * it when a run has gone wrong and you want another go", and the dashboard's
+   * ingest maps this very line to the run status `restarted`.
+   *
+   * So a routine retry swept the whole backlog into `ABANDONED`, which is
+   * terminal, which flushed every one of them unnarrated. Worse, it destroyed
+   * the better story: `ABANDONED` is sticky — `#note` re-opens only the
+   * recovered states — so attempt 2 hitting the same wall left the incident
+   * `ABANDONED` with `flushed_at` already set, and the real verdict could never
+   * ship. A run that fought one wall twice and then got past it was filed as
+   * "abandoned here; nobody got past it".
+   *
+   * Left open, the existing rules do the right thing on their own: a repeat
+   * increments `occurrences`, and getting past the step resolves it `RECOVERED`.
+   */
   if (event.kind === "INBOUND_ACK") {
     return { state: "RECOVERED", scope: "action" };
   }
@@ -191,6 +216,7 @@ export class FeedbackService implements SessionEventObserver {
   readonly #salt: string;
   readonly #repoRoot: string | undefined;
   readonly #enabled: boolean;
+  readonly #stateSurvivesShutdown: boolean;
   readonly #correlation: boolean;
   readonly #logger: Logger;
   readonly #metrics: Metrics | undefined;
@@ -241,6 +267,7 @@ export class FeedbackService implements SessionEventObserver {
     this.#salt = options.salt;
     this.#repoRoot = options.repoRoot;
     this.#enabled = options.enabled;
+    this.#stateSurvivesShutdown = options.stateSurvivesShutdown ?? false;
     this.#correlation = options.correlation ?? false;
     this.#logger = options.logger;
     this.#metrics = options.metrics;
@@ -747,11 +774,30 @@ export class FeedbackService implements SessionEventObserver {
    * Wait for scheduled capture to finish, then report what never resolved.
    *
    * This is where the guarantee is actually kept. A run that ends still stuck —
-   * the model gave up, the client disconnected, the process is going down — has
-   * no terminal event to trigger on, and without this its incident would sit in
-   * the store until the session TTL swept it away. **An incident nobody
-   * narrated still ships**, with `narration: null`; that is the difference
-   * between "reports every time" and "reports whenever the model remembered".
+   * the model gave up, the client disconnected — has no terminal event to
+   * trigger on, and without this its incident would sit in the store until the
+   * session TTL swept it away. **An incident nobody narrated still ships**, with
+   * `narration: null`; that is the difference between "reports every time" and
+   * "reports whenever the model remembered".
+   *
+   * ## Except where the process going down is not the run ending
+   *
+   * `drain` has exactly one production caller, `container.dispose()`, so every
+   * shutdown reached this code — including the `tsx watch` reload that fires on
+   * every file save. Where the store outlives us (`stateSurvivesShutdown`,
+   * i.e. `REDIS_URL` is set), the session, the binding and the incident are all
+   * still there afterwards and the run carries on. Calling that `UNRESOLVED` is
+   * a verdict the run never reached, and it is worse than merely wrong: it sets
+   * `flushed_at`, so when the run *does* recover, the true verdict can never
+   * ship.
+   *
+   * So a still-`OPEN` incident is deferred rather than judged. It ships later if
+   * the failure recurs — `#note` puts the session back in `#touched` — and
+   * otherwise expires with the session. An interrupted run is not a finding.
+   *
+   * Nothing is deferred when the store is in-process, which is the default and
+   * every test: there the run really does end with us, and deferring would lose
+   * the incident outright.
    */
   async drain(): Promise<void> {
     await this.settled();
@@ -759,6 +805,7 @@ export class FeedbackService implements SessionEventObserver {
     for (const sessionId of this.#touched) {
       for (const incident of await this.list(sessionId)) {
         if (incident.flushed_at !== undefined) continue;
+        if (incident.state === "OPEN" && this.#stateSurvivesShutdown) continue;
         const closed: Incident =
           incident.state === "OPEN"
             ? {
