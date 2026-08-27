@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
 import { z } from "zod";
 import type { Config } from "@/config/env.js";
+import { resolveFeatures } from "@/config/features.js";
 import type { Container } from "@/container.js";
 import { isAppError } from "@/lib/errors.js";
 import { journalKey } from "@/modules/record/record.repository.js";
@@ -94,7 +95,7 @@ export function addPrivateNetworkPreflight(
   app: PreflightHost,
   config: Config,
 ): void {
-  if (!config.UI_ENABLED) return;
+  if (!resolveFeatures(config).enabled("ui")) return;
 
   app.addHook("onRequest", async (request, reply) => {
     if (
@@ -143,7 +144,7 @@ export function uiRoutes(container: Container) {
   const { config, logger } = container;
 
   return async function register(app: FastifyInstance): Promise<void> {
-    if (!config.UI_ENABLED) return;
+    if (!resolveFeatures(config).enabled("ui")) return;
 
     const ui = container.ui;
     const token = container.uiToken;

@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
+import { resolveFeatures } from "@/config/features.js";
 import type { Container } from "@/container.js";
 
 /**
@@ -38,7 +39,7 @@ export function metricsRoutes(container: Container) {
   const { config, metrics } = container;
 
   return async function register(app: FastifyInstance): Promise<void> {
-    if (!config.METRICS_ENABLED) return;
+    if (!resolveFeatures(config).enabled("metrics")) return;
 
     const token = config.METRICS_TOKEN;
 

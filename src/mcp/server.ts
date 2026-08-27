@@ -3,6 +3,7 @@ import {
   type McpRequestContext,
   type McpServerFactory,
 } from "@modelcontextprotocol/server";
+import { resolveFeatures } from "@/config/features.js";
 import type { Container } from "@/container.js";
 import { registerCapabilities } from "@/mcp/capabilities.js";
 
@@ -28,7 +29,17 @@ import { registerCapabilities } from "@/mcp/capabilities.js";
 const SERVER_NAME = "ondc-mcp";
 const SERVER_VERSION = "0.1.0";
 
-const INSTRUCTIONS = [
+/**
+ * The model-facing preamble.
+ *
+ * Built from the enabled module set rather than written as one constant,
+ * because a narrow `PROFILE` must not leave the server telling a model to call
+ * a tool it never registered. The persona is always true; the sentences that
+ * name specific tools travel with the module that provides them.
+ */
+function instructionsFor(container: Container): string {
+  const features = resolveFeatures(container.config);
+  const lines = [
   "This server makes you a mock ONDC network participant.",
   "You test a real participant by behaving as its counterparty: if it is a BAP",
   "(buyer app) you act as the BPP (seller app), and vice versa. The inversion is",
@@ -38,13 +49,28 @@ const INSTRUCTIONS = [
   "is a BAP or a BPP, and the domain, version and use-case under test. Call",
   "catalog_list_builds first if any of those values are uncertain; use-case names",
   "are case- and space-sensitive. session_create returns the flows you can drive.",
-  "",
-  "Then catalog_describe_flow to see one flow's sequence. Every step is tagged",
-  "with an actor: 'mock' means you must produce it, 'np' means you wait for the",
-  "participant to send it.",
-  "",
-  "A failed call returns an error result rather than throwing — read it and adapt.",
-].join(" ");
+  ];
+  if (features.enabled("catalog")) {
+    lines.push(
+      "",
+      "Then catalog_describe_flow to see one flow's sequence. Every step is tagged",
+      "with an actor: 'mock' means you must produce it, 'np' means you wait for the",
+      "participant to send it.",
+    );
+  }
+  if (features.enabled("feedback")) {
+    lines.push(
+      "",
+      "When a run gets stuck, feedback_submit_report records what happened — the",
+      "tooling_gap field is the one that improves this tool surface.",
+    );
+  }
+  lines.push(
+    "",
+    "A failed call returns an error result rather than throwing — read it and adapt.",
+  );
+  return lines.join(" ");
+}
 
 export function buildMcpServer(
   container: Container,
@@ -54,7 +80,7 @@ export function buildMcpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
       capabilities: { tools: {}, resources: {}, prompts: {} },
-      instructions: INSTRUCTIONS,
+      instructions: instructionsFor(container),
       // Revision 2026-07-28 cache hints. Without these the SDK emits
       // `ttlMs: 0, cacheScope: "private"` and every client re-fetches the
       // tool list on each call. The listings below change only on deploy.

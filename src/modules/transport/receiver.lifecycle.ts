@@ -5,6 +5,7 @@ import {
   validatorCompiler,
 } from "fastify-type-provider-zod";
 import type { Logger } from "pino";
+import { resolveFeatures } from "@/config/features.js";
 import type { Container } from "@/container.js";
 import { UpstreamError } from "@/lib/errors.js";
 import { formsRoutes } from "@/modules/forms/forms.routes.js";
@@ -191,7 +192,7 @@ async function buildStandalone(container: Container, requestTimeoutMs: number) {
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
 
-  if (container.config.UI_ENABLED) {
+  if (resolveFeatures(container.config).enabled("ui")) {
     addPrivateNetworkPreflight(app, container.config);
 
     const uiOrigins = uiCorsOrigins(container.config);

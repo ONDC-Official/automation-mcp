@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Agent } from "undici";
 import type { Logger } from "pino";
 import type { Config } from "@/config/env.js";
+import { resolveFeatures } from "@/config/features.js";
 import type { CacheStore } from "@/lib/cache/cache-store.js";
 import { InMemoryCacheStore } from "@/lib/cache/in-memory-cache-store.js";
 import { RedisCacheStore } from "@/lib/cache/redis-cache-store.js";
@@ -218,6 +219,21 @@ export async function createContainer(
 ): Promise<Container> {
   const logger = options.logger ?? rootLogger;
 
+  /*
+   * Which modules this process runs. Read once, here, and consulted by the
+   * three places that used to each check their own flag — the MCP capability
+   * list, the HTTP route factories, and the observer taps below.
+   *
+   * Said out loud at boot beside the mirror and feedback lines, and for the
+   * same reason: an operator should not have to read a README to find out
+   * what is running.
+   */
+  const features = resolveFeatures(config);
+  logger.info(
+    { profile: features.profile, modules: features.names },
+    `modules: ${features.names.join(", ")}`,
+  );
+
   // One registry per container, never prom-client's process-wide default —
   // `lib/metrics/metrics.ts` explains what breaks otherwise, and it breaks in
   // the test suite rather than in production, which is the worse direction.
@@ -346,7 +362,7 @@ export async function createContainer(
   ).replace(/\/+$/, "");
 
   const uiToken = createViewerToken(config.UI_TOKEN);
-  if (config.UI_ENABLED && !uiToken.configured) {
+  if (features.enabled("ui") && !uiToken.configured) {
     // Said out loud because the token is otherwise invisible: it exists only
     // inside the links `session_create` hands out, so an operator who restarts
     // this process needs to know why yesterday's link stopped working.
@@ -375,7 +391,7 @@ export async function createContainer(
   );
   const uiBaseUrl = config.UI_BASE_URL.replace(/\/+$/, "");
   const viewerUrl = (sessionId: string): string | undefined => {
-    if (!config.UI_ENABLED) return undefined;
+    if (!features.enabled("ui")) return undefined;
     const params = new URLSearchParams({
       engine: uiEngineUrl,
       session: sessionId,
@@ -407,7 +423,9 @@ export async function createContainer(
    */
   const mirrorSink: MirrorSink =
     options.mirrorSink ??
-    (config.MIRROR_ENDPOINT_URL === undefined || config.NODE_ENV === "test"
+    (config.MIRROR_ENDPOINT_URL === undefined ||
+    !features.enabled("mirror") ||
+    config.NODE_ENV === "test"
       ? new NoopMirrorSink()
       : new BufferedHttpMirrorSink({
           endpoint: config.MIRROR_ENDPOINT_URL,
@@ -438,8 +456,12 @@ export async function createContainer(
   // Said out loud at boot, beside the feedback line and for the same reason:
   // something that ships diagnostics off the machine owes the operator a
   // printed statement of where they go, not a line in a README.
-  if (config.MIRROR_ENDPOINT_URL === undefined) {
-    logger.info("mirror: off (no MIRROR_ENDPOINT_URL)");
+  if (!features.enabled("mirror")) {
+    logger.info(
+      config.MIRROR_ENDPOINT_URL === undefined
+        ? "mirror: off (no MIRROR_ENDPOINT_URL)"
+        : `mirror: off (not in profile "${features.profile}")`,
+    );
   } else {
     logger.info(
       { endpoint: config.MIRROR_ENDPOINT_URL },
@@ -501,7 +523,7 @@ export async function createContainer(
   // that builds a container directly.
   const feedbackSink =
     options.feedbackSink ??
-    (config.FEEDBACK_DISABLED || config.NODE_ENV === "test"
+    (!features.enabled("feedback") || config.NODE_ENV === "test"
       ? new NoopSink()
       : new SpoolAndUploadSink({
           spool: new SpoolSink({
@@ -530,8 +552,12 @@ export async function createContainer(
   // Said out loud, once, at boot. Something that ships diagnostics off the
   // machine by default owes the operator a plain statement of where they go and
   // how to stop it — buried in a README is not the same as printed on start.
-  if (config.FEEDBACK_DISABLED) {
-    logger.info("feedback: disabled (FEEDBACK_DISABLED)");
+  if (!features.enabled("feedback")) {
+    logger.info(
+      config.FEEDBACK_DISABLED
+        ? "feedback: disabled (FEEDBACK_DISABLED)"
+        : `feedback: disabled (not in profile "${features.profile}")`,
+    );
   } else {
     logger.info(
       {
@@ -566,7 +592,7 @@ export async function createContainer(
     // mirror record name the same participant.
     salt: pseudonymSalt,
     repoRoot: process.cwd(),
-    enabled: !config.FEEDBACK_DISABLED,
+    enabled: features.enabled("feedback"),
     // A fact about the deployment, not a preference: with Redis the session and
     // its incidents outlive `dispose()`, so shutdown must not call a still-open
     // incident `UNRESOLVED`. Without it the store dies with us and the run
@@ -589,7 +615,15 @@ export async function createContainer(
     // metrics tap counts; the mirror streams. `RecordService` catches per
     // observer, so none can silence the others — which is the whole reason this
     // is a list.
-    observers: [feedback, new MetricsObserver(metrics), mirror],
+    // Independent consumers of one feed. The corpus opens incidents; the
+    // metrics tap counts; the mirror streams. `RecordService` catches per
+    // observer, so none can silence the others — which is the whole reason
+    // this is a list. A module the profile switched off is simply not in it.
+    observers: [
+      feedback,
+      ...(features.enabled("metrics") ? [new MetricsObserver(metrics)] : []),
+      mirror,
+    ],
   });
 
   // Protocol validation. The gateway shares the process-wide agent because the

@@ -1,4 +1,10 @@
 import { z } from "zod";
+import {
+  describeConflict,
+  MODULE_NAMES,
+  selectedModules,
+  unknownModules,
+} from "@/config/features.js";
 
 /**
  * The single place in the codebase that reads `process.env`.
@@ -407,6 +413,63 @@ const EnvSchema = z
      * longer risks a stale one catching an unrelated call.
      */
     EXPECTATION_TTL_MS: z.coerce.number().int().positive().default(300_000),
+
+    /* ---- Which modules run (see config/features.ts) ---------------------- */
+
+    /**
+     * Which set of modules this process runs.
+     *
+     * `full` is every module and is byte-identical to the behaviour before
+     * this setting existed. `driver` drops the viewer, the corpus and the
+     * mirror; `minimal` drops metrics too, leaving the loop and nothing else.
+     */
+    PROFILE: z.enum(["full", "driver", "minimal"]).default("full"),
+
+    /** Removed from whatever `PROFILE` grants. */
+    MODULES_DISABLED: csv.default([]),
+
+    /**
+     * Added on top, so a profile can be nudged without respelling it.
+     *
+     * Applied after `MODULES_DISABLED`, and it cannot switch on a module whose
+     * own flag is off — the profile only ever *narrows* what the existing
+     * switches already allow.
+     */
+    MODULES_ENABLED: csv.default([]),
+  })
+  /*
+   * Two module-list refusals, in one pass so each can report what is actually
+   * wrong rather than "invalid".
+   *
+   * A name that is not a module is a typo with **no symptom** — the module
+   * silently stays on, or silently never comes off. A profile that drops
+   * something an enabled module needs is a half-wired process. Both refuse to
+   * boot, the same posture as the `AUTH_MODE=none`-in-production and
+   * `METRICS_TOKEN` refusals below.
+   */
+  .superRefine((env, ctx) => {
+    const unknown = unknownModules([
+      ...env.MODULES_DISABLED,
+      ...env.MODULES_ENABLED,
+    ]);
+    if (unknown.length > 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["MODULES_DISABLED"],
+        message:
+          `unknown module name(s): ${unknown.join(", ")}. ` +
+          `Known modules: ${MODULE_NAMES.join(", ")}`,
+      });
+      return;
+    }
+    const conflict = describeConflict(selectedModules(env));
+    if (conflict !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["MODULES_DISABLED"],
+        message: conflict,
+      });
+    }
   })
   // `jwt` mode is useless without somewhere to fetch keys and something to
   // check them against. Catch it at boot, not on the first 401.

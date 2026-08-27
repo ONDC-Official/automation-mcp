@@ -328,8 +328,8 @@ of two moments:
 
 | First action is | Where the id comes from                                                                          | Bind site                                                                  |
 | --------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
-| ours to send    | `context.transaction_id` on the **generated** payload, read back after `generate`, before `send` | `flow.service.ts#bindOutbound`                                             |
-| theirs to send  | `context.transaction_id` on their call, adopted verbatim                                         | `flow.service.ts#adoptTransaction`, from the receiver's expectation branch |
+| ours to send    | `context.transaction_id` on the **generated** payload, read back after `generate`, before `send` | `flow.identity.ts#bindOutbound`                                             |
+| theirs to send  | `context.transaction_id` on their call, adopted verbatim                                         | `flow.identity.ts#adoptTransaction`, from the receiver's expectation branch |
 
 This is the workbench's own shape (`startNewFlowController` writes nothing to
 cache; the transaction is created once a payload has crossed). Minting an id up
@@ -1035,8 +1035,8 @@ saying so, defaulting it on would have meant silent traffic.
 Two trigger sites:
 
 1. **The receiver**, after the ACK is on the wire (`InboundResult.chain` →
-   `setImmediate` → `FlowService#chainNext`).
-2. **`FlowService#scheduleChain`**, after any `SENT` that was not itself chained.
+   `setImmediate` → `flow.chain.ts#chainNext`).
+2. **`flow.chain.ts#scheduleChain`**, after any `SENT` that was not itself chained.
    Without it, a run whose next two steps are both ours stopped dead after the
    first. Scheduled, never awaited — the outcome is already the caller's answer,
    and holding the tool result open would make one `flow_proceed` take as long as
@@ -1295,7 +1295,7 @@ One storage interface (`src/lib/cache/cache-store.ts`), two implementations
 answering `undefined`, because `undefined` means "no such session" and a model
 responds to that by starting a **second transaction on a real participant's
 wire**. Any `catch` around a store read must name the error it swallows
-(`receiver.service.ts#loadSession` is the pattern); a bare `catch {}` there turns
+(`receiver.attribute.ts#loadSession` is the pattern); a bare `catch {}` there turns
 our outage into their recorded non-compliance.
 
 ### The atomic family

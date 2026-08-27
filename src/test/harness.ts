@@ -44,10 +44,24 @@ export function resourceText(result: {
   throw new Error("expected a text resource content block");
 }
 
+/**
+ * Container overrides, plus raw environment for the settings a container
+ * cannot be handed — `PROFILE` and the module lists are read by `parseConfig`,
+ * not injected, because refusing a contradictory profile is a *boot* property.
+ */
+export interface HarnessOptions extends CreateContainerOptions {
+  env?: Record<string, string>;
+}
+
 export async function createHarness(
-  options: CreateContainerOptions = {},
+  options: HarnessOptions = {},
 ): Promise<Harness> {
-  const config = parseConfig({ NODE_ENV: "test", LOG_LEVEL: "silent" });
+  const { env, ...containerOptions } = options;
+  const config = parseConfig({
+    NODE_ENV: "test",
+    LOG_LEVEL: "silent",
+    ...env,
+  });
   const container = await createContainer(config, {
     configServiceGateway: createFakeConfigServiceGateway(),
     // Like the config-service fake: the default must never reach the network.
@@ -62,7 +76,7 @@ export async function createHarness(
     // Same rule again: no test may open a socket to a mirror ingest. Pass your
     // own `NoopMirrorSink` to assert on what would have been streamed.
     mirrorSink: new NoopMirrorSink(),
-    ...options,
+    ...containerOptions,
   });
   const server = buildMcpServer(container);
 

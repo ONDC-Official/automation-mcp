@@ -153,7 +153,7 @@ typo nothing in this repo can fix. A map of JSONPath → value, applied after
 (names one specific run when a session has several). `flow_await` takes
 **neither**, too — see §4a.
 
-**A wait that can never end** (`flow.service.ts#awaitEvent`, `#park`,
+**A wait that can never end** (`flow.await-run.ts#awaitEvent`, `#park`,
 `#effectiveAfterSeq`). Three live runs against workbench.ondc.tech spent five
 minutes each in `flow_await` with the callback they were waiting for already on
 the record. Every cause produced the same symptom, and it is the worst one this
@@ -164,10 +164,10 @@ blaming the wrong side.
 | Fact                                                                                                                                                         | Consequence                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **`after_seq` above `record.seq` is discarded, not clamped**, and the answer says so (`after_seq_adjusted`)                                                  | entry seq is `record.seq + 1`, so no cursor a run issues can exceed it — a larger one is the **journal's** counter (§4a), which is always further along. `notify` wakes on `event.seq > afterSeq`, so taking it at face value went deaf to every future event, not merely the one already recorded. Clamping to the high-water mark would end the deafness and still skip the awaited callback, because that callback *is* the high-water mark |
-| **Every loop answer carries the run's `seq`** — `flow_start`, `flow_proceed` (`FlowService#runSeq`), `flow_get_status`, `flow_await`                          | this is what made the bug reachable at all. `flow_proceed` used to expose only `events.cursor`, so a model following the tool's own advice (`"Call flow_await for the callback"`) had the wrong counter and no other. Two counters and one field name is a trap; the fix is an affordance, not a warning         |
+| **Every loop answer carries the run's `seq`** — `flow_start`, `flow_proceed` (`flow.load.ts#runSeq`), `flow_get_status`, `flow_await`                          | this is what made the bug reachable at all. `flow_proceed` used to expose only `events.cursor`, so a model following the tool's own advice (`"Call flow_await for the callback"`) had the wrong counter and no other. Two counters and one field name is a trap; the fix is an affordance, not a warning         |
 | **A run-scoped wait does not park when `next` is not `WAITING`** (`awaitable`), unless an explicit `timeout_ms` says to                                       | both observed stalls were on `COMPLETE` and `INPUT_REQUIRED` — runs owing the *caller* the next move, where parking can only run out the clock. The escape hatch is real: a participant may still fire an unsolicited extra step after the sequence is done                                                       |
 | **The park races `journal::{sessionId}`** for `POSSIBLY_RELATED` and `ATTENTION` only (`DEAD_END_JOURNAL_KINDS`)                                              | a refused call is filed against no transaction — there is nothing to append it to, which is why it was refused — so it publishes no run event. Every other journal kind *is* followed by one, and waking on those would answer "nothing arrived" a beat before something did                                      |
-| **All four 400 `MALFORMED_CONTEXT` branches journal** (`receiver.service.ts#refuseMalformed`)                                                                | they used to `return` and nothing else: no record (there is no id to file under), no journal, no channel to the model at all. A participant calling without `bap_uri` was completely invisible, and "they never called" and "we would not take their call" are opposite problems with one appearance              |
+| **All four 400 `MALFORMED_CONTEXT` branches journal** (`receiver.refuse.ts#refuseMalformed`)                                                                | they used to `return` and nothing else: no record (there is no id to file under), no journal, no channel to the model at all. A participant calling without `bap_uri` was completely invisible, and "they never called" and "we would not take their call" are opposite problems with one appearance              |
 | **`timeout_ms` defaults to 60s**; `AWAIT_MAX_WAIT_MS` (300s) is only the cap                                                                                 | the pair is built to long-poll and every outcome says "call again", so a long default is paid for entirely by mistakes. It also keeps the window clear of `EXPECTATION_TTL_MS`, which is itself 300s                                                                                                             |
 
 - `form_fetch` / `form_submit` — a form the participant hosts: fetch, screen, parse, fill, post. A form _we_ host needs no tool — the participant opens the URL we already sent
@@ -455,8 +455,8 @@ an expectation when the first step is the participant's, and returns
 
 | First action   | Where the id comes from                                                                             | Bind site                                                                  |
 | -------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| Ours to send   | `context.transaction_id` on the **generated payload**, read back after `generate` and before `send` | `flow.service.ts#bindOutbound`                                             |
-| Theirs to send | `context.transaction_id` on their call, adopted verbatim                                            | `flow.service.ts#adoptTransaction`, from the receiver's expectation branch |
+| Ours to send   | `context.transaction_id` on the **generated payload**, read back after `generate` and before `send` | `flow.identity.ts#bindOutbound`                                             |
+| Theirs to send | `context.transaction_id` on their call, adopted verbatim                                            | `flow.identity.ts#adoptTransaction`, from the receiver's expectation branch |
 
 This is the workbench's own shape, not an invention:
 `startNewFlowController` writes nothing to cache, and the transaction is created
@@ -635,7 +635,7 @@ whole reason the milestones ran in this order: auto-advance puts payloads on a
 third party's wire with nobody watching, and until every tool result carried a
 `CHAIN_SENT` line saying so, defaulting it on would have meant silent traffic.
 
-`FlowService#scheduleChain` is the second trigger site: after any `SENT` that
+`flow.chain.ts#scheduleChain` is the second trigger site: after any `SENT` that
 was not itself chained, the run carries on if it has auto-advance. Scheduled,
 never awaited — the outcome is already the caller's answer. It also covers the
 hosted-form case for free, because `proceed` answers `SENT` for a completed form
@@ -665,7 +665,7 @@ The scaffold's rules are load-bearing. `README.md` explains why; this is the sum
 - **stdout is the protocol.** pino writes to stderr; `no-console` is an error; a test spawns the real stdio entrypoint and fails on one stray byte.
 - **`buildMcpServer` stays cheap** — it runs once per HTTP request. Expensive or shared things go in `createContainer` and are closed over.
 - **No module-level mutable state.** Our NP has genuinely cross-request state (sessions, transactions, expectations). It lives behind the `CacheStore` port (`src/lib/cache/`), reached through a repository and injected via the container. Never a module-scope `Map`. There are **two instances of that port**, and the split is load-bearing: `stateStore` (Redis when `REDIS_URL` is set, in-process otherwise) holds what must outlive a restart; `catalogCache` is _always_ in-process because `FlowService.load()` reads a ~330KB mock config on every `flow_proceed` and every inbound callback, and that data is derived, TTL'd at 15min, and re-fetched transparently on a miss. Do not "simplify" them back into one — `createContainer` explains the reasoning in place.
-- **A store read is not a cache read.** `RedisCacheStore` throws `UpstreamError` when Redis is unreachable rather than answering `undefined`, because `undefined` means "no such session" and the model responds to that by starting a **second transaction on a real participant's wire**. Any `catch` around a store read must name the error it swallows (`receiver.service.ts#loadSession` is the pattern); a bare `catch {}` there turns our outage into their recorded non-compliance.
+- **A store read is not a cache read.** `RedisCacheStore` throws `UpstreamError` when Redis is unreachable rather than answering `undefined`, because `undefined` means "no such session" and the model responds to that by starting a **second transaction on a real participant's wire**. Any `catch` around a store read must name the error it swallows (`receiver.attribute.ts#loadSession` is the pattern); a bare `catch {}` there turns our outage into their recorded non-compliance.
 - **`get` returns a copy, not a reference.** Redis round-trips through JSON, so mutating a fetched object updates nothing and an explicit `undefined` property is dropped. Build stored shapes with the `...(x !== undefined ? { x } : {})` idiom and always write back explicitly.
 - **Nothing large reaches the model.** Tool results are context. Fetch big artefacts server-side, cache them, and return a summary plus a handle — `catalog_load_flow_config` is the pattern.
 - **Tests never touch the network.** `createHarness` injects a fixture-backed config-service gateway by default; outbound calls go through an injected undici `MockAgent` (`senderDispatcher`). `src/test/ondc-fixtures.ts` holds real captured responses — faithful to the wire but _not executable_, because their base64 is truncated. `src/test/runnable-config.ts` holds a small invented config that genuinely runs, so loop tests exercise a real worker round trip. Live tests are opt-in via `RUN_LIVE_TESTS=1` (`catalog.live`, `flow.live`).
@@ -706,13 +706,35 @@ src/modules/
   session/     ✅ sessions, NP identity, role inversion, interaction mode,
                endpoint index (the audience for an unattributable refusal)
                (later: difficulty knobs, nack_rules)
-  flow/        ✅ engine/ (ported mapper) + the loop: start · proceed · await · status, prompts,
-               flow.repository.ts (FlowBinding — the run, and the id it later binds to),
-               flow.overrides.ts (what a model may do to a generated payload —
-               pure, concrete-paths-only, all-or-nothing; the file with the tests)
+  flow/        ✅ engine/ (ported mapper) + the loop, split by subject. `flow.service.ts`
+               is a thin façade: it owns `#runLocks` — the loop's only mutable state,
+               and the reason it stays a class — binds `FlowLoop` for chain re-entry,
+               and delegates. Everything else is free functions over `FlowDeps`:
+                 flow.types.ts       the shapes, incl. FlowDeps / FlowLoop / Target
+                 flow.load.ts        resolving a run; `lockId` for an unbound one
+                 flow.identity.ts    **both** transaction-id bind sites, together on purpose
+                 flow.target.ts      which step this turn is about; `inputGate`
+                 flow.turn.ts        describing a turn, without doing it
+                 flow.dispatch.ts    the outbound path — moved whole, see its header
+                 flow.await-run.ts   waiting on one run, and the four ways it never ended
+                 flow.await-session.ts   the blocking drain over a whole session
+                 flow.start/restart/view/chain.ts
+                 flow.step-config.ts what the config says about a step — shared with
+                                     the receiver, which is the point (`saveDataFor`)
+                 flow.overrides.ts (what a model may do to a generated payload —
+                 pure, concrete-paths-only, all-or-nothing; the file with the tests),
+                 flow.repository.ts (FlowBinding — the run, and the id it later binds to)
   record/      ✅ exchanges + payloads + business data + the session event
                journal and its delivery cursor; all CacheStore access
-  transport/   ✅ inbound receiver (pipeline + routes + lifecycle) + outbound sender
+  transport/   ✅ inbound receiver + outbound sender. The receiver is split along the
+               phase boundaries its own `#handle` comments already drew:
+                 receiver.types.ts      the shapes, incl. ReceiverDeps
+                 receiver.attribute.ts  phases 1–3: whose call is this
+                 receiver.refuse.ts     every way of saying no, and journaling it
+                 receiver.persist.ts    recording it, and matching it to a step
+                 receiver.service.ts    `handle` + `#handle`, the pipeline itself
+               `ReceiverService` holds **no mutable state**, which is why each phase
+               is a plain function rather than a method
   forms/       ✅ forms this mock hosts, and forms it has to fetch and fill
   validate/    ✅ L0 + L1 via the api-service oracle: gateway · parse (the
                prose→findings grammar, and where the tests are) · service (the
@@ -763,7 +785,23 @@ src/test/
 replayable here by eye. The two deliberate divergences are documented in place
 (`seq` ordering in `reduce-history.ts`, the `toEngineFlow` adapter).
 
+**Which modules run** (`src/config/features.ts`). `PROFILE`
+(`full` · `driver` · `minimal`), narrowed by `MODULES_DISABLED` and widened by
+`MODULES_ENABLED`, decides which tools, resources and routes exist. Three
+properties are load-bearing:
+
+| Fact | Consequence |
+| ---- | ----------- |
+| **The gate only ever removes.** Every existing switch is ANDed with the profile, never replaced | this is what keeps the mirror's rule intact — `MIRROR_ENDPOINT_URL` unset is still the only way it is off, and a profile listing `mirror` means *may run*, never *does*. It also means `PROFILE=full` (the default) is byte-identical to the behaviour before this existed |
+| **`REQUIRES` is not the import graph.** Every service is still constructed whatever the profile says; the gate governs the *surface* | so the question each entry answers is narrow — if this module's tools are present, which others must be, for a model to get anywhere. `validate` is required by nothing: its gates fail open by design, and `VALIDATION_MODE=off` was always supported |
+| **A contradictory profile refuses to boot**, naming both sides | same posture as `AUTH_MODE=none`-in-production. A module list with a typo in it is a setting with no symptom otherwise — the module silently stays on, or silently never comes off |
+
+The gap this closed: `FEEDBACK_DISABLED=1` used to leave
+`feedback_submit_report` in the model's tool list, inert. A tool that is
+present and does nothing is worse than one that is absent.
+
 Env (extend `src/config/env.ts`, keep the fail-fast-at-boot property). Live today:
+`PROFILE`, `MODULES_DISABLED`, `MODULES_ENABLED`,
 `CONFIG_SERVICE_URL`, `CONFIG_SERVICE_TIMEOUT_MS`, `CATALOG_CACHE_TTL_MS`,
 `SESSION_TTL_MS`, `RECEIVER_PORT`, `RECEIVER_PUBLIC_URL`,
 `RECEIVER_ROUTE_PREFIX`, `MOCK_SUBSCRIBER_ID`,

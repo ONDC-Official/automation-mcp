@@ -227,6 +227,26 @@ describe("the metrics endpoint", () => {
     expect(response.statusCode).toBe(404);
     expect(response.json()).toMatchObject({ error: { code: "not_found" } });
   });
+
+  it("registers no route under a profile that excludes the module", async () => {
+    // The same 404, reached the other way: the route factories read the
+    // resolved feature set now, so `PROFILE` and `METRICS_ENABLED` cannot
+    // disagree about whether `/metrics` exists.
+    await boot(testConfig({ PROFILE: "minimal" }));
+
+    const response = await app.inject({ method: "GET", url: "/metrics" });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it("takes the viewer down with the same profile", async () => {
+    await boot(testConfig({ PROFILE: "minimal" }));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/ui/api/sessions",
+    });
+    expect(response.statusCode).toBe(404);
+  });
 });
 
 describe("mcp endpoint", () => {

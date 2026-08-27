@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/server";
+import { MODULE_NAMES, resolveFeatures, type ModuleName } from "@/config/features.js";
 import type { Container } from "@/container.js";
 import type { Registerable } from "@/lib/define-tool.js";
 import { createCatalogResources } from "@/modules/catalog/catalog.resource.js";
@@ -17,34 +18,68 @@ import { createValidateTools } from "@/modules/validate/validate.tool.js";
 /**
  * The one place that knows which capabilities exist.
  *
- * Adding a module means adding one line here — nothing else in the scaffold
- * needs to change, and both transports pick it up automatically because both
- * are built from the same factory.
+ * Still one entry per module and still explicit — but keyed by module name
+ * rather than written as a bare array, so `PROFILE` / `MODULES_DISABLED` can
+ * decide what the model actually sees. Registration order is `MODULE_NAMES`,
+ * so the sequence lives beside the module list rather than in the shape of a
+ * literal here.
+ *
+ * This is where the real gap closed: before it, `FEEDBACK_DISABLED=1` made the
+ * feedback service inert but still advertised `feedback_submit_report` and
+ * `feedback_list_reports` to the model — a tool that is present and does
+ * nothing is worse than one that is absent.
+ *
+ * `record` reaches every session-scoped tool because each one drains the
+ * session's event journal into its result — see `eventsFor`. That is the only
+ * channel guaranteed to put what happened on the wire in front of the model,
+ * so it is deliberately not something a tool can opt out of, and the module
+ * dependency table in `config/features.ts` makes it un-disableable in any
+ * profile that keeps them.
  */
-export function collectCapabilities(container: Container): Registerable[] {
-  const { catalog, session, record, flow, forms, validate, feedback } =
-    container.services;
+type CapabilityFactory = (container: Container) => Registerable[];
 
-  return [
-    ...createTransportTools(container),
-    // `record` reaches every session-scoped tool because each one drains the
-    // session's event journal into its result — see `eventsFor`. That is the
-    // only channel guaranteed to put what happened on the wire in front of the
-    // model, so it is deliberately not something a tool can opt out of.
-    ...createSessionTools(session, record),
-    ...createCatalogTools(catalog, session),
-    ...createFlowTools(flow, record, {
-      maxAwaitMs: container.config.AWAIT_MAX_WAIT_MS,
+const BY_MODULE: Partial<Record<ModuleName, CapabilityFactory>> = {
+  transport: (c) => [...createTransportTools(c)],
+  session: (c) => [
+    ...createSessionTools(c.services.session, c.services.record),
+    ...createSessionResources(c.services.session),
+  ],
+  catalog: (c) => [
+    ...createCatalogTools(c.services.catalog, c.services.session),
+    ...createCatalogResources(c.services.catalog),
+  ],
+  flow: (c) => [
+    ...createFlowTools(c.services.flow, c.services.record, {
+      maxAwaitMs: c.config.AWAIT_MAX_WAIT_MS,
     }),
-    ...createFormsTools(forms, record),
-    ...createValidateTools(validate, session, record),
-    ...createRecordTools(record, session),
-    ...createFeedbackTools(feedback, session, record),
-    ...createSessionResources(session),
-    ...createCatalogResources(catalog),
-    ...createRecordResources(record, session),
     ...createFlowPrompts(),
-  ];
+  ],
+  forms: (c) => [...createFormsTools(c.services.forms, c.services.record)],
+  validate: (c) => [
+    ...createValidateTools(
+      c.services.validate,
+      c.services.session,
+      c.services.record,
+    ),
+  ],
+  record: (c) => [
+    ...createRecordTools(c.services.record, c.services.session),
+    ...createRecordResources(c.services.record, c.services.session),
+  ],
+  feedback: (c) => [
+    ...createFeedbackTools(
+      c.services.feedback,
+      c.services.session,
+      c.services.record,
+    ),
+  ],
+};
+
+export function collectCapabilities(container: Container): Registerable[] {
+  const features = resolveFeatures(container.config);
+  return MODULE_NAMES.flatMap((name) =>
+    features.enabled(name) ? (BY_MODULE[name]?.(container) ?? []) : [],
+  );
 }
 
 export function registerCapabilities(
