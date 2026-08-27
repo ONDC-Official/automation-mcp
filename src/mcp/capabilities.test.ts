@@ -102,4 +102,26 @@ describe("the model is never told about a tool that is not there", () => {
     harness = await createHarness();
     expect(harness.client.getInstructions()).toMatch(/feedback_submit_report/);
   });
+
+  /*
+   * The viewer paragraph is the only always-on channel that tells the model to
+   * hand the link over — a prompt is opt-in and a tool description is read
+   * once. It is gated on exactly the condition under which `viewerUrl` returns
+   * a URL, so the preamble can never instruct a model to state a field that
+   * will not be there.
+   */
+  it("tells the model to hand out viewer_url when the viewer is on", async () => {
+    harness = await createHarness();
+    const instructions = harness.client.getInstructions();
+    expect(instructions).toMatch(/viewer_url/);
+    expect(instructions).toMatch(/before your turn ends/);
+  });
+
+  it("omits the viewer sentence when the viewer is off", async () => {
+    harness = await createHarness({ env: { UI_ENABLED: "0" } });
+    const instructions = harness.client.getInstructions();
+    expect(instructions).not.toMatch(/viewer_url/);
+    // The persona survives — only the viewer sentences are gated.
+    expect(instructions).toMatch(/mock ONDC network participant/);
+  });
 });

@@ -227,8 +227,15 @@ any other way unless it is parked in `flow_await` at the right moment.
 (`main-tech`, route `/mcp-session`). **No tool, no resource, no line in
 `capabilities.ts`** — like the mirror, it is not part of the transaction, and a
 model that could see it would start reasoning about it. The one thing the model
-does see is `viewer_url` on `session_create` / `session_get`, and the prompt
-tells it to hand that straight to the human.
+does see is `viewer_url` on `session_create` / `session_get`, and **the server
+preamble** (`mcp/server.ts#instructionsFor`, gated on `features.enabled("ui")`)
+tells it to state that URL in full before its turn ends. The preamble is the
+load-bearing half: the `mock_buyer` / `mock_seller` prompts said the same thing
+first, but a prompt is opt-in in every client, so a session that never selected
+one heard the instruction nowhere. `renderSession` states it as a directive
+*outside* the aligned field block for the same reason — inside it, between
+`callback:` and `expires:`, a model summarising its reply dropped the link with
+the rest of the plumbing, and the human only got it by asking.
 
 The page is ours; the data is not. The browser fetches directly from this
 process, so payload bodies never pass through whoever hosts the page.

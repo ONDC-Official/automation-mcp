@@ -83,6 +83,56 @@ describe("session tools over MCP", () => {
     expect(text).toContain("flow(s) available");
   });
 
+  it("hands the viewer link over as a directive, not as a field", async () => {
+    const result = await harness.client.callTool({
+      name: "session_create",
+      arguments: createArgs(),
+    });
+
+    const { viewer_url } = result.structuredContent as { viewer_url?: string };
+    expect(viewer_url).toBeDefined();
+
+    const text = (result.content as { text: string }[])[0]?.text ?? "";
+    const lines = text.split("\n");
+
+    /*
+     * The URL must stand on its own line, under the directive, and *not* be
+     * one of the aligned `key:` fields above it. Inside that block a model
+     * composing its reply summarised it away with the rest of the plumbing,
+     * which is the whole bug this shape exists to fix.
+     */
+    expect(text).toContain("HAND THIS TO THE PERSON YOU ARE TESTING FOR");
+    expect(text).toContain("before your turn ends");
+
+    const urlLine = lines.findIndex((line) => line.includes(viewer_url ?? ""));
+    expect(urlLine).toBeGreaterThan(-1);
+    expect(lines[urlLine]?.trim()).toBe(viewer_url);
+    expect(lines.slice(0, urlLine).join("\n")).toContain(
+      "HAND THIS TO THE PERSON",
+    );
+  });
+
+  it("restates the viewer link on session_get, for a human who lost it", async () => {
+    const created = await harness.client.callTool({
+      name: "session_create",
+      arguments: createArgs(),
+    });
+    const { session, viewer_url } = created.structuredContent as {
+      session: { session_id: string };
+      viewer_url?: string;
+    };
+
+    const fetched = await harness.client.callTool({
+      name: "session_get",
+      arguments: { session_id: session.session_id },
+    });
+
+    expect(fetched.structuredContent).toMatchObject({ viewer_url });
+    const text = (fetched.content as { text: string }[])[0]?.text ?? "";
+    expect(text).toContain(viewer_url);
+    expect(text).toContain("HAND THIS TO THE PERSON YOU ARE TESTING FOR");
+  });
+
   it("defaults the interaction settings and mints a callback URL", async () => {
     const result = await harness.client.callTool({
       name: "session_create",

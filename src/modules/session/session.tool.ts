@@ -28,17 +28,33 @@ export function renderSession(session: Session, viewerUrl?: string): string {
     // Stated on every session read, because a callback URL the participant
     // cannot reach is the single most common way a run silently goes nowhere.
     `  callback:   ${session.callback_url}`,
-    // Beside the callback URL because both are things to hand somebody, and
-    // this one is the only view of the run the human has that is not this
-    // model's narration of it.
-    ...(viewerUrl !== undefined
-      ? [
-          `  viewer:     ${viewerUrl}  ← give this to the person you are testing for`,
-        ]
-      : []),
     `  inputs:     ${session.interaction_mode === "manual" ? "manual — ask the human" : "llm_auto — you supply them"}`,
     `  advance:    ${session.auto_advance ? "auto" : "step by step"}`,
     `  expires:    ${session.expires_at}`,
+    /*
+     * The viewer link is a directive, not a field.
+     *
+     * It used to sit inside the block above, between `callback:` and
+     * `inputs:` — aligned, two-space indented, indistinguishable from
+     * `expires:`. A model composing its reply summarised the block and the URL
+     * went with the rest of the plumbing, so in practice the human only ever
+     * got the link by asking for it. Outside the block, with the deadline
+     * stated, it reads as something owed rather than something known.
+     *
+     * The wording has to hold at both call sites, because `session_get` shares
+     * this function: "before your turn ends" is true mid-run, where "before you
+     * start a flow" would already be stale. Restating it on `session_get` is
+     * deliberate — that is the tool called when the link was lost.
+     */
+    ...(viewerUrl !== undefined
+      ? [
+          "",
+          "→ HAND THIS TO THE PERSON YOU ARE TESTING FOR — state the URL in full in",
+          "  your reply, before your turn ends. It is the only view of the run they",
+          "  have that is not you describing it; read-only, so you keep driving.",
+          `  ${viewerUrl}`,
+        ]
+      : []),
   ].join("\n");
 }
 
@@ -76,9 +92,10 @@ export function createSessionTools(
         "rejected rather than silently returning no flows. " +
         "The returned callback_url is what the participant must send its " +
         "callbacks to; give it to them before starting a flow. " +
-        "The returned viewer_url is a live read-only page showing this " +
-        "session's flows, payloads and events — pass it on to the human you " +
-        "are testing for.",
+        "The returned viewer_url is a live read-only page of this session's " +
+        "flows, payloads and events: state it in full in your reply to the " +
+        "person you are testing for, before your turn ends — a human who never " +
+        "receives it has no view of the run except your description of it.",
       inputSchema: CreateSessionInput,
       outputSchema: CreateSessionOutput,
       annotations: {
@@ -110,7 +127,9 @@ export function createSessionTools(
       description:
         "Fetch a session by id: the participant under test, the role this " +
         "server plays against it, the build, and when the session expires. " +
-        "Returns an error result if the session is unknown or has expired.",
+        "Also restates the viewer_url, which is how the human gets the link " +
+        "back if it was lost. Returns an error result if the session is " +
+        "unknown or has expired.",
       inputSchema: GetSessionInput,
       outputSchema: GetSessionOutput,
       annotations: {

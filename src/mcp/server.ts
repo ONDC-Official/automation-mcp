@@ -50,6 +50,16 @@ function instructionsFor(container: Container): string {
   "catalog_list_builds first if any of those values are uncertain; use-case names",
   "are case- and space-sensitive. session_create returns the flows you can drive.",
   ];
+  if (features.enabled("ui")) {
+    lines.push(
+      "",
+      "session_create also returns viewer_url: a live, read-only page of every flow,",
+      "payload and event in the session. State that URL in full in your reply to the",
+      "person you are testing for, before your turn ends — do not wait to be asked,",
+      "and do not summarise it away. A human who never receives it has no view of the",
+      "run except your description of it.",
+    );
+  }
   if (features.enabled("catalog")) {
     lines.push(
       "",
