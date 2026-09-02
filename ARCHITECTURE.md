@@ -194,7 +194,7 @@ Four consequences worth keeping:
   on a laptop yields one only that person can open; an engine on a public URL
   yields one anybody holding it can.
 - **The link's parameters ride in the `#` fragment.** A query string is sent to
-  the page's host in the request line, so the token — a credential for *this*
+  the page's host in the request line, so the token — a credential for _this_
   server — would land in somebody else's access logs.
 - **Reads are cursor-neutral.** `readEvents`, never `drainEvents`: that cursor is
   how the model is told what happened, and a viewer that consumed it would leave
@@ -326,8 +326,8 @@ no id. It writes a binding, arms an expectation if the first step is the
 participant's, and returns `transaction_id: null`. The id is fixed at exactly one
 of two moments:
 
-| First action is | Where the id comes from                                                                          | Bind site                                                                  |
-| --------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| First action is | Where the id comes from                                                                          | Bind site                                                                   |
+| --------------- | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
 | ours to send    | `context.transaction_id` on the **generated** payload, read back after `generate`, before `send` | `flow.identity.ts#bindOutbound`                                             |
 | theirs to send  | `context.transaction_id` on their call, adopted verbatim                                         | `flow.identity.ts#adoptTransaction`, from the receiver's expectation branch |
 
@@ -653,16 +653,16 @@ sequenceDiagram
 Each step in `#dispatch` is placed where it is for a reason that has already been
 paid for once.
 
-| Order                                         | Why not later / earlier                                                                                                                                                                                                                                                                                      |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **inputs before requirements**                | requirements' own view of the world_is_ `sessionData`, so it would be answering about the wrong one. A wrong-shaped `inputs` reaches `generate` as an absent value and a generator that assigns it deletes a field the default payload had right. This is the last point at which the real cause is visible. |
-| **requirements before generate**              | an unmet precondition is ours to fix. The workbench sends an error payload at the counterparty; we return`BLOCKED` to the model, because telling the participant teaches it nothing.                                                                                                                         |
-| **overrides after generate, before the gate** | they patch the bytes the config actually produced, and the gate judges the**patched** payload — an override is not a validation bypass.                                                                                                                                                                      |
-| **transaction id settled before the gate**    | validating earlier would judge a payload that is not the one we send.                                                                                                                                                                                                                                        |
-| **`dry_run` returns after the gate, ungated** | a draft exists to be inspected, and one that fails validation is the most useful kind to look at. It persists a payload but binds nothing.                                                                                                                                                                   |
-| **gate before bind/record/send**              | a blocked step costs the run nothing but the attempt; an unbound run stays unbound.                                                                                                                                                                                                                          |
-| **`appendApiEntry` BEFORE the socket write**  | see below.                                                                                                                                                                                                                                                                                                   |
-| **`saveBusinessData` before the send**        | the receiver feeds business data to the inbound validator, so anything this step saves must be there before their next call can be judged against it.                                                                                                                                                        |
+| Order                                         | Why not later / earlier                                                                                                                                                                                                                                                                                     |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **inputs before requirements**                | requirements' own view of the world_is_`sessionData`, so it would be answering about the wrong one. A wrong-shaped `inputs` reaches `generate` as an absent value and a generator that assigns it deletes a field the default payload had right. This is the last point at which the real cause is visible. |
+| **requirements before generate**              | an unmet precondition is ours to fix. The workbench sends an error payload at the counterparty; we return`BLOCKED` to the model, because telling the participant teaches it nothing.                                                                                                                        |
+| **overrides after generate, before the gate** | they patch the bytes the config actually produced, and the gate judges the**patched** payload — an override is not a validation bypass.                                                                                                                                                                     |
+| **transaction id settled before the gate**    | validating earlier would judge a payload that is not the one we send.                                                                                                                                                                                                                                       |
+| **`dry_run` returns after the gate, ungated** | a draft exists to be inspected, and one that fails validation is the most useful kind to look at. It persists a payload but binds nothing.                                                                                                                                                                  |
+| **gate before bind/record/send**              | a blocked step costs the run nothing but the attempt; an unbound run stays unbound.                                                                                                                                                                                                                         |
+| **`appendApiEntry` BEFORE the socket write**  | see below.                                                                                                                                                                                                                                                                                                  |
+| **`saveBusinessData` before the send**        | the receiver feeds business data to the inbound validator, so anything this step saves must be there before their next call can be judged against it.                                                                                                                                                       |
 
 ### Recording an outbound call before it is sent
 
@@ -1103,7 +1103,7 @@ Four things about the oracle are load-bearing:
 
 | Fact                                                                                                                  | Consequence                                                                                                                                            |
 | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Two grammars — L0 plain text (`at '/p': got x, want y`), L1 markdown (`#### **CODE**`) — and **L0 short-circuits L1** | the layer is_inferred_, not guessed. `validate.parse.ts` is the only thing that produces a code or a JSONPath, so it is the file with the tests        |
+| Two grammars — L0 plain text (`at '/p': got x, want y`), L1 markdown (`#### **CODE**`) — and **L0 short-circuits L1** | the layer is_inferred_, not guessed.`validate.parse.ts` is the only thing that produces a code or a JSONPath, so it is the file with the tests         |
 | `error.code` is always the literal `"Bad Request"`; `error.paths` is always empty                                     | nothing structured to fall back on. The parser never throws and never answers a rejection with zero findings — an empty list reads exactly like`valid` |
 | No`context.transaction_id` ⇒ **HTTP 500**                                                                             | guarded locally                                                                                                                                        |
 | A`protocol_validation=false` cookie makes ONIX **skip L1 and answer ACK**                                             | we send no cookies.`validate.live.test.ts` asserts a known-bad payload still fails — that is what would catch this                                     |
@@ -1407,10 +1407,10 @@ model alternate `flow_proceed` / `flow_await` correctly instead of polling.
 | `POST`            | `{prefix}/forms/{domain}/{formId}/submit`              | accept its submission                                                |
 | `GET`             | `/ui/api/sessions`                                     | recent sessions, newest first                                        |
 | `GET`             | `/ui/api/sessions/{id}`                                | one session, its published flows and a row per run                   |
-| `GET`             | `/ui/api/sessions/{id}/flows/{flowId}`                 | the engine's own `FlowMap`, unprojected                              |
+| `GET`             | `/ui/api/sessions/{id}/flows/{flowId}`                 | the engine's own`FlowMap`, unprojected                               |
 | `GET`             | `/ui/api/sessions/{id}/payloads/{payloadId}`           | one payload and the ACK/NACK exchanged for it                        |
 | `GET`             | `/ui/api/sessions/{id}/data`                           | business data on one transaction                                     |
-| `GET`             | `/ui/api/sessions/{id}/events`                         | the journal since a cursor — **never consuming**                     |
+| `GET`             | `/ui/api/sessions/{id}/events`                         | the journal since a cursor —**never consuming**                      |
 | `GET`             | `/ui/api/sessions/{id}/stream`                         | the journal as it happens (SSE)                                      |
 | `GET`             | `/health`, `/ready`                                    | liveness, readiness                                                  |
 | `GET`             | `/metrics`                                             | Prometheus exposition                                                |
@@ -1467,17 +1467,17 @@ config-service gateway by default; outbound calls go through an injected undici
 `MockAgent` (`senderDispatcher`); the validation gateway and feedback sink are
 injected too.
 
-| Layer                       | How                                                                                |
-| --------------------------- | ---------------------------------------------------------------------------------- |
-| Service logic               | plain unit tests                                                                   |
-| Tools / resources / prompts | `src/test/harness.ts` — real MCP client ↔ real server over an in-memory transport  |
-| HTTP and the receiver       | `app.inject()`                                                                     |
-| Outbound                    | injected undici`MockAgent` (`src/test/mock-participant.ts` scripts a counterparty) |
-| stdio                       | a real subprocess, asserting stdout carries only protocol bytes                    |
-| The viewer's SSE stream     | a **bound port** and `fetch` — `app.inject()` buffers a whole response, so it cannot observe a stream that has not ended, which is every state this route has |
+| Layer                       | How                                                                                                                                                                                            |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Service logic               | plain unit tests                                                                                                                                                                               |
+| Tools / resources / prompts | `src/test/harness.ts` — real MCP client ↔ real server over an in-memory transport                                                                                                              |
+| HTTP and the receiver       | `app.inject()`                                                                                                                                                                                 |
+| Outbound                    | injected undici`MockAgent` (`src/test/mock-participant.ts` scripts a counterparty)                                                                                                             |
+| stdio                       | a real subprocess, asserting stdout carries only protocol bytes                                                                                                                                |
+| The viewer's SSE stream     | a**bound port** and `fetch` — `app.inject()` buffers a whole response, so it cannot observe a stream that has not ended, which is every state this route has                                   |
 | The standalone listener     | `container.receiver.start()` with `RECEIVER_PORT=0`; the lifecycle reports the port it actually bound. Nothing else exercises that host, and it is built by a different function from `app.ts` |
-| Live                        | opt-in via`RUN_LIVE_TESTS=1` (`catalog.live`, `flow.live`, `validate.live`)        |
-| Redis                       | opt-in via`RUN_REDIS_TESTS=1`; both stores share `cache-store-contract.ts`         |
+| Live                        | opt-in via`RUN_LIVE_TESTS=1` (`catalog.live`, `flow.live`, `validate.live`)                                                                                                                    |
+| Redis                       | opt-in via`RUN_REDIS_TESTS=1`; both stores share `cache-store-contract.ts`                                                                                                                     |
 
 Two fixture sets, and the distinction matters:
 
@@ -1491,7 +1491,7 @@ The end-to-end test that matters is `flow/flow.loop.test.ts`: both directions
 real, payloads generated by config JavaScript in a worker, callbacks arriving
 through the actual routes, and the ACK/callback inversion driven deterministically.
 
-`ui.contract.test.ts` is a different kind of guard: it transcribes the *page's*
+`ui.contract.test.ts` is a different kind of guard: it transcribes the _page's_
 types rather than importing them, because importing would make it true by
 construction. The contract it protects breaks silently — a field we stop sending
 renders an empty step list in a repo we do not control, and the obvious
