@@ -68,6 +68,20 @@ function instructionsFor(container: Container): string {
       "participant to send it.",
     );
   }
+  if (features.enabled("protocol")) {
+    lines.push(
+      "",
+      "A flow is one scripted path, not the protocol. When the question is how ONDC",
+      "itself works — what an action's fields mean, what a validator's rule code",
+      "meant, what may legitimately happen next — use the protocol_* tools, which",
+      "answer from the published spec and need no session: protocol_describe_build",
+      "for a domain's actions, use-cases and error codes, and protocol_next_actions",
+      "for the action graph a flow is only one path through. Look it up rather than",
+      "inferring it from a flow that happened to pass. When a payload is refused,",
+      "protocol_explain_rule takes the finding's code — or its json_path — and",
+      "returns the published rule it broke.",
+    );
+  }
   if (features.enabled("feedback")) {
     lines.push(
       "",

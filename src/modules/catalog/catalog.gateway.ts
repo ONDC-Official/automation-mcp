@@ -33,6 +33,9 @@ import {
 
 const SERVICE = "config-service";
 
+/** Domain codes and versions only. Keeps `..` and `/` out of the spec path. */
+const SPEC_SEGMENT = /^[A-Za-z0-9:._-]+$/;
+
 export interface ConfigServiceGateway {
   /** The full domain/version/usecase catalog. */
   fetchBuilds(): Promise<
@@ -45,6 +48,18 @@ export interface ConfigServiceGateway {
     build: BuildRef,
     flowId: string,
   ): Promise<MockConfig | undefined>;
+  /**
+   * The published protocol spec for a build, raw.
+   *
+   * Returned as `unknown` on purpose: this is ~10.5 MB and the `protocol`
+   * module's ingest is what decides which of it survives. Parsing it here
+   * would mean this file owning a shape it does not use.
+   */
+  fetchSpec(
+    domain: string,
+    version: string,
+    maxBytes: number,
+  ): Promise<unknown>;
   /** Dependency probe surfaced through `/ready`. */
   ping(): Promise<boolean>;
 }
@@ -126,6 +141,43 @@ export class HttpConfigServiceGateway implements ConfigServiceGateway {
     return this.#parse(UpstreamMockConfig, body, "mock/playground");
   }
 
+  /**
+   * `GET /protocol/spec/{domain}/{version}`.
+   *
+   * The domain code carries a colon (`ONDC:RET11`) and it must stay literal —
+   * percent-encoding it 404s. A colon is legal in a path segment, so the only
+   * thing needed is to keep `URLSearchParams` away from it, which is why this
+   * is built into the path rather than passed as a query parameter.
+   *
+   * Both segments are guarded against anything that could escape the path.
+   * They arrive from a model, and `..` in a path segment is a request for a
+   * different endpoint.
+   *
+   * Measured at 10.5 MB / 2.6 s for `ONDC:TRV11 2.0.1`, which is inside
+   * `CONFIG_SERVICE_TIMEOUT_MS`. Do not add `accept-encoding: gzip` here
+   * without also decompressing: `undici.request` does not do it for you.
+   */
+  async fetchSpec(
+    domain: string,
+    version: string,
+    maxBytes: number,
+  ): Promise<unknown> {
+    for (const segment of [domain, version]) {
+      if (!SPEC_SEGMENT.test(segment)) {
+        throw new UpstreamError(
+          SERVICE,
+          `refused a spec lookup for an unusable path segment: ${segment}`,
+          { segment },
+        );
+      }
+    }
+    return this.#get(
+      `/protocol/spec/${domain}/${version}`,
+      {},
+      { operation: "fetchSpec", maxBytes },
+    );
+  }
+
   async ping(): Promise<boolean> {
     await this.#get("/health", {}, { operation: "ping" });
     return true;
@@ -146,7 +198,20 @@ export class HttpConfigServiceGateway implements ConfigServiceGateway {
   async #get(
     path: string,
     query: Record<string, string> = {},
-    options: { allowNotFound?: boolean; operation?: string } = {},
+    options: {
+      allowNotFound?: boolean;
+      operation?: string;
+      /**
+       * Read the body through a byte counter instead of `.json()`.
+       *
+       * The four original endpoints answer in tens of kilobytes, so an
+       * unbounded read is fine for them. `/protocol/spec` is 10.5 MB by design
+       * and its tail is not ours to control — an unbounded read on an endpoint
+       * we do not own is how one bad upstream deploy takes this process out of
+       * memory rather than returning an error the model can act on.
+       */
+      maxBytes?: number;
+    } = {},
   ): Promise<unknown> {
     const search = new URLSearchParams(query).toString();
     const url = `${this.#baseUrl}${path}${search.length > 0 ? `?${search}` : ""}`;
@@ -201,16 +266,51 @@ export class HttpConfigServiceGateway implements ConfigServiceGateway {
     }
 
     try {
-      const parsed = await response.body.json();
+      const parsed: unknown =
+        options.maxBytes === undefined
+          ? await response.body.json()
+          : (JSON.parse(
+              await this.#readCapped(response, options.maxBytes, url),
+            ) as unknown);
       finish("ok");
       return parsed;
     } catch (error) {
+      if (error instanceof UpstreamError) {
+        finish("too_large");
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       finish("unreadable");
       throw new UpstreamError(SERVICE, `returned unreadable JSON: ${message}`, {
         url,
       });
     }
+  }
+
+  /** Body as text, refusing past `maxBytes` rather than buffering it all. */
+  async #readCapped(
+    response: Dispatcher.ResponseData,
+    maxBytes: number,
+    url: string,
+  ): Promise<string> {
+    const chunks: Uint8Array[] = [];
+    let seen = 0;
+    for await (const chunk of response.body) {
+      const buffer: Uint8Array =
+        chunk instanceof Uint8Array ? chunk : Buffer.from(chunk as string);
+      seen += buffer.byteLength;
+      if (seen > maxBytes) {
+        // Stop pulling; the socket is torn down with the request.
+        response.body.destroy();
+        throw new UpstreamError(
+          SERVICE,
+          `response exceeded ${String(maxBytes)} bytes`,
+          { url, maxBytes },
+        );
+      }
+      chunks.push(buffer);
+    }
+    return Buffer.concat(chunks).toString("utf8");
   }
 
   async #readErrorMessage(

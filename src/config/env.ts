@@ -90,6 +90,35 @@ const EnvSchema = z
       .default(15_000),
     /** TTL for fetched builds/flows/mock configs. Upstream caches ~1h. */
     CATALOG_CACHE_TTL_MS: z.coerce.number().int().positive().default(900_000),
+
+    /**
+     * How long a built spec bundle stays resident.
+     *
+     * Deliberately much longer than `CATALOG_CACHE_TTL_MS`. A mock config is
+     * re-read on every `flow_proceed`, so a 15-minute miss is cheap and
+     * frequent. A spec bundle costs a 10.5 MB fetch and parse, and upstream
+     * only moves `ingestedAt` on a multi-day cadence — a short TTL would buy a
+     * stall every quarter hour and nothing else.
+     */
+    PROTOCOL_SPEC_CACHE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(3_600_000),
+    /** Resident spec bundles. Roughly 200KB each today; sized for growth. */
+    PROTOCOL_SPEC_MAX_BUNDLES: z.coerce.number().int().positive().default(6),
+    /**
+     * Refuse a spec response larger than this rather than buffering it.
+     *
+     * The endpoint is 10.5 MB by design and its tail is not ours to control.
+     * An unbounded read on a service we do not own is how one bad upstream
+     * deploy takes this process out of memory instead of returning an error.
+     */
+    PROTOCOL_SPEC_MAX_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(41_943_040),
     /** Session lifetime. 48h matches the workbench's own session TTL. */
     SESSION_TTL_MS: z.coerce.number().int().positive().default(172_800_000),
 

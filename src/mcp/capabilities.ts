@@ -8,6 +8,9 @@ import { createFeedbackTools } from "@/modules/feedback/feedback.tool.js";
 import { createFlowPrompts } from "@/modules/flow/flow.prompt.js";
 import { createFlowTools } from "@/modules/flow/flow.tool.js";
 import { createFormsTools } from "@/modules/forms/forms.tool.js";
+import { createProtocolPrompts } from "@/modules/protocol/protocol.prompt.js";
+import { createProtocolResources } from "@/modules/protocol/protocol.resource.js";
+import { createProtocolTools } from "@/modules/protocol/protocol.tool.js";
 import { createRecordResources } from "@/modules/record/record.resource.js";
 import { createRecordTools } from "@/modules/record/record.tool.js";
 import { createSessionResources } from "@/modules/session/session.resource.js";
@@ -45,8 +48,23 @@ const BY_MODULE: Partial<Record<ModuleName, CapabilityFactory>> = {
     ...createSessionResources(c.services.session),
   ],
   catalog: (c) => [
-    ...createCatalogTools(c.services.catalog, c.services.session),
+    // The third argument is the `reality` block's only wiring. Passing the
+    // service rather than importing it keeps the dependency pointing one way:
+    // `protocol` needs `catalog` to validate a build, so `catalog` must not
+    // need `protocol` back.
+    ...createCatalogTools(
+      c.services.catalog,
+      c.services.session,
+      resolveFeatures(c.config).enabled("protocol")
+        ? c.services.protocol
+        : undefined,
+    ),
     ...createCatalogResources(c.services.catalog),
+  ],
+  protocol: (c) => [
+    ...createProtocolTools(c.services.protocol),
+    ...createProtocolResources(c.services.protocol),
+    ...createProtocolPrompts(),
   ],
   flow: (c) => [
     ...createFlowTools(c.services.flow, c.services.record, {

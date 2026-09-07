@@ -29,6 +29,7 @@
 export const MODULE_NAMES = [
   "health",
   "catalog",
+  "protocol",
   "session",
   "record",
   "validate",
@@ -68,6 +69,11 @@ const REQUIRES: Record<ModuleName, readonly ModuleName[]> = {
   health: [],
   catalog: [],
   record: [],
+  // Builds are validated against the catalog before a spec is fetched: the
+  // config-service answers an unknown build with an empty-ish document rather
+  // than a 404, so without that check a typo reads as "this build publishes
+  // nothing". Same trap `assertBuild` closes for flows.
+  protocol: ["catalog"],
   validate: [],
   transport: [],
   metrics: [],
@@ -102,7 +108,7 @@ export const PROFILES = {
   /** Everything. The default, and byte-identical to the old behaviour. */
   full: MODULE_NAMES,
   /** Drive flows and keep metrics; no viewer, no corpus, no mirror. */
-  driver: [...CORE, "metrics"] as readonly ModuleName[],
+  driver: [...CORE, "metrics", "protocol"] as readonly ModuleName[],
   /** The loop and nothing else. */
   minimal: CORE,
 } satisfies Record<string, readonly ModuleName[]>;

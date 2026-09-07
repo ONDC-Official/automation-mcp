@@ -198,11 +198,27 @@ export function pointerToPath(pointer: string): string {
   return trimmed
     .split("/")
     .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"))
-    .reduce((path, segment) => {
-      if (/^\d+$/.test(segment)) return `${path}[${segment}]`;
-      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment)) return `${path}.${segment}`;
-      return `${path}['${segment.replace(/'/g, "\\'")}']`;
-    }, "$");
+    .reduce(appendSegment, "$");
+}
+
+/**
+ * Append one object key to a JSONPath, quoting it if it is not a bare
+ * identifier.
+ *
+ * Exported because `protocol/protocol.attributes.ts` builds paths for the
+ * published field dictionary and **must spell them the same way this file
+ * spells a validator finding's path**. If the two drift, a finding's
+ * `json_path` stops matching the field it names and `protocol_explain_rule`
+ * quietly answers nothing.
+ *
+ * Not hoisted to `lib/`: the reason the two must agree is a fact about ONDC
+ * key names — `@ondc/org/...`, `bpp/providers` — and that knowledge already
+ * lives here, with its rationale.
+ */
+export function appendSegment(path: string, segment: string): string {
+  if (/^\d+$/.test(segment)) return `${path}[${segment}]`;
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment)) return `${path}.${segment}`;
+  return `${path}['${segment.replace(/'/g, "\\'")}']`;
 }
 
 /** The first JSONPath mentioned, with trailing punctuation trimmed. */

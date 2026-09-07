@@ -37,7 +37,7 @@ describe("buildMcpServer", () => {
 
     buildMcpServer(container);
 
-    expect(gateway.calls).toEqual({ builds: 0, flows: 0, mockConfig: 0 });
+    expect(gateway.calls).toEqual({ builds: 0, flows: 0, mockConfig: 0, spec: 0 });
     await container.dispose();
   });
 
@@ -51,7 +51,7 @@ describe("buildMcpServer", () => {
       await factory({ era: "modern" });
     }
 
-    expect(gateway.calls).toEqual({ builds: 0, flows: 0, mockConfig: 0 });
+    expect(gateway.calls).toEqual({ builds: 0, flows: 0, mockConfig: 0, spec: 0 });
     await container.dispose();
   });
 

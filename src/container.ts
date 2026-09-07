@@ -13,6 +13,7 @@ import { MockEngine } from "@/lib/mock-engine/mock-engine.js";
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
 import { HttpConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
 import { CatalogService } from "@/modules/catalog/catalog.service.js";
+import { ProtocolService } from "@/modules/protocol/protocol.service.js";
 import { FeedbackRepository } from "@/modules/feedback/feedback.repository.js";
 import { FeedbackService } from "@/modules/feedback/feedback.service.js";
 import {
@@ -105,6 +106,7 @@ export interface Container {
   readonly logger: Logger;
   readonly services: {
     readonly catalog: CatalogService;
+    readonly protocol: ProtocolService;
     readonly session: SessionService;
     readonly record: RecordService;
     readonly flow: FlowService;
@@ -688,8 +690,24 @@ export async function createContainer(
       : {}),
   });
 
+  // Built after `session`: it resolves a build from either a triple or a
+  // session id, and validates the triple through the catalog first. Bundles
+  // live in `catalogCache` for the reason stated where that store is created —
+  // derived, re-fetchable, and far too large to round-trip through Redis.
+  const protocol = new ProtocolService({
+    gateway: configServiceGateway,
+    catalog,
+    sessions: session,
+    cache: catalogCache,
+    cacheTtlMs: config.PROTOCOL_SPEC_CACHE_TTL_MS,
+    maxBundles: config.PROTOCOL_SPEC_MAX_BUNDLES,
+    maxSpecBytes: config.PROTOCOL_SPEC_MAX_BYTES,
+    logger,
+  });
+
   const services = {
     catalog,
+    protocol,
     session,
     record,
     flow,

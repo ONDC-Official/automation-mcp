@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FlowReality } from "@/modules/protocol/protocol.schema.js";
 
 /**
  * Two families of schema live here, and mixing them up causes real bugs.
@@ -278,6 +279,12 @@ export const FlowDetail = z.object({
   extra_sequence: z
     .array(FlowStep)
     .describe("Parallel or unsolicited steps, if any."),
+  reality: FlowReality.optional().describe(
+    "What this sequence does NOT say: the actions the build's graph also " +
+      "permits, which of these steps may repeat or arrive unsolicited, and " +
+      "which must echo their values from an earlier exchange. Absent when the " +
+      "protocol module is off or the published spec is unreachable.",
+  ),
 });
 export type FlowDetail = z.infer<typeof FlowDetail>;
 

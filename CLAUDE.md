@@ -123,6 +123,97 @@ Names follow the scaffold convention `module_verb_noun`. Every tool declares
 - `catalog_describe_flow` — the full sequence; every step tagged `actor: mock | np | unknown`
 - `catalog_load_flow_config` — fetch + cache a flow's mock-runner config; returns a summary and a `cache_key`, never the config
 
+**Protocol reference** — ✅ shipped
+
+The *reference* half of the server, complementing the *execution* half.
+Everything else here knows ONDC **procedurally** — inside `generate` JS it
+executes but never reads, inside the oracle it calls but never enumerates — so
+a model could drive a transaction end to end and acquire not one transferable
+fact. These tools answer questions instead of driving runs.
+
+- `protocol_describe_build` — what a domain/version is: the published business
+  context, its use-cases and their status, every action it defines, which
+  actions may **open** a transaction, and how many error codes and validation
+  rules it publishes. `include` adds the flow list, the error-code catalogue
+  and `recent_changes`
+- `protocol_next_actions` — the legal successors of an action, each annotated
+  *repeatable* / *unsolicited* / *answers* / `must_echo`. **The anti-"a flow is
+  the protocol" tool**
+- `protocol_describe_action` — one action's fields, each with its meaning,
+  owning side, requiredness and allowed values, plus its rules and its echo
+  contract. The one that needs real budgeting: RET11's `on_search` publishes
+  178 fields and 387 rules, so it defaults to `max_depth: 4`, `limit: 30`, and
+  says what it elided
+- `protocol_search_fields` — the door into 600KB of field prose when you do not
+  yet know which action to ask about
+- `protocol_explain_rule` — **closes the loop `validate/` left open.** One
+  `query` field, four grammars: a rule name, an ONDC error code, a JSONPath, or
+  a finding code exactly as `payload_validate` reported it
+- `protocol_list_error_codes` — the catalogue, narrowed by side or by whether a
+  code belongs in a NACK or in a callback's `error` object
+- `protocol_search_knowledge` — the network-wide corpus (below). Takes no build
+
+Resources: `ondc://spec/{domain}/{version}` and
+`ondc://schema/{domain}/{version}/{action}` — the latter planned since day one
+and cheap now that `meta.components` is null and `meta.paths` has no `$ref`. A
+resource rather than a field on `describe_action` **because a resource is
+pulled deliberately**: unlike a tool result it does not land in context on a
+call the model did not intend.
+
+Both take a **build triple directly**, with `session_id` as an optional
+shorthand — the opposite of every catalog tool, and deliberately: the audience
+is somebody *implementing* ONDC, who has no participant under test and must not
+have to invent one to read a spec.
+
+Source: `GET {CONFIG_SERVICE_URL}/protocol/spec/{domain}/{version}` — live,
+published, and untouched by this repo until now. Shape verified identical
+across TRV11 / RET11 / FIS12 / LOG10.
+
+| Fact | Consequence |
+| ---- | ----------- |
+| **`flows[].config` is 8–9 MB of the 10.5 MB response**, and is the same artefact `catalog_load_flow_config` already caches | `UpstreamSpecFlow` is a `z.object`, so the **parse** strips it and the ingest never walks it. Two caches of one 330KB-per-flow artefact is a bug, not a saving. The fixture keeps a config stub on purpose, so the test can prove the strip rather than assume it |
+| **`meta.supportedActions` is a graph, and its entry key is the literal string `"null"`** | a JSON object key cannot be null. `null → [search, select, init]` says a transaction need not open at `search`; `on_search → on_search` is catalogue fan-out. Reading the key as absent loses the entry set entirely |
+| **`meta.apiProperties[a].transaction_partner` is the published answer to hardcoding** | `confirm` echoes `["init","on_init"]` — every identifier in a confirm must trace to something the counterparty offered. It surfaces as `must_echo`, and it is why the model no longer has to be *told* not to reuse a value |
+| **`errorCodes[].code` is a number in some builds and a string in others** — TRV11 publishes `30001`, RET11 publishes `"60001"` | normalised to string once, at ingest. A lookup keyed on the raw value misses silently for half the network |
+| **`validations` nests one level deeper than it reads** — `validations.validations._TESTS_` | recorded now because the rule tools will need it and the shape invites exactly one wrong guess. Pinned by the fixture and the live canary |
+| **`meta.components` is null and `meta.paths` contains no `$ref`** | every per-action schema is inlined at 0.8–6.8KB, so `ondc://schema/{domain}/{version}/{action}` needs no resolver. Asserted live, because a resolver appearing later is a silent breaking change |
+| **Rule names are not unique across actions** — 142 of 508 in TRV11, 320 of 727 in RET11; `REQUIRED_CONTEXT_CODE_1` is in fourteen | the index is keyed `(action, name)` and a name-only lookup returns **every** action it applies to. Keying on the name alone answers confidently with one arbitrary action's row |
+| **RET names arrive markdown-wrapped** (`**CONTEXT_REQUIRED**`) — the same spelling `validate.parse.ts` scrapes from an `#### **CODE**` header; TRV names are bare | normalising by stripping `*` is what lets a real rejection be matched back to its published rule. `scope` is backtick-wrapped on **every** row that has one (75/75 TRV11, 6/6 RET11) — a matcher that keeps them finds nothing, forever, with no error |
+| **`validationTable.rows[].errorCode` is `30000` on 894/904 TRV11 and 1543/1942 RET11 rows** — the JVAL compiler's default `_ERROR_CODE_` | **no rule → business-error-code mapping is built on it.** Real error-code knowledge is `meta.errorCodes`, and it is a separate lookup |
+| **`protocol.attributes.ts` invents the JSONPath** rather than echoing one — the tree is a nest of object keys, and ONDC keys contain `/` and `@` (`bpp/providers`, `@ondc/org/return_window`) | it is **the file with the tests**. A dotted join yields `$.message.catalog.bpp/providers`: right-looking, evaluates to nothing. It imports `appendSegment` from `validate.parse.ts` so a `FieldNode.path` and a `ValidationFinding.json_path` cannot drift apart |
+| **Ranking per group and truncating across groups is not ranking** | `protocol_search_fields` merges hits from every action, so it sorts the **merged** list (`compareRanked`). Ranking each action separately returned four prose matches from `confirm` and dropped the exact hit in `on_search`, because `confirm` sorts first |
+| **The changelog is never a version migration** — verified on ten builds: `fromVersion === toVersion` on a `draft-*` branch, and two builds ship none | so there is **no `protocol_diff_versions`**. It is surfaced as `recent_changes`, named for what it is. A tool promising a migration guide would be a confident wrong answer |
+| **The bundle fails loud; `realityFor` fails open** | nothing here is on a transaction's path, so "this action has no fields" is a worse answer than an error — the opposite of `validate/`, which fails open because NACKing a compliant participant over *our* outage writes our failure into their report. The one exception rides on `catalog_describe_flow`, which must not stop working because the reference half is down |
+| **The body is read through a byte counter** (`#readCapped`, `PROTOCOL_SPEC_MAX_BYTES`) | the four original config-service endpoints answer in tens of kilobytes and `.json()` is fine for them. An unbounded read on a 10.5MB endpoint we do not own is how one bad upstream deploy OOMs the process instead of returning an error the model can act on |
+
+**The `reality` block is the anti-hardcoding affordance.** `catalog_describe_flow`
+now carries an optional `reality` key: the fixed sentence that this sequence is
+*one path* through the build's graph, which of its steps repeat or arrive
+unsolicited, which must echo an earlier exchange, and which actions the build
+permits that this flow never exercises. It rides on the tool the model already
+reads before every run, because this repo has twice recorded that **the fix is
+an affordance, not a warning** — a prompt is opt-in in every client. Capped at
+1.5KB and asserted mechanically; absent, never broken, when `protocol` is off
+or the spec is unreachable.
+
+`np_integrator` is the third prompt: a persona for helping somebody build a
+real participant, distinct from `mock_buyer` / `mock_seller`, which are personas
+for testing somebody else's.
+
+**Tier 2 — the bundled corpus** (`protocol.knowledge-corpus.ts`, ~13KB). The
+spec endpoint answers everything that varies by build and nothing about the
+network *around* a transaction: the ACK-then-callback contract, identity,
+signing, the registry and gateway, and why a flow is not the protocol. **This
+is the one bundled thing in the server, and the exception is argued rather than
+silent**: the no-bundling rule exists because build specs drift and a stale copy
+is worse than none, and none of that reaches network-wide invariants that no
+endpoint publishes. Every answer carries `AS_OF`.
+
+It is **TypeScript, not markdown files**, because the runtime image copies only
+`dist/` and `tsc` emits nothing else — a corpus read from disk would work under
+`npm run dev` and `vitest` and silently find nothing in the container. Exactly
+the failure this repo already recorded for MCP notifications.
+
 **Flow loop** — ✅ shipped
 
 - `flow_start` — session_id, flow_id → callback_url and the first `StepOutcome`. **`transaction_id` comes back `null`** and nothing is persisted but the binding; see the identity model. Validates the flow _before_ anything is sent: it must have a mock config, every step an owner, and every step key a config entry. Arms the expectation when the first step is the participant's — a model that obeys a `WAITING` outcome calls `flow_await`, never `flow_proceed`, so arming only in `proceed` meant the first callback was refused 412
@@ -707,6 +798,16 @@ src/lib/
   stdout-guard.ts  rebinds console onto stderr before anything else loads (stdio)
 
 src/modules/
+  protocol/    ✅ the published spec, sliced: gateway (one GET on the shared
+               config-service client) · bundle (10.5MB → ~1.2MB SpecBundle; the
+               upstream type divergences are normalised here) · graph (pure —
+               successors, fan-out, unsolicited, `must_echo`, `realityFor`) ·
+               attributes (**the file with the tests** — it invents the
+               JSONPath, so it shares `appendSegment` with `validate.parse.ts`)
+               · rules (the (action,name) index, and the `*`/backtick
+               normalisers) · knowledge + knowledge-corpus (Tier 2, bundled) ·
+               service (fetch · single-flight · TTL · LRU cap · resolveBuild) ·
+               tool · resource · prompt. No session, no state, no journal delta
   catalog/     ✅ config-service client, builds/flows/mock configs, actor annotation,
                catalog.inputs.ts (what a step's declared inputs *mean* — the flat
                `user_inputs` contract and the wrapper-name trap; the file with the tests)
@@ -810,6 +911,8 @@ present and does nothing is worse than one that is absent.
 Env (extend `src/config/env.ts`, keep the fail-fast-at-boot property). Live today:
 `PROFILE`, `MODULES_DISABLED`, `MODULES_ENABLED`,
 `CONFIG_SERVICE_URL`, `CONFIG_SERVICE_TIMEOUT_MS`, `CATALOG_CACHE_TTL_MS`,
+`PROTOCOL_SPEC_CACHE_TTL_MS`, `PROTOCOL_SPEC_MAX_BUNDLES`,
+`PROTOCOL_SPEC_MAX_BYTES`,
 `SESSION_TTL_MS`, `RECEIVER_PORT`, `RECEIVER_PUBLIC_URL`,
 `RECEIVER_ROUTE_PREFIX`, `MOCK_SUBSCRIBER_ID`,
 `SEND_TIMEOUT_MS`, `AWAIT_MAX_WAIT_MS`, `FLOW_STATUS_TTL_MS`,
@@ -1009,6 +1112,14 @@ npm run typecheck && npm run lint && npm test    # before declaring anything don
 ## 8. Reference map (read-only siblings)
 
 Never modify anything outside `automation-mcp/`.
+
+**`../automation-framework/` is not a sibling.** The paths below resolve from
+`~/Desktop/ondc/workbench/automation-specifications/` — the knowledge book is at
+`automation-framework/knowledge/protocol-workbench/` *inside that tree*, not
+beside this repo. Alongside it, `automation-specifications/knowledge/` holds 16
+pre-atomized per-domain-version books (~14MB, with `atoms.md`, `anchors/` and a
+`kb_query.py`). Excellent authoring input; **not a runtime source** — they live
+on one machine in another tree and this server is deployed.
 
 | Need                                                 | Look at                                                                                                                                 |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |

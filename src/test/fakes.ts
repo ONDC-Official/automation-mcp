@@ -17,6 +17,7 @@ import {
   FLOWS_RESPONSE,
   MOCK_CONFIG_RESPONSE,
 } from "@/test/ondc-fixtures.js";
+import { SPEC_RESPONSE } from "@/test/protocol-fixtures.js";
 import {
   buildRunnableMockConfig,
   RUNNABLE_CHAIN_FLOW,
@@ -41,7 +42,12 @@ import {
 
 export interface FakeConfigServiceGateway extends ConfigServiceGateway {
   /** How many times each method was called — for cache-hit assertions. */
-  readonly calls: { builds: number; flows: number; mockConfig: number };
+  readonly calls: {
+    builds: number;
+    flows: number;
+    mockConfig: number;
+    spec: number;
+  };
 }
 
 export interface FakeGatewayOptions {
@@ -82,7 +88,7 @@ export function createFakeConfigServiceGateway(
   const knownFlowIds =
     options.knownFlowIds ?? flows.map((flow: UpstreamFlow) => flow.id);
 
-  const calls = { builds: 0, flows: 0, mockConfig: 0 };
+  const calls = { builds: 0, flows: 0, mockConfig: 0, spec: 0 };
 
   function guard(): void {
     if (options.failWith) throw options.failWith;
@@ -105,6 +111,22 @@ export function createFakeConfigServiceGateway(
       guard();
       if (!knownFlowIds.includes(flowId)) return Promise.resolve(undefined);
       return Promise.resolve(runnableConfigs.get(flowId) ?? mockConfig);
+    },
+    fetchSpec(domain: string, version: string) {
+      calls.spec += 1;
+      guard();
+      // One captured build. Anything else is an unknown build, which
+      // `ProtocolService.resolveBuild` is supposed to refuse *before* reaching
+      // a gateway — a test that trips this has lost that guard.
+      if (domain !== "ONDC:FIS12" || version !== "2.0.3") {
+        return Promise.reject(
+          new Error(
+            `fake config-service has no spec for ${domain} ${version}; ` +
+              "resolveBuild should have refused this build first",
+          ),
+        );
+      }
+      return Promise.resolve(SPEC_RESPONSE as unknown);
     },
     ping() {
       guard();

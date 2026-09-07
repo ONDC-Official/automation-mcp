@@ -10,8 +10,10 @@ import {
   LoadFlowConfigOutput,
   type FlowStep,
 } from "@/modules/catalog/catalog.schema.js";
+import type { FlowReality } from "@/modules/protocol/protocol.schema.js";
 import type { CatalogService } from "@/modules/catalog/catalog.service.js";
 import { renderFlowSummary } from "@/modules/session/session.tool.js";
+import type { ProtocolService } from "@/modules/protocol/protocol.service.js";
 import type { SessionService } from "@/modules/session/session.service.js";
 
 /**
@@ -34,9 +36,55 @@ function renderStep(step: FlowStep, index: number): string {
   return `${String(index + 1).padStart(2)} ${marker} ${step.type}${owner} (${step.key})${inputs}`;
 }
 
+/**
+ * The three lines that answer "a flow is not the protocol".
+ *
+ * In the render, not only the structured output, because the render is what a
+ * model actually reads. Kept to three lines and only emitted where there is
+ * something to say — a caveat nobody reads costs the same as one nobody needs.
+ */
+function renderReality(reality: FlowReality): string[] {
+  const lines = [reality.note];
+  if (reality.not_in_this_flow.length > 0) {
+    lines.push(
+      `The build also permits: ${reality.not_in_this_flow.join(", ")}.`,
+    );
+  }
+  const repeats = reality.steps.filter((s) => s.repeatable === true);
+  const unsolicited = reality.steps.filter((s) => s.unsolicited === true);
+  if (repeats.length > 0 || unsolicited.length > 0) {
+    const parts = [
+      repeats.length > 0
+        ? `can repeat: ${repeats.map((s) => s.action).join(", ")}`
+        : undefined,
+      unsolicited.length > 0
+        ? `can arrive unsolicited: ${unsolicited.map((s) => s.action).join(", ")}`
+        : undefined,
+    ].filter((part): part is string => part !== undefined);
+    lines.push(`${parts.join("   ")}.`);
+  }
+  for (const step of reality.steps) {
+    if (step.must_echo === undefined || step.must_echo.length === 0) continue;
+    lines.push(
+      `${step.action} must echo values from ${step.must_echo.join(" / ")} — ` +
+        "read them with record_get_payload, never reuse a value from another run.",
+    );
+  }
+  return lines;
+}
+
 export function createCatalogTools(
   catalog: CatalogService,
   sessions: SessionService,
+  /**
+   * Present only when the `protocol` module runs. It supplies the `reality`
+   * block: what this flow's sequence leaves out about the live protocol.
+   *
+   * Optional rather than required because the dependency must point one way —
+   * `ProtocolService` validates a build through `CatalogService`, so this file
+   * importing the service (rather than being handed it) would close a cycle.
+   */
+  protocol?: ProtocolService,
 ): Registerable[] {
   return [
     defineTool({
@@ -136,11 +184,27 @@ export function createCatalogTools(
             ...flow.extra_sequence.map(renderStep),
           );
         }
+        if (flow.reality !== undefined) lines.push("", ...renderReality(flow.reality));
         return lines.join("\n");
       },
       handler: async ({ session_id, flow_id }) => {
         const session = await sessions.requireSession(session_id);
-        return catalog.describeFlow(session.build, flow_id, session.mock_role);
+        const detail = await catalog.describeFlow(
+          session.build,
+          flow_id,
+          session.mock_role,
+        );
+        if (protocol === undefined) return detail;
+
+        // A model reading a flow is exactly the model about to mistake it for
+        // the protocol, so this rides along here rather than waiting to be
+        // asked for. `realityFor` never throws — a flow's sequence must not
+        // become unreadable because the reference half is down.
+        const reality = await protocol.realityFor(session.build, [
+          ...detail.sequence.map((step) => step.type),
+          ...detail.extra_sequence.map((step) => step.type),
+        ]);
+        return reality === undefined ? detail : { ...detail, reality };
       },
     }),
 

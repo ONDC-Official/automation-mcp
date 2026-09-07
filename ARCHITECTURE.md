@@ -1369,6 +1369,13 @@ second call on a third party's wire.
 | `catalog_list_flows`       | yes                                                               | flow summaries with per-actor step counts                                                                                                |
 | `catalog_describe_flow`    | yes                                                               | the full sequence; every step tagged`actor: mock \| np \| unknown`                                                                       |
 | `catalog_load_flow_config` | no (idempotent)                                                   | fetch + cache a flow's mock config; returns a summary and a`cache_key`, **never** the config                                             |
+| `protocol_describe_build`  | yes                                                               | a domain/version's business context, use-cases, actions, entry actions, and error-code / rule counts. **No session needed**              |
+| `protocol_next_actions`    | yes                                                               | the legal successors of an action, marked repeatable / unsolicited / `must_echo` — the graph a flow is one path through                  |
+| `protocol_describe_action` | yes                                                               | one action's fields (meaning, owner, requiredness, enums), its rules and its echo contract. Depth- and limit-budgeted                    |
+| `protocol_search_fields`   | yes                                                               | find a field across every action by path, enum value or meaning                                                                         |
+| `protocol_explain_rule`    | yes                                                               | a rule name, error code, JSONPath or `payload_validate` finding code → the published rule it names                                       |
+| `protocol_list_error_codes`| yes                                                               | the build's error codes, by side and by NACK-vs-callback                                                                                 |
+| `protocol_search_knowledge`| yes                                                               | the bundled network-wide corpus: async contract, identity, signing, registry. Takes no build                                             |
 | `session_create`           | no                                                                | participant URL +`np_type` + build → `session_id`, derived `mock_role`, `callback_url`, available flows                                  |
 | `session_get`              | yes                                                               | the session: participant, mock role, build, callback URL, expiry                                                                         |
 | `flow_start`               | no                                                                | validates the flow, writes the binding, arms the first expectation, returns the first`StepOutcome`. `transaction_id` comes back **null** |
@@ -1389,12 +1396,21 @@ second call on a third party's wire.
 
 `ondc://builds` · `ondc://session/{sessionId}` ·
 `ondc://txn/{sessionId}/{transactionId}` (slim) · `ondc://payload/{payloadId}`
-(full body). Planned: `ondc://schema/{domain}/{version}/{action}`.
+(full body) · `ondc://spec/{domain}/{version}` ·
+`ondc://schema/{domain}/{version}/{action}` — the last is cheap, because
+`meta.components` is null and `meta.paths` carries no `$ref`, so every
+per-action schema is inlined at 0.8–6.8KB. Asserted live, since a resolver
+appearing later would be a silent breaking change.
 
 ### Prompts
 
 `mock_buyer`, `mock_seller` — the persona plus the loop discipline that makes a
 model alternate `flow_proceed` / `flow_await` correctly instead of polling.
+
+`np_integrator` — a different audience and a different failure mode: helping
+somebody build their **own** participant. The mock personas guard against
+polling and reading whole payloads; this one guards against treating a flow as
+the protocol and hardcoding a run green.
 
 ### HTTP routes
 
@@ -1562,6 +1578,9 @@ src/
   modules/
     catalog/     config-service client, builds/flows/mock configs, actor annotation,
                  catalog.inputs.ts (what a step's declared inputs *mean*)
+    protocol/    the published spec, sliced — gateway · bundle (the ingest, and where
+                 upstream's type divergences are normalised) · graph (pure: fan-out,
+                 unsolicited, must_echo, realityFor) · service · tool · prompt
     session/     sessions, NP identity, role inversion, interaction mode, endpoint index
     flow/        engine/ (the ported mapper) + the loop: start · proceed · await · status
                  · restart, prompts, flow.repository.ts (FlowBinding),
@@ -1584,6 +1603,8 @@ src/
     harness.ts         in-process client ↔ server; injects the fake gateway by default
     fakes.ts           fixture-backed ConfigServiceGateway
     ondc-fixtures.ts   real captured config-service responses — faithful, NOT executable
+    protocol-fixtures.ts one real /protocol/spec response, trimmed — keeps a flow
+                       `config` stub on purpose, so the strip can be proved
     runnable-config.ts a small invented config that genuinely runs, for loop tests
     mock-participant.ts scripted counterparty over undici's MockAgent
     cache-store-contract.ts · validation-fixtures.ts · pii-fixtures.ts

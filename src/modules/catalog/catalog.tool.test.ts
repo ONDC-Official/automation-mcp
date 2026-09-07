@@ -153,3 +153,66 @@ describe("catalog tools over MCP", () => {
     );
   });
 });
+
+describe("the reality block on catalog_describe_flow", () => {
+  it("says a flow is one path, and names what the build also permits", async () => {
+    // It rides along on the tool the model already reads before every run,
+    // rather than waiting in a tool it has to think to call. A prompt is
+    // opt-in in every client; this is not.
+    const sessionId = await openSession();
+    const result = await harness.client.callTool({
+      name: "catalog_describe_flow",
+      arguments: { session_id: sessionId, flow_id: FIXTURE_FLOW_ID },
+    });
+
+    const { reality } = result.structuredContent as {
+      reality?: { note: string; may_start_with: string[]; not_in_this_flow: string[] };
+    };
+    expect(reality).toBeDefined();
+    expect(reality?.note).toMatch(/ONE path/);
+    expect(reality?.may_start_with.length).toBeGreaterThan(0);
+    expect(textOf(result)).toMatch(/ONE path/);
+  });
+
+  it("stays inside its byte budget", async () => {
+    const sessionId = await openSession();
+    const result = await harness.client.callTool({
+      name: "catalog_describe_flow",
+      arguments: { session_id: sessionId, flow_id: FIXTURE_FLOW_ID },
+    });
+    const { reality } = result.structuredContent as { reality?: unknown };
+    expect(JSON.stringify(reality).length).toBeLessThan(1_500);
+  });
+
+  it("is absent, not broken, when the protocol module is off", async () => {
+    const off = await createHarness({ env: { MODULES_DISABLED: "protocol" } });
+    try {
+      const created = await off.client.callTool({
+        name: "session_create",
+        arguments: {
+          subscriber_url: "https://np.example.com",
+          np_type: "BAP",
+          domain: FIXTURE_BUILD.domain,
+          version: FIXTURE_BUILD.version,
+          usecase: FIXTURE_BUILD.usecase,
+        },
+      });
+      const { session } = created.structuredContent as {
+        session: { session_id: string };
+      };
+      const result = await off.client.callTool({
+        name: "catalog_describe_flow",
+        arguments: { session_id: session.session_id, flow_id: FIXTURE_FLOW_ID },
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).not.toHaveProperty("reality");
+      // The sequence itself must still be there — that is the whole point of
+      // making the block optional rather than part of the answer.
+      const { sequence } = result.structuredContent as { sequence: unknown[] };
+      expect(sequence.length).toBeGreaterThan(0);
+    } finally {
+      await off.close();
+    }
+  });
+});
