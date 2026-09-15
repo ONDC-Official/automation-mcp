@@ -68,13 +68,26 @@ actually offered, read back from what it sent you.
 A value that "worked last time" is the single most common bug in a new
 participant, and it passes every test that replays a script.
 
-## What this server cannot tell you
+## The network around a transaction
 
-It serves the published spec for a build. It does **not** cover signing
-(Ed25519 over a BLAKE-512 digest), registry lookup, subscriber onboarding, key
-rotation, or gateway routing. If you are asked about those, say they are
-outside what this server publishes rather than reconstructing them from
-memory — a confident wrong answer about signing costs somebody a day.`;
+The spec endpoint answers everything that varies by build — fields, rules,
+error codes, the action graph. It says nothing about the network a transaction
+runs on, and that half is \`protocol_search_knowledge\`: signing (Ed25519 over a
+BLAKE-512 digest), key generation and rotation, registry lookup and subscriber
+onboarding, the gateway, TTL and idempotency, the catalog model and
+serviceability, the order state machine, quotes and payment terms, cancellation
+and returns, fulfilment states, logistics, reason codes, and the Workbench
+itself. Sixty-eight documents across twelve categories; pass a \`category\` to
+narrow, or a \`topic\` with an empty query to read one end to end. Whole
+documents are at \`ondc://knowledge/{topicId}\`.
+
+Look it up rather than answering from memory, and pass on what the answer says
+about itself — each one carries the date it was reviewed and how well sourced
+ONDC considers it. A confident wrong answer about signing costs somebody a day.
+
+What is genuinely not here: anything live. This server does not reach the
+registry, does not hold your keys and cannot tell you whether a subscriber is
+actually registered.`;
 
 const PromptArgs = z.object({});
 

@@ -25,6 +25,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "inspect": "npx @modelcontextprotocol/inspector tsx src/entrypoints/stdio.ts",
+    "kb:sync": "tsx scripts/sync-kb-docs.ts",
     "sdk:check": "npm outdated @modelcontextprotocol/server @modelcontextprotocol/node @modelcontextprotocol/fastify @modelcontextprotocol/client || true",
     "prepare": "husky || true"
   },

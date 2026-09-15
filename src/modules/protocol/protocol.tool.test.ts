@@ -395,6 +395,77 @@ describe("protocol tools over MCP", () => {
       const out = result.structuredContent as { sections: { topic: string }[] };
       expect(out.sections.map((s) => s.topic)).toContain("flows-vs-reality");
     });
+
+    it("reaches the published knowledge base, not only its own notes", async () => {
+      const result = await harness.client.callTool({
+        name: "protocol_search_knowledge",
+        arguments: { query: "how do I rotate my signing key", limit: 4 },
+      });
+      expect(result.isError).toBeFalsy();
+      const out = result.structuredContent as {
+        sections: { topic: string; tier: string; status?: string }[];
+        kb: { repo: string; sha: string; docs: number; as_of: string };
+      };
+      expect(out.sections.map((s) => s.topic)).toContain("30-key-rotation");
+      expect(out.kb.repo).toBe("ONDC-Official/automation-kb-studio");
+      expect(out.kb.docs).toBe(63);
+      expect(out.kb.sha).toMatch(/^[0-9a-f]{40}$/);
+    });
+
+    it("renders provenance into the text, not just the structured content", async () => {
+      // The rendered text is what the model reads. A status of `partial` that
+      // only reaches a code consumer has told nobody anything.
+      const result = await harness.client.callTool({
+        name: "protocol_search_knowledge",
+        arguments: { query: "awb shipping label", limit: 2 },
+      });
+      const text = textOf(result);
+      expect(text).toContain("51-awb-shipping-label");
+      expect(text).toContain("Fulfillment & Logistics");
+      expect(text).toMatch(/matching sections/);
+      expect(text).toMatch(/ONDC docs \d{4}-\d{2}-\d{2} @ [0-9a-f]{7}/);
+    });
+
+    it("narrows to a category, and says which ones exist", async () => {
+      const result = await harness.client.callTool({
+        name: "protocol_search_knowledge",
+        arguments: {
+          query: "state machine",
+          category: "Order Lifecycle",
+          limit: 3,
+        },
+      });
+      const out = result.structuredContent as {
+        sections: { category?: string }[];
+        categories: string[];
+      };
+      expect(out.sections.length).toBeGreaterThan(0);
+      expect(out.sections.every((s) => s.category === "Order Lifecycle")).toBe(
+        true,
+      );
+      expect(out.categories).toHaveLength(12);
+    });
+
+    it("refuses an unknown topic instead of answering nothing", async () => {
+      // An empty answer reads as "the network has nothing on this", which is a
+      // much more expensive thing for a model to believe than a typo.
+      const result = await harness.client.callTool({
+        name: "protocol_search_knowledge",
+        arguments: { query: "keys", topic: "key-rotation" },
+      });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toMatch(/knowledge topic/i);
+    });
+
+    it("keeps a default answer small enough to be worth reading", async () => {
+      // Tool output reaches the model twice — once rendered, once as
+      // structured content — so the budget is effectively halved.
+      const result = await harness.client.callTool({
+        name: "protocol_search_knowledge",
+        arguments: { query: "ondc network participant catalog order" },
+      });
+      expect(textOf(result).length).toBeLessThan(6_000);
+    });
   });
 
   describe("resources", () => {
@@ -405,6 +476,43 @@ describe("protocol tools over MCP", () => {
       });
       const card = JSON.parse(resourceText(result)) as { domain: string };
       expect(card.domain).toBe(BUILD.domain);
+    });
+
+    it("lists every knowledge topic, both layers, with its facets", async () => {
+      const result = await harness.client.readResource({
+        uri: "ondc://knowledge",
+      });
+      const body = JSON.parse(resourceText(result)) as {
+        topics: { id: string; tier: string; category?: string }[];
+        total: number;
+        categories: string[];
+      };
+      expect(body.total).toBe(68);
+      expect(body.categories).toHaveLength(12);
+      expect(body.topics.map((t) => t.id)).toContain("signing");
+      expect(body.topics.map((t) => t.id)).toContain("30-key-rotation");
+    });
+
+    it("serves one whole knowledge document as markdown", async () => {
+      // The follow-up to a search hit. A resource, so it lands in context only
+      // when a client actually pulls it.
+      const result = await harness.client.readResource({
+        uri: "ondc://knowledge/30-key-rotation",
+      });
+      const text = resourceText(result);
+      expect(text).toContain("# Key Rotation");
+      expect(text).toContain("Published by ONDC.");
+      expect(text).toContain("Category: Security & Auth.");
+      expect(text).toContain("## Objective");
+    });
+
+    it("serves the hand-written notes through the same uri", async () => {
+      const result = await harness.client.readResource({
+        uri: "ondc://knowledge/signing",
+      });
+      expect(resourceText(result)).toContain(
+        "This server's own orientation notes.",
+      );
     });
 
     it("serves one action's schema, fully inlined", async () => {

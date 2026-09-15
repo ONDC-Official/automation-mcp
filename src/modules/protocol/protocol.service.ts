@@ -30,6 +30,12 @@ import {
 } from "@/modules/protocol/protocol.rules.js";
 import {
   AS_OF,
+  CATEGORIES,
+  hasTopic,
+  KB_AS_OF,
+  KB_SOURCE,
+  knowledgeDoc,
+  knowledgeIndex,
   searchKnowledge as searchCorpus,
   TOPICS,
 } from "@/modules/protocol/protocol.knowledge.js";
@@ -589,26 +595,75 @@ export class ProtocolService {
   /**
    * The network-wide corpus. No build, because none of it varies by build —
    * that is exactly why it is bundled rather than fetched.
+   *
+   * Two layers behind one query: this server's five orientation notes and the
+   * 63 documents ONDC publishes. The model is not asked to choose between
+   * them, because a model asked to pick between two near-identical tools picks
+   * wrong.
    */
   searchKnowledge(input: SearchKnowledgeInput): SearchKnowledgeOutput {
+    if (input.topic !== undefined && !hasTopic(input.topic)) {
+      // With five topics a typo was obvious. With sixty-eight, an empty answer
+      // reads as "the network has nothing on this" — which is a different and
+      // much more expensive thing to believe.
+      throw new NotFoundError("knowledge topic", input.topic, {
+        categories: [...CATEGORIES],
+        nearest: nearestTopics(input.topic),
+      });
+    }
+
     const limit = input.limit ?? 3;
     const found = searchCorpus(input.query, {
       topic: input.topic,
+      category: input.category,
       limit,
     });
+    const narrowed = input.topic !== undefined || input.category !== undefined;
+
     return {
       query: input.query,
       total: found.total,
       returned: found.sections.length,
       truncated: found.total > found.sections.length,
+      elided: found.elided,
       sections: found.sections,
-      topics: [...TOPICS],
+      categories: [...CATEGORIES],
+      // Sixty-eight ids on every answer is noise, and tool output reaches a
+      // model twice — once rendered, once as structured content. They are
+      // worth the space only when the caller has nothing else to go on.
+      ...(found.sections.length === 0 || narrowed
+        ? { topics: [...TOPICS] }
+        : {}),
       as_of: AS_OF,
+      kb: {
+        repo: KB_SOURCE.repo,
+        sha: KB_SOURCE.sha,
+        path: KB_SOURCE.path,
+        docs: knowledgeIndex().filter((entry) => entry.tier === "kb").length,
+        as_of: KB_AS_OF,
+      },
       note:
         "This is written down in this server rather than fetched from the " +
         "network, so weigh its age. Anything build-specific — fields, rules, " +
-        "error codes — comes from protocol_describe_action instead.",
+        "error codes — comes from protocol_describe_action instead. Whole " +
+        "documents are at ondc://knowledge/{topic}.",
     };
+  }
+
+  /** The knowledge index, for `ondc://knowledge`. */
+  knowledgeIndex(): ReturnType<typeof knowledgeIndex> {
+    return knowledgeIndex();
+  }
+
+  /** One whole knowledge document, for `ondc://knowledge/{topicId}`. */
+  knowledgeDoc(id: string): NonNullable<ReturnType<typeof knowledgeDoc>> {
+    const doc = knowledgeDoc(id);
+    if (doc === undefined) {
+      throw new NotFoundError("knowledge topic", id, {
+        nearest: nearestTopics(id),
+      });
+    }
+    return doc;
   }
 
   /** One action's request schema, for the resource. */
@@ -695,4 +750,21 @@ function dominantOwner(fields: readonly FieldNode[]): string | undefined {
   const [top] = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   if (top === undefined) return undefined;
   return top[1] / total >= 0.6 ? top[0] : undefined;
+}
+
+/**
+ * Ids worth suggesting for one that does not exist.
+ *
+ * A bare "no such topic" leaves a model guessing at a list of sixty-eight it
+ * cannot see; the ids share long slugs, so a shared token is almost always the
+ * right hint.
+ */
+function nearestTopics(id: string): string[] {
+  const parts = id
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((p) => p.length > 2);
+  return TOPICS.filter((topic) =>
+    parts.some((part) => topic.toLowerCase().includes(part)),
+  ).slice(0, 5);
 }

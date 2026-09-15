@@ -80,6 +80,13 @@ function instructionsFor(container: Container): string {
       "inferring it from a flow that happened to pass. When a payload is refused,",
       "protocol_explain_rule takes the finding's code — or its json_path — and",
       "returns the published rule it broke.",
+      "",
+      "For how the network itself works rather than what one build publishes —",
+      "signing and key rotation, the registry and gateway, onboarding, TTL and",
+      "idempotency, the catalog model, the order state machine, error and reason",
+      "codes — use protocol_search_knowledge. A prompt is opt-in and this is not,",
+      "so: that tool exists, it needs no session, and it is where those answers",
+      "come from instead of from memory.",
     );
   }
   if (features.enabled("feedback")) {

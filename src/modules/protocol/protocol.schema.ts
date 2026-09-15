@@ -555,11 +555,26 @@ export const SearchKnowledgeInput = z.object({
   query: z
     .string()
     .describe(
-      "What you want to know about the ONDC network itself — signing, the " +
-        "registry, TTLs, retries, the async contract.",
+      "What you want to know about the ONDC network itself — signing and key " +
+        "rotation, the registry and gateway, TTLs and retries, the async " +
+        "contract, the catalog model, the order state machine, reason codes. " +
+        "Leave empty and pass `topic` to read one document end to end.",
     ),
-  topic: z.string().optional().describe("Restrict to one topic id."),
-  limit: z.number().int().positive().max(10).optional(),
+  topic: z
+    .string()
+    .optional()
+    .describe(
+      "Restrict to one topic id, e.g. `signing` or `30-key-rotation`. An id " +
+        "that does not exist is an error, not an empty answer.",
+    ),
+  category: z
+    .string()
+    .optional()
+    .describe(
+      "Restrict to one category, e.g. `Security & Auth`, `Order Lifecycle`. " +
+        "The full list comes back on every answer.",
+    ),
+  limit: z.number().int().positive().max(20).optional(),
 });
 export type SearchKnowledgeInput = z.infer<typeof SearchKnowledgeInput>;
 
@@ -568,19 +583,65 @@ export const KnowledgeSection = z.object({
   title: z.string(),
   heading: z.string(),
   body: z.string(),
+  tier: z
+    .enum(["core", "kb"])
+    .describe(
+      "`core` is this server's own orientation notes; `kb` is the knowledge " +
+        "base ONDC publishes.",
+    ),
+  category: z.string().optional(),
+  status: z
+    .string()
+    .optional()
+    .describe(
+      "How well sourced the document is upstream: `source-confirmed`, " +
+        "`partial` or `overview`. Weigh an answer accordingly.",
+    ),
+  truncated: z
+    .boolean()
+    .describe(
+      "The section was cut to fit the answer's budget. Read the whole " +
+        "document at `ondc://knowledge/{topic}`.",
+    ),
+});
+
+export const KnowledgeProvenance = z.object({
+  repo: z.string(),
+  sha: z.string(),
+  path: z.string(),
+  docs: z.number().int(),
+  as_of: z.string(),
 });
 
 export const SearchKnowledgeOutput = z.object({
   query: z.string(),
   ...Truncatable,
+  elided: z
+    .number()
+    .int()
+    .describe("Sections that matched and were dropped to fit the budget."),
   sections: z.array(KnowledgeSection),
-  topics: z.array(z.string()).describe("Every topic id available."),
+  categories: z
+    .array(z.string())
+    .describe("Every category `category` accepts."),
+  topics: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Every topic id. Sent only when the answer was empty or narrowed — " +
+        "there are 68 of them, and listing them on every call is noise.",
+    ),
   as_of: z
     .string()
     .describe(
-      "When this corpus was last reviewed. It is written down here rather " +
-        "than fetched, so it can go stale — say so if the answer matters.",
+      "When this server's own notes were last reviewed. They are written " +
+        "down here rather than fetched, so they can go stale — say so if the " +
+        "answer matters.",
     ),
+  kb: KnowledgeProvenance.describe(
+    "Where the published half came from, so an answer can be traced past " +
+      "this server to a commit.",
+  ),
   note: z.string(),
 });
 export type SearchKnowledgeOutput = z.infer<typeof SearchKnowledgeOutput>;

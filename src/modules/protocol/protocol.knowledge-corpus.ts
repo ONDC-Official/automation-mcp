@@ -25,6 +25,16 @@
  * *"it would have worked over HTTP and silently not over stdio."* So the
  * documents live here, as escaped template literals, and there is one source
  * of truth for each.
+ *
+ * ## The second corpus
+ *
+ * `protocol.kb-corpus.generated.ts` holds the published ONDC knowledge base
+ * (`ONDC-Official/automation-kb-studio/kb-docs`) under the same argument and
+ * the same shape. It is vendored at a pinned commit rather than fetched,
+ * because a content change should arrive as a reviewable diff rather than as a
+ * silent difference between two deployments of the same image. The five
+ * documents below are *not* superseded by it: they are the orientation layer,
+ * and `protocol.knowledge.ts` reserves a result slot for them.
  */
 
 /** When this corpus was last reviewed against the published ONDC docs. */
@@ -34,6 +44,24 @@ export interface KnowledgeDoc {
   readonly id: string;
   readonly title: string;
   readonly body: string;
+  /**
+   * Which layer this document belongs to.
+   *
+   * `core` is the hand-written orientation layer below — short, blunt, written
+   * for a model driving *this* server. `kb` is the published ONDC knowledge
+   * base (`protocol.kb-corpus.generated.ts`), longer and written for somebody
+   * implementing a participant. Absent means `core`: the five documents in
+   * this file predate the split and restating it on each would be noise.
+   */
+  readonly tier?: "core" | "kb";
+  /** One of the twelve kb-docs categories. Absent on the core layer. */
+  readonly category?: string;
+  /** `source-confirmed` | `partial` | `overview`, verbatim from the index. */
+  readonly status?: string;
+  /** What the document cites, so an answer can be traced past this server. */
+  readonly sources?: readonly string[];
+  /** Ids this document cross-references, resolved from its own `see` notes. */
+  readonly see_also?: readonly string[];
 }
 
 export const KNOWLEDGE: readonly KnowledgeDoc[] = [

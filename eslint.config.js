@@ -12,6 +12,10 @@ export default tseslint.config(
       // rules have no program for them.
       "*.config.js",
       "*.config.ts",
+      // Same reason: `tsconfig.json` sets `include: ["src"]`, so a generator
+      // script has no program either. Everything about `kb:sync` that is worth
+      // checking lives in `src/modules/protocol/protocol.kb-ingest.ts`.
+      "scripts/**",
     ],
   },
   js.configs.recommended,

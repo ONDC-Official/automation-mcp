@@ -347,10 +347,16 @@ export function createProtocolTools(protocol: ProtocolService): Registerable[] {
       title: "How the ONDC network works",
       description:
         "The parts of ONDC that do not vary by build and that no spec " +
-        "endpoint publishes: the ACK-then-callback contract, transaction and " +
-        "message identity, request signing, the registry and gateway, and why " +
-        "a flow is not the protocol. Use this for 'how does X work' rather " +
-        "than 'what fields does X have'.",
+        "endpoint publishes. Two layers behind one query: this server's own " +
+        "orientation notes (the ACK-then-callback contract, identity, " +
+        "signing, the registry and gateway, why a flow is not the protocol) " +
+        "and the knowledge base ONDC publishes — signing and key rotation, " +
+        "onboarding and lookup, the gateway, TTL and idempotency, the " +
+        "catalog model and serviceability, the order state machine, quotes, " +
+        "payment terms, cancellation and returns, fulfillment states, " +
+        "logistics, error and reason codes, and the Workbench. Use it for " +
+        "'how does X work' rather than 'what fields does X have'. Pass a " +
+        "`topic` with an empty `query` to read one document end to end.",
       inputSchema: SearchKnowledgeInput,
       outputSchema: SearchKnowledgeOutput,
       annotations: {
@@ -360,16 +366,46 @@ export function createProtocolTools(protocol: ProtocolService): Registerable[] {
       },
       render: (out) => {
         if (out.sections.length === 0) {
-          return `Nothing on "${out.query}". Topics: ${out.topics.join(", ")}.`;
+          return [
+            `Nothing on "${out.query}".`,
+            `Categories: ${out.categories.join(", ")}.`,
+            out.topics ? `Topics: ${out.topics.join(", ")}.` : "",
+          ]
+            .filter((line) => line !== "")
+            .join("\n");
         }
-        return [
-          ...out.sections.map(
-            (section) =>
-              `## ${section.title} — ${section.heading}\n\n${section.body}`,
-          ),
-          "",
-          `(reviewed ${out.as_of}; topics: ${out.topics.join(", ")})`,
-        ].join("\n\n");
+
+        const hits = out.sections.map((section) => {
+          // The provenance line is what lets an answer be weighed: which
+          // layer it came from, and how well sourced upstream says it is.
+          const origin = [
+            section.topic,
+            section.category,
+            section.status,
+            section.tier === "core" ? "this server's own notes" : undefined,
+          ]
+            .filter((part) => part !== undefined && part !== "")
+            .join(" · ");
+          const cut = section.truncated
+            ? `\n\n_(cut to fit — whole document at ondc://knowledge/${section.topic})_`
+            : "";
+          return `## ${section.title} — ${section.heading}\n_${origin}_\n\n${section.body}${cut}`;
+        });
+
+        // Said out loud, not left in structuredContent. A model that cannot
+        // see what was withheld cannot ask for it.
+        const footer = [
+          `${String(out.returned)} of ${String(out.total)} matching sections`,
+          out.elided > 0
+            ? `${String(out.elided)} more dropped to fit the budget`
+            : undefined,
+          `notes reviewed ${out.as_of}`,
+          `ONDC docs ${out.kb.as_of} @ ${out.kb.sha.slice(0, 7)}`,
+        ]
+          .filter((part) => part !== undefined)
+          .join("; ");
+
+        return [...hits, "", `(${footer})`].join("\n\n");
       },
       handler: (input) => Promise.resolve(protocol.searchKnowledge(input)),
     }),

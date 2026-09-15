@@ -151,10 +151,14 @@ fact. These tools answer questions instead of driving runs.
   a finding code exactly as `payload_validate` reported it
 - `protocol_list_error_codes` — the catalogue, narrowed by side or by whether a
   code belongs in a NACK or in a callback's `error` object
-- `protocol_search_knowledge` — the network-wide corpus (below). Takes no build
+- `protocol_search_knowledge` — the network-wide corpus (below): 68 documents
+  across twelve categories, in two layers, searched together. Takes no build.
+  `category` narrows; a `topic` with an empty `query` reads one document end to
+  end, which is why there is no separate doc-fetch tool
 
-Resources: `ondc://spec/{domain}/{version}` and
-`ondc://schema/{domain}/{version}/{action}` — the latter planned since day one
+Resources: `ondc://spec/{domain}/{version}`,
+`ondc://schema/{domain}/{version}/{action}`, `ondc://knowledge` and
+`ondc://knowledge/{topicId}` — the schema one planned since day one
 and cheap now that `meta.components` is null and `meta.paths` has no `$ref`. A
 resource rather than a field on `describe_action` **because a resource is
 pulled deliberately**: unlike a tool result it does not land in context on a
@@ -200,19 +204,46 @@ or the spec is unreachable.
 real participant, distinct from `mock_buyer` / `mock_seller`, which are personas
 for testing somebody else's.
 
-**Tier 2 — the bundled corpus** (`protocol.knowledge-corpus.ts`, ~13KB). The
-spec endpoint answers everything that varies by build and nothing about the
-network *around* a transaction: the ACK-then-callback contract, identity,
-signing, the registry and gateway, and why a flow is not the protocol. **This
-is the one bundled thing in the server, and the exception is argued rather than
-silent**: the no-bundling rule exists because build specs drift and a stale copy
-is worse than none, and none of that reaches network-wide invariants that no
-endpoint publishes. Every answer carries `AS_OF`.
+**Tier 2 — the bundled corpus**, two layers behind one query. The spec endpoint
+answers everything that varies by build and nothing about the network *around*
+a transaction. **This is the one bundled thing in the server, and the exception
+is argued rather than silent**: the no-bundling rule exists because build specs
+drift and a stale copy is worse than none, and none of that reaches
+network-wide invariants that no endpoint publishes.
 
-It is **TypeScript, not markdown files**, because the runtime image copies only
-`dist/` and `tsc` emits nothing else — a corpus read from disk would work under
-`npm run dev` and `vitest` and silently find nothing in the container. Exactly
-the failure this repo already recorded for MCP notifications.
+| Layer | What it is |
+| ----- | ---------- |
+| `protocol.knowledge-corpus.ts` (~13KB, 5 docs) | hand-written **orientation** — the ACK-then-callback contract, identity, signing, the registry and gateway, why a flow is not the protocol. Short and blunt, written for a model driving *this* server. Carries `AS_OF` |
+| `protocol.kb-corpus.generated.ts` (~136KB, 63 docs) | the **published depth** — ONDC's own knowledge base, vendored from `ONDC-Official/automation-kb-studio/kb-docs`. Signing and key rotation, onboarding and lookup, the gateway, TTL and idempotency, the catalog model, the order state machine, reason codes, fulfillment, logistics, the Workbench. Twelve categories. Carries `KB_AS_OF` **and the commit it came from** |
+
+Both are **TypeScript, not markdown files**, because the runtime image copies
+only `dist/` and `tsc` emits nothing else — a corpus read from disk would work
+under `npm run dev` and `vitest` and silently find nothing in the container.
+Exactly the failure this repo already recorded for MCP notifications.
+
+| Fact | Consequence |
+| ---- | ----------- |
+| **Vendored at a pinned SHA** (`npm run kb:sync`), not fetched at runtime | a content change arrives as a reviewable diff instead of as a silent difference between two deployments of the same image, and the knowledge tools do not go dark when a host we do not own is unreachable. The generated module is checked in; the build has no codegen step and needs no network |
+| **`protocol.kb-ingest.ts` holds every part of the sync that can be wrong** — the index parse, the document parse, the cross-reference scrape, the TS escaper — and `scripts/sync-kb-docs.ts` only fetches and writes | `tsconfig` is `include: ["src"]`, so a `scripts/*.ts` file is outside the program: not typechecked, and ESLint's type-aware rules have no program for it. This is `validate.parse.ts`'s pattern — **the file that can be wrong in a way nothing downstream catches is the file with the tests.** The sync also round-trips what it wrote, because a corrupt escape typechecks perfectly |
+| **The ingest fails loud** — a file with no index row, a row with no file, a document without exactly one H1 | nothing here is on a transaction's path, so `realityFor`'s fail-open argument does not reach it. A corpus that silently ingests 61 of 63 documents answers "the network has nothing on key rotation" forever, with no error anywhere |
+| **One tool, not two.** The layers are searched together, with a slot **reserved** for the orientation layer rather than a score bonus buying it one | two near-identical tools is a choice a model gets wrong. And a `CORE_BONUS` would have been tuned until the eight original routing assertions went green — at which point they pass by coincidence, and the next well-scoring upstream document silently pushes `signing` out again |
+| **Every scoring contribution is multiplied by the matched term's rarity**, coverage and bonuses alike | flat bonuses reintroduce the exact bug that weighting coverage fixed. `async-contract` tied the `signing` document for "how do I sign a request" — to the decimal — because its *title* contains `request`, and a title hit on a word in half the corpus counted for as much as one on `sign` |
+| **Thin sections are penalised; long ones are not** | the reverse was tried first and was wrong twice over: once coverage is rarity-weighted a long section gets no free matches, and penalising length promoted all sixty-three one-sentence `## Deliverable` sections. `## Protocol nuances` is boilerplate-headed and carries the best prose in the corpus, so only *thinness* is penalised, never the heading |
+| **`## Objective` / `## Sources` / `## Deliverable` are excluded from the heading bonus, not from the body text** | every published document has all of them, so weighting the heading rewards structure rather than relevance |
+| **68 topic ids are no longer listed on every answer** — categories are, topics only when the answer was empty or narrowed | tool output reaches the model twice, once rendered and once as `structuredContent`. A 2KB footer of ids on every call is the kind of cost nothing reports |
+| **An unknown `topic` is an error, with the nearest ids named** | with five topics a typo was obvious. With sixty-eight, an empty answer reads as "the network has nothing on this", which is a much more expensive thing for a model to believe |
+
+Whole documents are **resources**, not tool output: `ondc://knowledge` (the
+index) and `ondc://knowledge/{topicId}` (one document, as markdown). That is the
+argument `protocol.resource.ts` already made for `ondc://schema` — a resource is
+pulled deliberately and does not land in context on a call the model did not
+intend — and at 68 documents it finally had something to apply to.
+
+`np_integrator` and the server preamble (`mcp/server.ts#instructionsFor`) both
+name the tool. The prompt used to say the server "does **not** cover signing,
+registry lookup, subscriber onboarding, key rotation, or gateway routing" —
+wrong on two counts by the time the corpus landed and on all five now. **A
+prompt is opt-in in every client**, which is why the preamble carries it too.
 
 **Flow loop** — ✅ shipped
 
@@ -359,8 +390,9 @@ the receiver validates what arrives, inside the ACK window. Both **fail open**.
 
 **Resources** — read-only grounding, no side effects. Shipped: `ondc://builds` ·
 `ondc://session/{sessionId}` · `ondc://txn/{sessionId}/{transactionId}` (slim) ·
-`ondc://payload/{payloadId}` (full body). Planned:
-`ondc://schema/{domain}/{version}/{action}`.
+`ondc://payload/{payloadId}` (full body) · `ondc://spec/{domain}/{version}` ·
+`ondc://schema/{domain}/{version}/{action}` · `ondc://knowledge` (the index) ·
+`ondc://knowledge/{topicId}` (one document, as markdown).
 
 **Prompts** — ✅ `mock_buyer`, `mock_seller`: the persona + loop discipline that makes a
 model alternate `flow_proceed` / `flow_await` correctly instead of polling.
@@ -805,7 +837,10 @@ src/modules/
                attributes (**the file with the tests** — it invents the
                JSONPath, so it shares `appendSegment` with `validate.parse.ts`)
                · rules (the (action,name) index, and the `*`/backtick
-               normalisers) · knowledge + knowledge-corpus (Tier 2, bundled) ·
+               normalisers) · knowledge (two-layer search: rarity-weighted
+               coverage, reserved core slot) + knowledge-corpus (Tier 2a,
+               hand-written) + kb-ingest/kb-corpus.generated (Tier 2b, the
+               published ONDC docs, vendored by `npm run kb:sync`) ·
                service (fetch · single-flight · TTL · LRU cap · resolveBuild) ·
                tool · resource · prompt. No session, no state, no journal delta
   catalog/     ✅ config-service client, builds/flows/mock configs, actor annotation,
