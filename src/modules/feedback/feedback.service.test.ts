@@ -4,6 +4,7 @@ import { UpstreamError } from "@/lib/errors.js";
 import { FeedbackRepository } from "@/modules/feedback/feedback.repository.js";
 import { FeedbackService } from "@/modules/feedback/feedback.service.js";
 import { NoopSink } from "@/modules/feedback/feedback.sink.js";
+import { UNSCOPED_SESSION } from "@/modules/feedback/feedback.schema.js";
 import { FlowRepository } from "@/modules/flow/flow.repository.js";
 import { RecordRepository } from "@/modules/record/record.repository.js";
 import { CacheSessionRepository } from "@/modules/session/session.repository.js";
@@ -494,5 +495,152 @@ describe("FeedbackService — it cannot break its callers", () => {
 
     expect(await h.feedback.list(SESSION)).toEqual([]);
     expect(h.journalled).toEqual([]);
+  });
+});
+
+describe("FeedbackService — a report with no incident behind it", () => {
+  const narration = {
+    diagnosis: "protocol_describe_action returned a key its schema forbids",
+    attempted: ["retried with max_depth 1", "tried search_fields instead"],
+    outcome: "gave_up" as const,
+    suspected_cause: "our_tooling" as const,
+    tooling_gap: "nothing told me the result had been rejected",
+    at: "2026-09-29T10:00:00.000Z",
+  };
+
+  it("opens, narrates and ships one with no session at all", async () => {
+    const h = harness();
+
+    const incident = await h.feedback.report({
+      tool: "protocol_describe_action",
+      problem: "tool_result_rejected",
+      observed: "data/fields/items/0 must NOT have additional properties",
+      narration,
+    });
+
+    expect(incident?.trigger).toBe("MODEL_REPORTED");
+    // Terminal on arrival: nothing will ever resolve it, and `drain` must not
+    // hand it a verdict the model never reached.
+    expect(incident?.state).toBe("REPORTED");
+    expect(incident?.tool).toBe("protocol_describe_action");
+    expect(incident?.session_id).toBe(UNSCOPED_SESSION);
+
+    // The whole point: it left the machine without a run behind it.
+    expect(h.sink.delivered).toHaveLength(1);
+    const report = h.sink.delivered[0];
+    expect(report?.incident.trigger).toBe("MODEL_REPORTED");
+    expect(report?.incident.tool).toBe("protocol_describe_action");
+    expect(report?.narration?.diagnosis).toContain("protocol_describe_action");
+    expect(report?.evidence.message).toContain("additional properties");
+    // No session means no build coordinates; the existing default covers it.
+    expect(report?.build).toEqual({ domain: "unknown", version: "unknown" });
+    expect(report?.flow_id).toBe("unknown");
+  });
+
+  it("never nudges — the model is already the one reporting", async () => {
+    const h = harness();
+    await h.feedback.report({ problem: "other", narration });
+    expect(h.journalled).toEqual([]);
+  });
+
+  it("files into a session when one is named", async () => {
+    const h = harness();
+    await h.feedback.report({
+      sessionId: SESSION,
+      problem: "missing_capability",
+      narration,
+    });
+
+    const listed = await h.feedback.list(SESSION);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.state).toBe("REPORTED");
+    expect(await h.feedback.list(UNSCOPED_SESSION)).toEqual([]);
+  });
+
+  it("counts a repeat rather than filing a second row", async () => {
+    const h = harness();
+    await h.feedback.report({
+      tool: "protocol_search_fields",
+      problem: "tool_result_rejected",
+      narration,
+    });
+    await h.feedback.report({
+      tool: "protocol_search_fields",
+      problem: "tool_result_rejected",
+      narration,
+    });
+
+    const listed = await h.feedback.list(UNSCOPED_SESSION);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.occurrences).toBe(2);
+  });
+
+  it("keeps a report about a different tool separate", async () => {
+    const h = harness();
+    await h.feedback.report({
+      tool: "protocol_search_fields",
+      problem: "tool_result_rejected",
+      narration,
+    });
+    await h.feedback.report({
+      tool: "protocol_describe_action",
+      problem: "tool_result_rejected",
+      narration,
+    });
+
+    expect(await h.feedback.list(UNSCOPED_SESSION)).toHaveLength(2);
+  });
+
+  it("leaves a REPORTED incident alone at shutdown", async () => {
+    const h = harness();
+    await h.feedback.report({ problem: "other", narration });
+    await h.feedback.drain();
+
+    const listed = await h.feedback.list(UNSCOPED_SESSION);
+    // Not UNRESOLVED: that is the verdict for a run that ended still stuck,
+    // and this row never described a run.
+    expect(listed[0]?.state).toBe("REPORTED");
+    expect(h.sink.delivered).toHaveLength(1);
+  });
+
+  it("records nothing, and says so, when reporting is disabled", async () => {
+    const h = harness({ enabled: false });
+    expect(
+      await h.feedback.report({ problem: "other", narration }),
+    ).toBeUndefined();
+    expect(h.sink.delivered).toEqual([]);
+  });
+});
+
+describe("FeedbackService — schema drift", () => {
+  it("opens one incident per tool and key, whoever called it", async () => {
+    const h = harness();
+
+    h.feedback.noteToolDrift("protocol_describe_action", [
+      "fields.items[].depth",
+    ]);
+    h.feedback.noteToolDrift("protocol_describe_action", [
+      "fields.items[].depth",
+    ]);
+    await h.settle();
+
+    const listed = await h.feedback.list(UNSCOPED_SESSION);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.trigger).toBe("SCHEMA_DRIFT");
+    expect(listed[0]?.tool).toBe("protocol_describe_action");
+    expect(listed[0]?.code).toBe("fields.items[].depth");
+    expect(listed[0]?.occurrences).toBe(2);
+    expect(listed[0]?.evidence.message).toContain("undeclared keys");
+    // No nudge: the model did not do this and cannot fix it.
+    expect(h.journalled).toEqual([]);
+  });
+
+  it("files against the session that made the call, when there was one", async () => {
+    const h = harness();
+    h.feedback.noteToolDrift("flow_get_status", ["seq"], SESSION);
+    await h.settle();
+
+    expect(await h.feedback.list(SESSION)).toHaveLength(1);
+    expect(await h.feedback.list(UNSCOPED_SESSION)).toEqual([]);
   });
 });

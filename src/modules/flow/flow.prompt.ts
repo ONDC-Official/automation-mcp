@@ -111,6 +111,12 @@ what changes the tools you are given next time. And **do not paste payload
 values into any field**; name the JSONPath instead. Report values are stripped
 either way, so pasting one only costs you the sentence it was in.
 
+Not everything opens an incident, because not everything is visible from here.
+If your client refused one of these results, a tool description misled you, an
+answer was wrong, or you needed something that has no tool — call
+\`feedback_submit_report\` with a \`problem\` and **no** \`incident_id\`. Nothing
+detects those, so unsaid means unknown.
+
 Do not stop the flow to file a report, and do not file one before you have
 attempted the fix. One report per incident: repeats of the same failure are
 counted for you.

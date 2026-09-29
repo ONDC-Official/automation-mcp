@@ -18,6 +18,7 @@ import {
   REPORT_JOURNAL_LIMIT,
   REPORT_SCHEMA_VERSION,
   signatureOf,
+  UNSCOPED_SESSION,
   type Incident,
   type IncidentState,
   type IssueReport,
@@ -432,17 +433,109 @@ export class FeedbackService implements SessionEventObserver {
     );
   }
 
+  /* --------------------------- the model's own ---------------------------- */
+
+  /**
+   * An incident the model opens, about something nothing here detected.
+   *
+   * The two taps see failures that happen *inside* this server. They cannot
+   * see a result the client refused after we returned it, a tool description
+   * that pointed the wrong way, or an answer that was confidently wrong — and
+   * those are failures of exactly the kind the corpus exists to collect. The
+   * only witness is the model, and until this existed it had no incident id to
+   * quote and, on the session-less half of the surface, no session either.
+   *
+   * Opened and narrated in one call: there is nothing to wait for. `narrate`
+   * does the rest unchanged — it scrubs every free-text field, clears
+   * `flushed_at` and flushes — so a model-opened report and a detected one
+   * leave by the same path and arrive in the same shape.
+   */
+  async report(input: {
+    sessionId?: string;
+    tool?: string;
+    problem: string;
+    observed?: string;
+    narration: Narration;
+  }): Promise<Incident | undefined> {
+    if (!this.#enabled) return undefined;
+
+    const partition = input.sessionId ?? UNSCOPED_SESSION;
+    const incident = await this.#note(
+      partition,
+      undefined,
+      {
+        trigger: "MODEL_REPORTED",
+        code: input.problem,
+        ...(input.tool !== undefined ? { tool: input.tool } : {}),
+        evidence:
+          input.observed !== undefined ? { message: input.observed } : {},
+      },
+      undefined,
+      // Terminal on arrival, and no nudge: there is no run state to derive and
+      // nobody left to ask.
+      { nudge: false, state: "REPORTED" },
+    );
+    if (incident === undefined) return undefined;
+
+    return await this.narrate(partition, incident.id, input.narration);
+  }
+
+  /**
+   * A tool emitted a key its own `outputSchema` does not declare.
+   *
+   * Called by `defineTool` after it has dropped the key, so this is a report
+   * about a bug that no longer reaches the wire. It is still an incident,
+   * because the published schema and the object the handler builds are two
+   * spellings of one shape and they have now disagreed — silently, on a path
+   * where the only other symptom was a strict client refusing every result.
+   *
+   * Fire-and-forget, like the taps: a tool call must not slow down or fail for
+   * this.
+   */
+  noteToolDrift(tool: string, paths: string[], sessionId?: string): void {
+    if (!this.#enabled || paths.length === 0) return;
+    this.#schedule(
+      this.#note(
+        sessionId ?? UNSCOPED_SESSION,
+        undefined,
+        {
+          trigger: "SCHEMA_DRIFT",
+          code: paths[0] ?? "unknown",
+          tool,
+          evidence: { message: `undeclared keys: ${paths.join(", ")}` },
+        },
+        undefined,
+        { nudge: false },
+      ),
+    );
+  }
+
   /* ------------------------------- capture -------------------------------- */
 
+  /**
+   * Open an incident, or count another sighting of one.
+   *
+   * Returns the incident it wrote, which the detector taps ignore and
+   * `report()` needs: a model-opened incident is narrated in the same breath,
+   * and narration is keyed on the id minted here.
+   *
+   * `options.nudge` is false for exactly one caller. The `ISSUE_OPEN` line
+   * tells the model to go and file a report; writing it for the report the
+   * model is filing right now would ask it to answer itself.
+   */
   async #note(
     sessionId: string,
     flowId: string | undefined,
     candidate: Candidate,
     transactionId: string | undefined,
-  ): Promise<void> {
+    options: { nudge?: boolean; state?: IncidentState } = {},
+  ): Promise<Incident | undefined> {
     const signature = signatureOf(
       candidate.trigger,
-      candidate.stepKey,
+      // A detector always has a step and never a tool; `report()` and the
+      // drift hook are the other way round. One or the other, never both, so
+      // the dedupe key stays the shape `signatureOf` already documents.
+      candidate.stepKey ?? candidate.tool,
       candidate.code,
     );
 
@@ -456,12 +549,12 @@ export class FeedbackService implements SessionEventObserver {
         signature,
       );
 
-      await this.#withLock(`${sessionId}::${signature}`, async () => {
+      return await this.#withLock(`${sessionId}::${signature}`, async () => {
         const existing = await this.#repository.find(sessionId, signature);
         const now = new Date().toISOString();
 
         if (existing !== undefined) {
-          await this.#repository.save({
+          const merged: Incident = {
             ...existing,
             occurrences,
             last_seen_at: now,
@@ -473,8 +566,9 @@ export class FeedbackService implements SessionEventObserver {
             ...(transactionId !== undefined
               ? { transaction_id: transactionId }
               : {}),
-          });
-          return;
+          };
+          await this.#repository.save(merged);
+          return merged;
         }
 
         const resolvedFlowId = flowId ?? "unknown";
@@ -501,11 +595,12 @@ export class FeedbackService implements SessionEventObserver {
           ...(candidate.action !== undefined
             ? { action: candidate.action }
             : {}),
+          ...(candidate.tool !== undefined ? { tool: candidate.tool } : {}),
           signature,
           occurrences,
           first_seen_at: now,
           last_seen_at: now,
-          state: "OPEN",
+          state: options.state ?? "OPEN",
           journal_from: 0,
           // Redacted here, at capture, never at flush. A report that is never
           // sent should still not leave personal data sitting in the store.
@@ -534,6 +629,8 @@ export class FeedbackService implements SessionEventObserver {
         // The nudge. Written only on the first sighting — the `existing` branch
         // returns above — so a failure the model retries ten times asks it once,
         // which is the whole reason incidents are deduplicated by signature.
+        if (options.nudge === false) return incident;
+
         await this.#journal(sessionId, {
           kind: "ISSUE_OPEN",
           ...(flowId !== undefined ? { flow_id: flowId } : {}),
@@ -549,12 +646,15 @@ export class FeedbackService implements SessionEventObserver {
             ` — call feedback_submit_report with incident_id ${incident.id} ` +
             `once you know what happened.`,
         });
+
+        return incident;
       });
     } catch (error) {
       this.#logger.warn(
         { err: error, session_id: sessionId, signature },
         "could not record a feedback incident; nothing else is affected",
       );
+      return undefined;
     }
   }
 
@@ -627,6 +727,7 @@ export class FeedbackService implements SessionEventObserver {
             ? { step_key: incident.step_key }
             : {}),
           ...(incident.action !== undefined ? { action: incident.action } : {}),
+          ...(incident.tool !== undefined ? { tool: incident.tool } : {}),
           occurrences: incident.occurrences,
           state: incident.state,
           ...(resolvedAt !== undefined
@@ -665,7 +766,11 @@ export class FeedbackService implements SessionEventObserver {
          * on the way to the spool but a differential assertion would not, and
          * the point of the shape is that the assertion is exact.
          */
-        ...(this.#correlation
+        // The sentinel partition is not a session, so it is not an identifier
+        // to correlate on. Writing `session_id: "unscoped"` into a field
+        // documented as a clear id would be a lie in the one place this repo
+        // asserts the flag's blast radius exactly.
+        ...(this.#correlation && incident.session_id !== UNSCOPED_SESSION
           ? {
               correlation: {
                 session_id: incident.session_id,

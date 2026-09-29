@@ -176,6 +176,27 @@ describe("protocol tools over MCP", () => {
       expect(out.legal_next.length).toBeGreaterThan(0);
     });
 
+    it("declares every key it emits, depth included", async () => {
+      // The published outputSchema carries `additionalProperties: false`, so a
+      // key `toField` sets and the schema omits makes a strict client reject
+      // the whole result. `depth` did exactly that. The harness lists tools on
+      // connect, which is what makes the SDK client check this at all.
+      const result = await harness.client.callTool({
+        name: "protocol_describe_action",
+        arguments: { ...ACTION, max_depth: 2, limit: 100 },
+      });
+      const items = (
+        result.structuredContent as {
+          fields?: { items: { path: string; depth: number }[] };
+        }
+      ).fields?.items;
+      expect(items?.length).toBeGreaterThan(0);
+      for (const field of items ?? []) {
+        expect(field.depth).toBeGreaterThan(0);
+        expect(field.depth).toBeLessThanOrEqual(2);
+      }
+    });
+
     it("truncates deterministically and says it did", async () => {
       const result = await harness.client.callTool({
         name: "protocol_describe_action",
@@ -265,7 +286,26 @@ describe("protocol tools over MCP", () => {
       expect(out.hits[0]?.action).toBeTruthy();
     });
 
-    it("answers a query that matches nothing without erroring", async () => {
+    it("declares every key a hit carries", async () => {
+      // Same schema bug, same blast radius: `data/hits/N must NOT have
+      // additional properties` rejected every non-empty search.
+      const result = await harness.client.callTool({
+        name: "protocol_search_fields",
+        arguments: {
+          ...BUILD,
+          usecase: FIXTURE_BUILD.usecase,
+          query: "domain",
+        },
+      });
+      expect(result.isError).toBeFalsy();
+      const hits = (
+        result.structuredContent as { hits: { depth: number }[] }
+      ).hits;
+      expect(hits.length).toBeGreaterThan(0);
+      expect(hits[0]?.depth).toBeGreaterThan(0);
+    });
+
+    it("answers a query that matches nothing without erroring", async () =>{
       const result = await harness.client.callTool({
         name: "protocol_search_fields",
         arguments: {

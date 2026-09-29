@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHarness, type Harness } from "@/test/harness.js";
 import { NoopSink } from "@/modules/feedback/feedback.sink.js";
 import { RUNNABLE_BUILD } from "@/test/runnable-config.js";
+import { PII_PROSE, expectNoPii } from "@/test/pii-fixtures.js";
 import type {
   ListReportsOutput,
   SubmitReportOutput,
@@ -224,5 +225,146 @@ describe("feedback tools", () => {
     });
 
     expect(result.isError).toBe(true);
+  });
+
+  describe("a report with no incident behind it", () => {
+    /**
+     * The failure that produced this branch: `protocol_describe_action`
+     * answered, the *client* rejected the answer against the published output
+     * schema, and nothing on this side saw anything go wrong. No incident, no
+     * session either — `protocol_*` takes a build triple — so the one witness
+     * had nothing to quote and no way to say so.
+     */
+    const REPRO = {
+      problem: "tool_result_rejected",
+      tool: "protocol_describe_action",
+      observed:
+        "Structured content does not match the tool's output schema: " +
+        "data/fields/items/0 must NOT have additional properties",
+      diagnosis: "the result carried a key the published schema forbids",
+      attempted: ["retried with a narrower path_prefix", "tried a lower limit"],
+      outcome: "gave_up",
+      suspected_cause: "our_tooling",
+      tooling_gap: "no way to report this at all",
+    };
+
+    it("accepts one with neither a session nor an incident", async () => {
+      const result = await harness.client.callTool({
+        name: "feedback_submit_report",
+        arguments: REPRO,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const out = result.structuredContent as SubmitReportOutput;
+      expect(out.accepted).toBe(true);
+      expect(out.state).toBe("REPORTED");
+      expect(out.incident_id).toMatch(/^inc_/);
+      // No session, so no journal to drain and no events block to carry.
+      expect(out.events).toBeUndefined();
+
+      expect(sink.delivered).toHaveLength(1);
+      expect(sink.delivered[0]?.incident.trigger).toBe("MODEL_REPORTED");
+      expect(sink.delivered[0]?.incident.tool).toBe("protocol_describe_action");
+    });
+
+    it("lists it back with no session named, body and all", async () => {
+      await harness.client.callTool({
+        name: "feedback_submit_report",
+        arguments: REPRO,
+      });
+
+      const listed = await harness.client.callTool({
+        name: "feedback_list_reports",
+        arguments: { include_body: true },
+      });
+
+      expect(listed.isError).toBeFalsy();
+      const out = listed.structuredContent as ListReportsOutput;
+      expect(out.incidents).toHaveLength(1);
+      expect(out.incidents[0]?.narrated).toBe(true);
+      // The honest answer to "what are you sending about me?" has to work for
+      // these too, or the notice on them is unbacked.
+      expect(out.incidents[0]?.report?.narration?.outcome).toBe("gave_up");
+    });
+
+    it("strips what the model pasted, exactly as it strips a payload", async () => {
+      await harness.client.callTool({
+        name: "feedback_submit_report",
+        arguments: {
+          ...REPRO,
+          diagnosis: `the call said ${PII_PROSE}`,
+          observed: PII_PROSE,
+        },
+      });
+
+      expect(sink.delivered).toHaveLength(1);
+      expectNoPii(sink.delivered[0]);
+    });
+
+    it("files into the session when one is named", async () => {
+      await harness.client.callTool({
+        name: "feedback_submit_report",
+        arguments: { ...REPRO, session_id: sessionId },
+      });
+
+      const listed = await harness.client.callTool({
+        name: "feedback_list_reports",
+        arguments: { session_id: sessionId },
+      });
+      const out = listed.structuredContent as ListReportsOutput;
+      expect(out.incidents.map((i) => i.trigger)).toContain("MODEL_REPORTED");
+    });
+
+    it("refuses an incident_id with no session to authorise it", async () => {
+      const result = await harness.client.callTool({
+        name: "feedback_submit_report",
+        arguments: {
+          incident_id: "inc_whatever",
+          diagnosis: "x",
+          attempted: [],
+          outcome: "fixed",
+          suspected_cause: "unknown",
+        },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: "validation_error" },
+      });
+    });
+
+    it("refuses the two shapes half-mixed", async () => {
+      const incidentId = await openIncident();
+
+      const result = await harness.client.callTool({
+        name: "feedback_submit_report",
+        arguments: {
+          session_id: sessionId,
+          incident_id: incidentId,
+          problem: "tool_failed",
+          diagnosis: "x",
+          attempted: [],
+          outcome: "fixed",
+          suspected_cause: "unknown",
+        },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.structuredContent)).toContain("problem");
+    });
+
+    it("still needs a problem when there is no incident to answer", async () => {
+      const result = await harness.client.callTool({
+        name: "feedback_submit_report",
+        arguments: {
+          diagnosis: "something was wrong",
+          attempted: [],
+          outcome: "gave_up",
+          suspected_cause: "unknown",
+        },
+      });
+
+      expect(result.isError).toBe(true);
+    });
   });
 });

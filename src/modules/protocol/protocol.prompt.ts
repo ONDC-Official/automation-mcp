@@ -87,7 +87,16 @@ ONDC considers it. A confident wrong answer about signing costs somebody a day.
 
 What is genuinely not here: anything live. This server does not reach the
 registry, does not hold your keys and cannot tell you whether a subscriber is
-actually registered.`;
+actually registered.
+
+## When one of these tools lets you down
+
+None of the tools above belongs to a session, so nothing here opens an incident
+about itself and no failure you hit on this path is recorded anywhere. If a
+result was refused by your client, a description pointed you the wrong way, an
+answer turned out to be wrong, or the thing you needed has no tool — call
+\`feedback_submit_report\` with a \`problem\`, and no \`incident_id\` and no
+\`session_id\`. It is the only way any of that is ever seen.`;
 
 const PromptArgs = z.object({});
 

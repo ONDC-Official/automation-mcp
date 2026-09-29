@@ -40,15 +40,15 @@ const SERVER_VERSION = "0.1.0";
 function instructionsFor(container: Container): string {
   const features = resolveFeatures(container.config);
   const lines = [
-  "This server makes you a mock ONDC network participant.",
-  "You test a real participant by behaving as its counterparty: if it is a BAP",
-  "(buyer app) you act as the BPP (seller app), and vice versa. The inversion is",
-  "derived for you — never ask which role to play.",
-  "",
-  "Start with session_create, giving the participant's subscriber URL, whether it",
-  "is a BAP or a BPP, and the domain, version and use-case under test. Call",
-  "catalog_list_builds first if any of those values are uncertain; use-case names",
-  "are case- and space-sensitive. session_create returns the flows you can drive.",
+    "This server makes you a mock ONDC network participant.",
+    "You test a real participant by behaving as its counterparty: if it is a BAP",
+    "(buyer app) you act as the BPP (seller app), and vice versa. The inversion is",
+    "derived for you — never ask which role to play.",
+    "",
+    "Start with session_create, giving the participant's subscriber URL, whether it",
+    "is a BAP or a BPP, and the domain, version and use-case under test. Call",
+    "catalog_list_builds first if any of those values are uncertain; use-case names",
+    "are case- and space-sensitive. session_create returns the flows you can drive.",
   ];
   if (features.enabled("ui")) {
     lines.push(
@@ -92,8 +92,12 @@ function instructionsFor(container: Container): string {
   if (features.enabled("feedback")) {
     lines.push(
       "",
-      "When a run gets stuck, feedback_submit_report records what happened — the",
-      "tooling_gap field is the one that improves this tool surface.",
+      "When a run gets stuck, feedback_submit_report records what happened. It also",
+      "takes a report with no incident_id and no session at all: if your client",
+      "refused a result, a tool description misled you, an answer was wrong, or",
+      "something you needed does not exist, say so there — nothing on this side can",
+      "see any of that, so unsaid means unknown. The tooling_gap field is the one",
+      "that improves this tool surface.",
     );
   }
   lines.push(

@@ -59,6 +59,15 @@ export interface Candidate {
   readonly code: string;
   readonly stepKey?: string;
   readonly action?: string;
+  /**
+   * The tool this is about, for the two triggers no detector produces.
+   *
+   * Nothing in this file ever sets it — a detected failure always has a step.
+   * It is declared here because `#note` builds one incident shape from one
+   * candidate shape, and the alternative was a second parameter threaded
+   * through the same call for the sake of two callers.
+   */
+  readonly tool?: string;
   readonly evidence: IncidentEvidence;
 }
 
@@ -128,9 +137,9 @@ export function detectFromOutcome(outcome: StepOutcome): Candidate[] {
   if (outcome.outcome === "BLOCKED") {
     const details = outcome.details;
     const raw = pick(details, "findings");
-    const findings = (
-      Array.isArray(raw) ? raw : []
-    ) as NonNullable<IncidentEvidence["findings"]>;
+    const findings = (Array.isArray(raw) ? raw : []) as NonNullable<
+      IncidentEvidence["findings"]
+    >;
 
     /*
      * A block the outbound gate caused is the *same lesson* the dry-run path

@@ -90,6 +90,14 @@ export async function createHarness(
     client.connect(clientTransport),
   ]);
 
+  // Every real client lists tools before calling one, and the SDK client only
+  // checks `structuredContent` against an `outputSchema` it has already seen.
+  // Without this line the suite is the one caller in the world that never
+  // validates: `protocol_describe_action` shipped a `depth` key its schema did
+  // not declare, and every strict client rejected every non-empty result while
+  // these tests stayed green.
+  await client.listTools();
+
   return {
     client,
     container,

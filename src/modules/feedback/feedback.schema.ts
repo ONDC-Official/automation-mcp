@@ -48,6 +48,18 @@ import { ValidationFinding } from "@/modules/validate/validate.schema.js";
  * | `AWAIT_TIMEOUT`          | a bounded wait lapsed with the run still on the same step     |
  * | `RUN_ABANDONED`          | **retired.** Nothing emits it — see below                     |
  * | `INFRA_ERROR`            | one of ours: a store blip, a check that threw, a sweep that failed |
+ * | `MODEL_REPORTED`         | the model filed it; **nothing detected it**                    |
+ * | `SCHEMA_DRIFT`           | a tool emitted a key its own `outputSchema` does not declare   |
+ *
+ * The last two are the only triggers not fed by a detector, and they exist for
+ * the same failure. `protocol_describe_action` shipped a `depth` key
+ * `ActionField` did not declare; the published schema carries
+ * `additionalProperties: false`, so every strict client rejected every
+ * non-empty result — while the *call* succeeded here, the SDK's own output
+ * check passed (zod strips unknown keys rather than refusing them), and nothing
+ * on this side saw a failure at all. The only witness was the model, and it had
+ * no incident to quote. `SCHEMA_DRIFT` is now opened by `defineTool` when it
+ * drops a key; `MODEL_REPORTED` is opened by the model saying so.
  *
  * `RUN_ABANDONED` was opened on every `flow_restart`, on the reading that a
  * restart is a give-up. It is not — it is the retry the prompt, the tool
@@ -68,6 +80,8 @@ export const TriggerKind = z.enum([
   "AWAIT_TIMEOUT",
   "RUN_ABANDONED",
   "INFRA_ERROR",
+  "MODEL_REPORTED",
+  "SCHEMA_DRIFT",
 ]);
 export type TriggerKind = z.infer<typeof TriggerKind>;
 
@@ -113,6 +127,16 @@ export const IncidentState = z.enum([
    * `OPEN` rather than given a verdict they never reached.
    */
   "UNRESOLVED",
+  /**
+   * Filed by the model, about something no detector saw.
+   *
+   * Terminal on arrival, and not a claim: it states that this row exists
+   * because the model reported it, which is a fact about us rather than about
+   * the run. Nothing resolves it — `STEP_RECOVERABLE` excludes its triggers —
+   * and `claimMatches` is never asked about it, because there is no run verdict
+   * to agree or disagree with.
+   */
+  "REPORTED",
 ]);
 export type IncidentState = z.infer<typeof IncidentState>;
 
@@ -261,6 +285,14 @@ export const Incident = z.object({
     ),
   step_key: z.string().optional(),
   action: z.string().optional(),
+  /**
+   * The tool the incident is about, for the triggers that have no step.
+   *
+   * A column of its own rather than a second meaning for `step_key`: that one
+   * names a flow step, it is the corpus's most-queried facet, and a tool name
+   * sitting in it would make every query over it ambiguous.
+   */
+  tool: z.string().optional(),
 
   /**
    * The dedupe key: `{trigger}::{step_key}::{code}`. Three retries of the same
@@ -359,6 +391,7 @@ export const IssueReport = z.object({
     code: z.string(),
     step_key: z.string().optional(),
     action: z.string().optional(),
+    tool: z.string().optional(),
     occurrences: z.number().int(),
     state: IncidentState,
     /** Wall time from first sighting to resolution, when it resolved. */
@@ -400,12 +433,104 @@ export type IssueReport = z.infer<typeof IssueReport>;
 /* Tool IO                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The partition for incidents that belong to no session.
+ *
+ * Every key in `feedback.repository.ts` leads with a session id, `#touched`
+ * holds session ids, and `drain()` iterates them — so an incident with no
+ * session had nowhere to live at all. A sentinel is the small change; making
+ * `session_id` optional would have been the same decision spread over five
+ * layers. Never collides: every real session id is a uuid.
+ *
+ * Half the server needs this. `protocol_*` takes a build triple and no session
+ * at all, so the surface most likely to be *read* by somebody implementing
+ * ONDC was also the one that could not report a word about itself.
+ *
+ * The abuse bound on a partition every caller shares is the one that was
+ * already there: signature dedupe collapses repeats into `occurrences`, and
+ * `INCIDENT_INDEX_LIMIT` caps the index at 200.
+ */
+export const UNSCOPED_SESSION = "unscoped";
+
+/**
+ * What kind of thing went wrong, for a report the model opens itself.
+ *
+ * An enum rather than free text because this is the facet the corpus is
+ * queried on, and `code` on every other trigger is a published identifier —
+ * a rule code, a NACK code, a `blocked()` reason. Free text there would be the
+ * one column nobody can group by.
+ */
+export const ReportedProblem = z.enum([
+  /** A result this server returned, which the client then refused. */
+  "tool_result_rejected",
+  /** A tool answered, and the answer was wrong or led you astray. */
+  "wrong_or_misleading_answer",
+  /** A tool failed in a way you could not act on. */
+  "tool_failed",
+  /** The thing you needed to do has no tool. */
+  "missing_capability",
+  /** A published spec or flow config is itself wrong. */
+  "spec_or_config_defect",
+  "other",
+]);
+export type ReportedProblem = z.infer<typeof ReportedProblem>;
+
+/**
+ * Two shapes behind one tool.
+ *
+ * **Answering an incident** — `incident_id`, with the `session_id` that owns
+ * it. This is the original contract and it is unchanged, down to an unknown id
+ * still being a `not_found`: an id nobody minted must never be quietly opened
+ * as a new row, or a typo becomes a report with no evidence in it.
+ *
+ * **Opening one** — neither id, plus `problem`. For the failures this server
+ * cannot see: a result the *client* refused after we answered it, a tool
+ * description that misled, an answer that was wrong, a capability that is not
+ * there. Nothing detects those, so without this the only witness had no way to
+ * speak.
+ *
+ * One tool rather than two, on the argument this module already made about its
+ * own size: a second reporting tool is a decision the model pays for on every
+ * turn, out of the attention the transaction needs.
+ */
 export const SubmitReportInput = z.object({
-  session_id: z.string().min(1),
+  session_id: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "The session this is about. Required with an incident_id — it is what " +
+        "authorises reading that incident back. Omit it entirely when " +
+        "reporting something that happened outside a session.",
+    ),
   incident_id: z
     .string()
     .min(1)
-    .describe("From the ISSUE_OPEN event, or from feedback_list_reports."),
+    .optional()
+    .describe(
+      "From the ISSUE_OPEN event, or from feedback_list_reports. Omit it to " +
+        "open a report of your own about something nothing here noticed.",
+    ),
+  problem: ReportedProblem.optional().describe(
+    "What kind of thing went wrong. Required when there is no incident_id, " +
+      "and refused alongside one.",
+  ),
+  tool: z
+    .string()
+    .min(1)
+    .max(120)
+    .optional()
+    .describe(
+      "The tool or surface this is about, e.g. protocol_describe_action.",
+    ),
+  observed: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "The exact error or output you saw — paste your client's message here. " +
+        "Values are stripped before it is stored.",
+    ),
   diagnosis: z
     .string()
     .min(1)
@@ -436,7 +561,13 @@ export const SubmitReportOutput = z.object({
 export type SubmitReportOutput = z.infer<typeof SubmitReportOutput>;
 
 export const ListReportsInput = z.object({
-  session_id: z.string().min(1),
+  session_id: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Omit to list the reports you filed with no session of their own.",
+    ),
   include_body: z
     .boolean()
     .default(false)

@@ -4,7 +4,10 @@ import { logger } from "@/lib/logger.js";
 import { redactEvidence } from "@/modules/feedback/feedback.redact.js";
 import { FeedbackRepository } from "@/modules/feedback/feedback.repository.js";
 import { FeedbackService } from "@/modules/feedback/feedback.service.js";
-import type { Incident } from "@/modules/feedback/feedback.schema.js";
+import {
+  UNSCOPED_SESSION,
+  type Incident,
+} from "@/modules/feedback/feedback.schema.js";
 import { NoopSink } from "@/modules/feedback/feedback.sink.js";
 import { FlowRepository } from "@/modules/flow/flow.repository.js";
 import { RecordRepository } from "@/modules/record/record.repository.js";
@@ -136,6 +139,23 @@ describe("TELEMETRY_CORRELATION", () => {
     expect(report?.correlation).toEqual({ session_id: SESSION });
   });
 
+  it("correlates nothing for a report that belongs to no session", async () => {
+    // `UNSCOPED_SESSION` is a partition key, not an identifier. Under a flag
+    // documented as "clear ids, so a dashboard can deep-link a report to its
+    // run", a sentinel would be a link to nothing wearing the shape of one.
+    const unscoped: Incident = {
+      ...incident(),
+      session_id: UNSCOPED_SESSION,
+      trigger: "MODEL_REPORTED",
+      state: "REPORTED",
+    };
+    delete unscoped.transaction_id;
+
+    const report = await on.buildReport(unscoped);
+    expect(report).toBeDefined();
+    expect(report).not.toHaveProperty("correlation");
+  });
+
   it("still pseudonymises a transaction id inside the payload shape", async () => {
     // The structural path. `feedback.redact.ts` does not know this flag exists,
     // which is what makes this hold by construction rather than by care.
@@ -208,9 +228,7 @@ describe("TELEMETRY_CORRELATION", () => {
     const report = await withJournal.buildReport(incident());
     const line = report?.journal[0];
 
-    expect(line?.summary).not.toContain(
-      "b4f1e2a0-0000-4000-8000-000000000001",
-    );
+    expect(line?.summary).not.toContain("b4f1e2a0-0000-4000-8000-000000000001");
     expect(line?.summary).toContain("id_");
     expect(line?.summary).toContain("<email>");
 

@@ -1,7 +1,11 @@
 import type { McpServer } from "@modelcontextprotocol/server";
-import { MODULE_NAMES, resolveFeatures, type ModuleName } from "@/config/features.js";
+import {
+  MODULE_NAMES,
+  resolveFeatures,
+  type ModuleName,
+} from "@/config/features.js";
 import type { Container } from "@/container.js";
-import type { Registerable } from "@/lib/define-tool.js";
+import type { Registerable, ToolHooks } from "@/lib/define-tool.js";
 import { createCatalogResources } from "@/modules/catalog/catalog.resource.js";
 import { createCatalogTools } from "@/modules/catalog/catalog.tool.js";
 import { createFeedbackTools } from "@/modules/feedback/feedback.tool.js";
@@ -104,7 +108,24 @@ export function registerCapabilities(
   server: McpServer,
   container: Container,
 ): void {
+  /*
+   * The one place that has both the tool list and the container, which is why
+   * the drift hook is built here rather than declared per tool.
+   *
+   * `defineTool` has already dropped the undeclared keys by the time this
+   * runs; what it buys is that somebody finds out. A published schema and the
+   * object a handler builds are two spellings of one shape, and when they stop
+   * agreeing there is no other symptom on this side — the SDK's own output
+   * check passes, because zod strips rather than refuses. The symptom was
+   * entirely on the client's side, and a client cannot file an incident.
+   */
+  const hooks: ToolHooks = {
+    onOutputDrift: (tool, paths, sessionId) => {
+      container.services.feedback.noteToolDrift(tool, paths, sessionId);
+    },
+  };
+
   for (const capability of collectCapabilities(container)) {
-    capability.register(server);
+    capability.register(server, hooks);
   }
 }

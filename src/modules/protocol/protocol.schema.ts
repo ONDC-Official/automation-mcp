@@ -368,6 +368,13 @@ export const FieldEnumEntry = z.object({
 
 export const ActionField = z.object({
   path: z.string().describe("JSONPath into this action's payload."),
+  // Emitted on every field by `toField`, so it has to be declared: the
+  // published schema carries `additionalProperties: false`, and a strict
+  // client rejects the whole result over one undeclared key.
+  depth: z
+    .number()
+    .int()
+    .describe("Segments below `$`. What `max_depth` filters on."),
   required: z.boolean(),
   type: z.string().optional(),
   owner: z

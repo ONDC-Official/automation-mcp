@@ -315,15 +315,32 @@ and handed to a sink. **The report ships whether or not the model narrates it**;
 that is what makes it "every time" rather than "every time the model
 remembered".
 
+**And a third path, for the failures neither tap can see.** Both taps observe
+things that go wrong _inside_ this server. `protocol_describe_action` emitted a
+`depth` key `ActionField` did not declare; the call succeeded here, the SDK's
+own output check passed — it validates through the standard schema, which for
+zod _strips_ unknown keys rather than refusing them — and the **client** then
+rejected every non-empty result against the published JSON Schema, which
+carries `additionalProperties: false`. Nothing on this side saw a failure, so
+no incident existed; the tools took a required `session_id`, and the repro was
+on `protocol_*`, which needs none. The one witness had nothing to quote and
+nowhere to file. So `feedback_submit_report` now also takes a report with
+**neither an `incident_id` nor a `session_id`**, and `defineTool` opens a
+`SCHEMA_DRIFT` incident by itself when it drops a key.
+
 - `feedback_submit_report` — the model's account of one incident: `diagnosis`,
   `attempted`, `outcome`, `suspected_cause`, and `tooling_gap` ("what would have
   let you resolve this faster"), which is the field that actually improves this
-  tool surface. Not read-only, not idempotent — it finalises and sends
+  tool surface. Not read-only, not idempotent — it finalises and sends.
+  **Or, with no `incident_id` and no `session_id`, a report the model opens
+  itself** — `problem` (a six-value enum, so the corpus has a facet), `tool`,
+  and `observed`, which is where the client's own rejection text goes
 - `feedback_list_reports` — every incident in the session; `include_body: true`
   renders the fully-redacted report exactly as it would be uploaded, which is the
-  honest answer to a user asking what is being sent about them
+  honest answer to a user asking what is being sent about them. Omit
+  `session_id` to read back the reports that have no session
 
-Three things are load-bearing and easy to undo:
+These are load-bearing and easy to undo:
 
 | Fact                                                                                                                                                       | Consequence                                                                                                                                                                                                                                                |
 | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -333,6 +350,9 @@ Three things are load-bearing and easy to undo:
 | **Detection must not double-count.** The journal side declines `OUTBOUND_SENT`-with-NACK and `CHAIN_PAUSED`, both of which `detectFromOutcome` already saw | `chainNext` re-enters `proceed`, so a chained step is observed once, not twice. `occurrences` is the number that says how hard something was fought                                                                                                        |
 | **One defect must not open two incidents.** A findings-bearing `BLOCKED` is normalised onto `VALIDATION_FINDINGS`, because the gate and `dry_run` describe the same failure through different outcome shapes | the gate's own message tells the model to inspect with `dry_run`, so the surface walks it into the second incident. Both 2026-07-31 runs spooled the pair                                                                                                 |
 | **A restart is a retry, not a verdict.** `FLOW_RESTARTED` opens no incident and resolves none — `RUN_ABANDONED` and `ABANDONED` are retired, kept in their enums only for rows already in the corpus | `flow_restart` is what the prompt, the tool description and the dashboard's own run-status map all call the sanctioned way to try again, so treating it as a give-up filed a content-free row _and_ swept the real backlog into a terminal state, flushing it unnarrated. `ABANDONED` is sticky, so attempt 2 hitting the same wall could never re-ship — a run that fought one wall twice and then won read as "abandoned here; nobody got past it" |
+| **A report with no incident is opened, never merely accepted.** `feedback.report()` mints one through the same `#note`, with trigger `MODEL_REPORTED`, state `REPORTED` and `nudge: false`, then hands it to `narrate` unchanged | one delivery path, so a model-opened report is redacted, deduplicated, capped and spooled exactly as a detected one is. `REPORTED` is terminal on arrival because there is no run state to derive — it keeps `IncidentState` "derived, never claimed" — and it is what stops `drain` stamping `UNRESOLVED` on a report that was complete when it was filed |
+| **An unknown `incident_id` is still `not_found`, never silently opened** — and `problem` / `tool` / `observed` are refused _by name_ beside one | the two shapes must not half-mix. A mistyped id quietly becoming a new row would file a report with none of the evidence the real incident holds, which is worse than the error the model can act on |
+| **`UNSCOPED_SESSION` is a partition, not an identifier.** Reports with no session live under it, and `#renderReport` omits `correlation` entirely for them | every key in `feedback.repository.ts` leads with a session id and `drain` iterates them, so a sentinel was the small change and making the field optional through five layers was not. But under `TELEMETRY_CORRELATION`, a field documented as a clear id must never carry one that names nothing — that flag's blast radius is asserted exactly, and a lie inside it would pass |
 | **Shutdown may not mint a verdict the run never reached.** `drain` defers still-`OPEN` incidents when the state store outlives the process (`stateSurvivesShutdown`, derived from the store `createContainer` actually chose) | `dispose()` is `drain`'s only caller, so every `tsx watch` reload reached it. With Redis the session and the run are still there afterwards, and `UNRESOLVED` would set `flushed_at` — stopping the true verdict from ever shipping. In-process, the run really does end with us, so nothing is deferred and every existing drain test passes unchanged |
 
 `NODE_ENV=test` forces the no-op sink in `createContainer`, and `createHarness`
@@ -1131,6 +1151,31 @@ HTTP and the receiver: `app.inject()`. Outbound: an injected undici `MockAgent`.
 stdio: a real subprocess, asserting stdout carries only protocol bytes — the
 mock-runner writes `console.log` under `NODE_ENV=development`, so
 `lib/stdout-guard.ts` and that test are load-bearing together.
+
+**`createHarness` lists tools before it hands the client back, and that line is
+load-bearing.** The SDK client checks `structuredContent` against an
+`outputSchema` only once it has *seen* that schema, so a suite that never calls
+`tools/list` is the one caller in the world that does not validate — while
+every real client does. `protocol_describe_action` and `protocol_search_fields`
+shipped a `depth` key `ActionField` did not declare; the published schema
+carries `additionalProperties: false`, so strict clients rejected *every
+non-empty result* (`data/fields/items/N must NOT have additional properties`)
+while the whole suite stayed green. An output schema and the object a handler
+builds are two spellings of one shape, and nothing but this check keeps them
+the same one.
+
+**`defineTool` now sends the parsed value, not the handler's.** The SDK server
+validates output through the standard schema, which for zod strips unknown keys
+rather than refusing them — and then discards the stripped value and sends the
+original, which is exactly how that key reached a client. So the parse happens
+in `defineTool` and its *value* is what goes out, rendered text included, and
+an undeclared key can no longer reach any client. It is not a silent fix: the
+key sets are compared first, the dropped paths are logged, and
+`registerCapabilities` wires the one hook that turns them into a `SCHEMA_DRIFT`
+incident (`undeclaredPaths` collapses array indices, so a hundred rows are one
+path and one signature). Costs one extra validate per tool call, which is the
+price of a defect class that is invisible on this side and fatal on the
+other.
 
 The end-to-end loop test (`flow/flow.loop.test.ts`) is the one that matters:
 both directions real, payloads generated by config JavaScript in a worker,
