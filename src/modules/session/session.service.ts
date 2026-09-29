@@ -150,6 +150,9 @@ export class SessionService {
         type: input.np_type,
       },
       mock_role: mockRole,
+      ...(input.mock_subscriber_id !== undefined
+        ? { mock_subscriber_id: input.mock_subscriber_id }
+        : {}),
       build,
       interaction_mode: interactionMode,
       // Follows the interaction mode unless the caller says otherwise. An

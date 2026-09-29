@@ -6,6 +6,7 @@ import {
 } from "@/config/features.js";
 import type { Container } from "@/container.js";
 import type { Registerable, ToolHooks } from "@/lib/define-tool.js";
+import { createBatchTools } from "@/modules/batch/batch.tool.js";
 import { createCatalogResources } from "@/modules/catalog/catalog.resource.js";
 import { createCatalogTools } from "@/modules/catalog/catalog.tool.js";
 import { createFeedbackTools } from "@/modules/feedback/feedback.tool.js";
@@ -77,6 +78,7 @@ const BY_MODULE: Partial<Record<ModuleName, CapabilityFactory>> = {
     ...createFlowPrompts(),
   ],
   forms: (c) => [...createFormsTools(c.services.forms, c.services.record)],
+  batch: (c) => [...createBatchTools(c.services.batch)],
   validate: (c) => [
     ...createValidateTools(
       c.services.validate,

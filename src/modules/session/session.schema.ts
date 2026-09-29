@@ -58,6 +58,13 @@ export const Session = z.object({
   mock_role: NpType.describe(
     "The role this server plays — always the opposite of the participant's.",
   ),
+  mock_subscriber_id: z
+    .string()
+    .optional()
+    .describe(
+      "The id this mock presents as bap_id/bpp_id for this session, when it " +
+        "differs from the server's MOCK_SUBSCRIBER_ID.",
+    ),
   build: BuildRef.describe("Domain, version and use-case under test."),
   interaction_mode: InteractionMode.describe(
     "Who supplies inputs and fills forms for flows in this session.",
@@ -105,6 +112,14 @@ export const CreateSessionInput = z.object({
     .string()
     .optional()
     .describe("Registry subscriber id of the participant, when known."),
+  mock_subscriber_id: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "The id this mock presents as its own bap_id/bpp_id. Defaults to the " +
+        "server's MOCK_SUBSCRIBER_ID.",
+    ),
   interaction_mode: InteractionMode.optional().describe(
     "'llm_auto' (default) — you supply every input and fill forms yourself. " +
       "'manual' — a human supplies them; forms come back as links to hand over.",

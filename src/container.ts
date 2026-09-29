@@ -27,6 +27,9 @@ import {
 import { FlowRepository } from "@/modules/flow/flow.repository.js";
 import { FlowService } from "@/modules/flow/flow.service.js";
 import { FormsService } from "@/modules/forms/forms.service.js";
+import { BatchRepository } from "@/modules/batch/batch.repository.js";
+import { BatchService } from "@/modules/batch/batch.service.js";
+import { HttpBatchPeer } from "@/modules/batch/batch.peer.js";
 import { RecordRepository } from "@/modules/record/record.repository.js";
 import { RecordService } from "@/modules/record/record.service.js";
 import { MetricsObserver } from "@/modules/metrics/metrics.observer.js";
@@ -111,6 +114,7 @@ export interface Container {
     readonly record: RecordService;
     readonly flow: FlowService;
     readonly forms: FormsService;
+    readonly batch: BatchService;
     readonly validate: ValidateService;
     readonly feedback: FeedbackService;
   };
@@ -324,6 +328,7 @@ export async function createContainer(
     logger,
     allowedFetchBaseUrls: config.RUNNER_FETCH_ALLOWLIST,
     idleTtlMs: config.RUNNER_CACHE_TTL_MS,
+    poolSize: config.MOCK_RUNNER_POOL_SIZE,
     metrics,
   });
 
@@ -690,6 +695,30 @@ export async function createContainer(
       : {}),
   });
 
+  // Same CacheStore as session/record: batch state (meta, progress, results)
+  // must survive a restart on the same terms theirs does.
+  const batchRepository = new BatchRepository(stateStore);
+  const batch = new BatchService({
+    session,
+    flow,
+    record,
+    repository: batchRepository,
+    logger,
+    receiverPublicUrl,
+    catalog,
+    mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    ...(config.BATCH_PEER_URL !== undefined
+      ? {
+          peer: new HttpBatchPeer({
+            url: config.BATCH_PEER_URL,
+            ...(config.BATCH_PEER_API_KEY !== undefined
+              ? { apiKey: config.BATCH_PEER_API_KEY }
+              : {}),
+          }),
+        }
+      : {}),
+  });
+
   // Built after `session`: it resolves a build from either a triple or a
   // session id, and validates the triple through the catalog first. Bundles
   // live in `catalogCache` for the reason stated where that store is created —
@@ -712,6 +741,7 @@ export async function createContainer(
     record,
     flow,
     forms,
+    batch,
     validate,
     feedback,
   } as const;

@@ -129,6 +129,11 @@ export class CatalogService {
    *
    * @throws {NotFoundError} naming the flows that do exist.
    */
+  /** Every flow the build publishes, as the config-service defines them. */
+  requireFlows(build: BuildRef): Promise<UpstreamFlow[]> {
+    return this.#flows(build);
+  }
+
   async requireFlow(build: BuildRef, flowId: string): Promise<UpstreamFlow> {
     const flows = await this.#flows(build);
     const flow = flows.find((entry) => entry.id === flowId);
@@ -246,17 +251,37 @@ export class CatalogService {
     return { key, config };
   }
 
-  async #fetchMockConfig(
+  /**
+   * Concurrent callers for one key share a single upstream fetch. Without it,
+   * a cold cache under N simultaneous sessions issues N identical downloads of
+   * a config that is hundreds of KB, and the config-service times some of
+   * them out — observed live at ten concurrent order journeys.
+   */
+  readonly #inflight = new Map<string, Promise<unknown>>();
+
+  #once<T>(key: string, load: () => Promise<T>): Promise<T> {
+    const running = this.#inflight.get(key);
+    if (running) return running as Promise<T>;
+    const started = load().finally(() => {
+      this.#inflight.delete(key);
+    });
+    this.#inflight.set(key, started);
+    return started;
+  }
+
+  #fetchMockConfig(
     build: BuildRef,
     flowId: string,
     key: string,
   ): Promise<UpstreamMockConfig> {
-    const config = await this.#gateway.fetchMockConfig(build, flowId);
-    if (!config) {
-      throw new NotFoundError("flow", flowId, build);
-    }
-    await this.#cache.set(key, config, this.#ttl);
-    return config;
+    return this.#once(key, async () => {
+      const config = await this.#gateway.fetchMockConfig(build, flowId);
+      if (!config) {
+        throw new NotFoundError("flow", flowId, build);
+      }
+      await this.#cache.set(key, config, this.#ttl);
+      return config;
+    });
   }
 
   async #builds(): Promise<Build[]> {
@@ -264,9 +289,11 @@ export class CatalogService {
     const cached = await this.#cache.get<Build[]>(key);
     if (cached) return cached;
 
-    const builds = await this.#gateway.fetchBuilds();
-    await this.#cache.set(key, builds, this.#ttl);
-    return builds;
+    return this.#once(key, async () => {
+      const builds = await this.#gateway.fetchBuilds();
+      await this.#cache.set(key, builds, this.#ttl);
+      return builds;
+    });
   }
 
   async #flows(build: BuildRef): Promise<UpstreamFlow[]> {
@@ -274,9 +301,11 @@ export class CatalogService {
     const cached = await this.#cache.get<UpstreamFlow[]>(key);
     if (cached) return cached;
 
-    const flows = await this.#gateway.fetchFlows(build);
-    await this.#cache.set(key, flows, this.#ttl);
-    return flows;
+    return this.#once(key, async () => {
+      const flows = await this.#gateway.fetchFlows(build);
+      await this.#cache.set(key, flows, this.#ttl);
+      return flows;
+    });
   }
 }
 

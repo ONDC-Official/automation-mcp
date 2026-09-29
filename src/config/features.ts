@@ -36,6 +36,7 @@ export const MODULE_NAMES = [
   "transport",
   "flow",
   "forms",
+  "batch",
   "feedback",
   "metrics",
   "mirror",
@@ -83,6 +84,9 @@ const REQUIRES: Record<ModuleName, readonly ModuleName[]> = {
   session: ["catalog"],
   flow: ["session", "catalog", "record"],
   forms: ["flow"],
+  // Orchestrates many independent flow runs; needs everything a single run
+  // needs, since it is that same loop run many times concurrently.
+  batch: ["session", "catalog", "record", "flow"],
 };
 
 /**
@@ -108,7 +112,7 @@ export const PROFILES = {
   /** Everything. The default, and byte-identical to the old behaviour. */
   full: MODULE_NAMES,
   /** Drive flows and keep metrics; no viewer, no corpus, no mirror. */
-  driver: [...CORE, "metrics", "protocol"] as readonly ModuleName[],
+  driver: [...CORE, "metrics", "protocol", "batch"] as readonly ModuleName[],
   /** The loop and nothing else. */
   minimal: CORE,
 } satisfies Record<string, readonly ModuleName[]>;
