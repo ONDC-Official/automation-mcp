@@ -61,6 +61,12 @@ export interface MockEngineOptions {
   allowedFetchBaseUrls: readonly string[];
   /** How long an unused runner instance (and its config) is kept. */
   idleTtlMs: number;
+  /**
+   * Worker threads in the shared pool. Omitted, the library's own default (2)
+   * applies — fine for a single driven flow, the first bottleneck under many
+   * concurrent `flow_proceed`/inbound `validate` calls (see `batch` module).
+   */
+  poolSize?: number;
   /** Injectable clock, so tests can cross the idle boundary without waiting. */
   now?: () => number;
   /** Optional; absent in unit tests. Execution is identical without it. */
@@ -93,6 +99,7 @@ export class MockEngine {
   readonly #idleTtlMs: number;
   readonly #now: () => number;
   readonly #allowedFetchBaseUrls: string[];
+  readonly #poolSize: number | undefined;
   readonly #metrics: Metrics | undefined;
   readonly #runners = new Map<string, CachedRunner>();
   /** The shared worker pool, held so `dispose` can terminate exactly it. */
@@ -104,6 +111,7 @@ export class MockEngine {
     this.#idleTtlMs = options.idleTtlMs;
     this.#now = options.now ?? Date.now;
     this.#allowedFetchBaseUrls = [...options.allowedFetchBaseUrls];
+    this.#poolSize = options.poolSize;
     this.#metrics = options.metrics;
   }
 
@@ -123,10 +131,14 @@ export class MockEngine {
 
     this.#pool = MockRunner.initSharedRunner({
       allowedFetchBaseUrls: this.#allowedFetchBaseUrls,
+      ...(this.#poolSize !== undefined ? { poolSize: this.#poolSize } : {}),
     });
 
     this.#logger.debug(
-      { fetchAllowlist: this.#allowedFetchBaseUrls.length },
+      {
+        fetchAllowlist: this.#allowedFetchBaseUrls.length,
+        poolSize: this.#poolSize,
+      },
       "mock runner pool started",
     );
   }

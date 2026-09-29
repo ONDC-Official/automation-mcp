@@ -28,6 +28,12 @@ describe("the default profile", () => {
   it("advertises every tool, so nothing changed for existing deployments", async () => {
     const names = await toolNames();
     expect(names).toEqual([
+      "batch_list_orders",
+      "batch_run_cancel",
+      "batch_run_order_log",
+      "batch_run_payloads",
+      "batch_run_start",
+      "batch_run_status",
       "catalog_describe_flow",
       "catalog_list_builds",
       "catalog_list_flows",

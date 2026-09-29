@@ -27,6 +27,14 @@ import {
   RUNNABLE_FORM_FLOW,
   RUNNABLE_FORM_FLOW_ID,
 } from "@/test/runnable-config.js";
+import {
+  BATCH_FIXTURE_FLOW,
+  BATCH_FIXTURE_FLOW_ID,
+  buildBatchFixtureMockConfig,
+  buildStationFirstMockConfig,
+  STATION_FIRST_FLOW,
+  STATION_FIRST_FLOW_ID,
+} from "@/modules/batch/batch.test-fixture.js";
 
 /**
  * A `ConfigServiceGateway` backed by captured responses.
@@ -75,16 +83,29 @@ export function createFakeConfigServiceGateway(
     UpstreamFlow.parse(RUNNABLE_FLOW),
     UpstreamFlow.parse(RUNNABLE_FORM_FLOW),
     UpstreamFlow.parse(RUNNABLE_CHAIN_FLOW),
+    UpstreamFlow.parse(BATCH_FIXTURE_FLOW),
+    UpstreamFlow.parse(STATION_FIRST_FLOW),
   ];
   const mockConfig = UpstreamMockConfig.parse(MOCK_CONFIG_RESPONSE);
-  const runnableConfigs = new Map<string, UpstreamMockConfig>(
-    [RUNNABLE_FLOW_ID, RUNNABLE_FORM_FLOW_ID, RUNNABLE_CHAIN_FLOW_ID].map(
-      (flowId) => [
-        flowId,
-        UpstreamMockConfig.parse(buildRunnableMockConfig(flowId)),
-      ],
+  const runnableConfigs = new Map<string, UpstreamMockConfig>([
+    ...(
+      [RUNNABLE_FLOW_ID, RUNNABLE_FORM_FLOW_ID, RUNNABLE_CHAIN_FLOW_ID] as const
+    ).map(
+      (flowId) =>
+        [
+          flowId,
+          UpstreamMockConfig.parse(buildRunnableMockConfig(flowId)),
+        ] as const,
     ),
-  );
+    [
+      BATCH_FIXTURE_FLOW_ID,
+      UpstreamMockConfig.parse(buildBatchFixtureMockConfig()),
+    ],
+    [
+      STATION_FIRST_FLOW_ID,
+      UpstreamMockConfig.parse(buildStationFirstMockConfig()),
+    ],
+  ]);
   const knownFlowIds =
     options.knownFlowIds ?? flows.map((flow: UpstreamFlow) => flow.id);
 

@@ -1,0 +1,818 @@
+{
+  "info": {
+    "name": "ONDC TRV11 order batch (single API)",
+    "description": "Place many TRV11 Metro orders with one call to the buyer instance, watch progress, and read the complete log of any order.\n\nRun in order: 1 Start batch -> 2 Batch status -> 3 Order log, then 5/6 for payloads across the whole batch.\n\nSetup: buyer instance on port 3000 with BATCH_PEER_URL pointing at the seller instance (port 3010). See BATCH_RUNNER_GUIDE.md.\n\nReplies are a single SSE `data:` line; each request's Tests tab parses it and stores batch_id / transaction_id in collection variables.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:3000",
+      "description": "Buyer instance. The only one you call."
+    },
+    {
+      "key": "seller_url",
+      "value": "http://127.0.0.1:3010",
+      "description": "Seller instance (used by the two-call folder and health checks)."
+    },
+    {
+      "key": "buyer_url",
+      "value": "http://127.0.0.1:3000"
+    },
+    {
+      "key": "version",
+      "value": "2.0.1",
+      "description": "2.0.1 or 2.0.0 (TRV11 Metro)."
+    },
+    {
+      "key": "transaction_count",
+      "value": "10",
+      "description": "Orders to place, 1 to 1000."
+    },
+    {
+      "key": "concurrency",
+      "value": "25",
+      "description": "Orders in flight at once, 10 to 50 recommended (max 1000)."
+    },
+    {
+      "key": "per_transaction_timeout_ms",
+      "value": "180000"
+    },
+    {
+      "key": "batch_id",
+      "value": ""
+    },
+    {
+      "key": "include_results",
+      "value": "true"
+    },
+    {
+      "key": "since_index",
+      "value": "0"
+    },
+    {
+      "key": "limit",
+      "value": "100"
+    },
+    {
+      "key": "order_index",
+      "value": "0"
+    },
+    {
+      "key": "transaction_id",
+      "value": ""
+    },
+    {
+      "key": "include_payloads",
+      "value": "false",
+      "description": "true adds every request/response body (large)."
+    },
+    {
+      "key": "viewer_token",
+      "value": "local-batch-viewer"
+    },
+    {
+      "key": "action",
+      "value": "on_confirm",
+      "description": "Protocol action to pull for every order: search, on_search, select, on_select, init, on_init, confirm, on_confirm, status, on_status."
+    },
+    {
+      "key": "parts",
+      "value": "both",
+      "description": "both | context | message"
+    },
+    {
+      "key": "payload_limit",
+      "value": "10",
+      "description": "Orders per page for the batch payload requests (max 100)."
+    },
+    {
+      "key": "flow_id",
+      "value": "STATION_CODE_FLOW_ORDER",
+      "description": "Request 1a: the flow to run. Run request 0 to see which flows the version offers."
+    },
+    {
+      "key": "bap_id",
+      "value": "my-buyer.example.com",
+      "description": "Request 1b: this buyer's subscriber id (context.bap_id)."
+    },
+    {
+      "key": "bap_uri",
+      "value": "https://my-buyer.example.com/ONDC:TRV11/2.0.1/buyer",
+      "description": "Request 1b: where the seller calls this buyer back. Must end /ONDC:TRV11/<version>/buyer and be reachable by the seller."
+    },
+    {
+      "key": "bpp_id",
+      "value": "their-seller.example.com",
+      "description": "Request 1b: the other seller app's subscriber id (context.bpp_id)."
+    },
+    {
+      "key": "bpp_uri",
+      "value": "https://their-seller.example.com/ONDC:TRV11/2.0.1/seller",
+      "description": "Request 1b: the other seller app's URI. Setting it runs the buyer against that seller."
+    }
+  ],
+  "item": [
+    {
+      "name": "Order batch (single call)",
+      "item": [
+        {
+          "name": "1. Start batch (default flow)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('accepted', () => pm.expect(msg.result.isError).to.not.eql(true));",
+                  "if (out && out.batch_id) { pm.collectionVariables.set('batch_id', out.batch_id); console.log('batch_id', out.batch_id); }",
+                  "pm.test('one id covers both sides', () => pm.expect(out.role).to.eql('both'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_start\",\n    \"arguments\": {\n      \"version\": \"{{version}}\",\n      \"transaction_count\": {{transaction_count}},\n      \"concurrency\": {{concurrency}},\n      \"per_transaction_timeout_ms\": {{per_transaction_timeout_ms}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "One call: this (buyer) instance starts the seller instance, waits for it to be ready, then places the orders. The returned batch_id is saved automatically."
+          },
+          "response": []
+        },
+        {
+          "name": "1a. Start batch - choose the flow (by flow_id)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('accepted', () => pm.expect(msg.result.isError).to.not.eql(true));",
+                  "if (out && out.batch_id) { pm.collectionVariables.set('batch_id', out.batch_id); console.log('flow', out.flow_id, 'batch_id', out.batch_id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_start\",\n    \"arguments\": {\n      \"version\": \"{{version}}\",\n      \"flow_id\": \"{{flow_id}}\",\n      \"transaction_count\": {{transaction_count}},\n      \"concurrency\": {{concurrency}},\n      \"per_transaction_timeout_ms\": {{per_transaction_timeout_ms}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Runs the flow named in the flow_id variable instead of the version's default. flow_id is read from its own definition on the config-service: the driver fills whatever inputs it declares (city search, station search, select \u2014 both published shapes) from the generated order, or the field's own default for anything else. A flow needing a nested value the filler cannot construct (an update/cancel step naming a specific fulfillment, say) is refused or blocks naming the step."
+          },
+          "response": []
+        },
+        {
+          "name": "1b. Start batch - against another seller app",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('accepted', () => pm.expect(msg.result.isError).to.not.eql(true));",
+                  "pm.test('seller is external', () => pm.expect(out.parties.seller).to.eql('external'));",
+                  "if (out && out.batch_id) { pm.collectionVariables.set('batch_id', out.batch_id); console.log(JSON.stringify(out.parties)); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_start\",\n    \"arguments\": {\n      \"version\": \"{{version}}\",\n      \"bap_id\": \"{{bap_id}}\",\n      \"bap_uri\": \"{{bap_uri}}\",\n      \"bpp_id\": \"{{bpp_id}}\",\n      \"bpp_uri\": \"{{bpp_uri}}\",\n      \"transaction_count\": {{transaction_count}},\n      \"concurrency\": {{concurrency}},\n      \"per_transaction_timeout_ms\": {{per_transaction_timeout_ms}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Buyer against ANOTHER seller app. bpp_uri / bpp_id name that seller; bap_uri / bap_id are this buyer's identity, and bap_uri must be reachable by that seller and end /ONDC:TRV11/<version>/buyer. Nothing is started on the seller instance: the orders are between this buyer and the seller at bpp_uri."
+          },
+          "response": []
+        },
+        {
+          "name": "2. Batch status (both sides)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('has progress', () => pm.expect(out.progress).to.be.an('object'));",
+                  "if (out && out.results && out.results.length) { pm.collectionVariables.set('transaction_id', out.results[0].transaction_id || ''); }",
+                  "console.log(msg.result.content[0].text);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_status\",\n    \"arguments\": {\n      \"batch_id\": \"{{batch_id}}\",\n      \"include_results\": {{include_results}},\n      \"since_index\": {{since_index}},\n      \"limit\": {{limit}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Run repeatedly until state is `completed`. `peer` shows the seller side. Results are paginated with since_index / limit. The first result's transaction_id is saved for the order-log request."
+          },
+          "response": []
+        },
+        {
+          "name": "3. Order log (by index)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('has steps', () => pm.expect(out.steps.length).to.be.above(0));",
+                  "console.log(msg.result.content[0].text);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_order_log\",\n    \"arguments\": {\n      \"batch_id\": \"{{batch_id}}\",\n      \"index\": {{order_index}},\n      \"include_payloads\": {{include_payloads}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Complete journey of one order: every exchange in order, direction, timestamp, ACK, events, final order state. Set order_index; set include_payloads=true for every body."
+          },
+          "response": []
+        },
+        {
+          "name": "3b. Order log (by transaction id)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('has steps', () => pm.expect(out.steps.length).to.be.above(0));",
+                  "console.log(msg.result.content[0].text);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_order_log\",\n    \"arguments\": {\n      \"batch_id\": \"{{batch_id}}\",\n      \"transaction_id\": \"{{transaction_id}}\",\n      \"include_payloads\": {{include_payloads}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Same, naming the order by transaction_id."
+          },
+          "response": []
+        },
+        {
+          "name": "4. Batch orders - ids and amounts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('has orders', () => pm.expect(out.orders.length).to.be.above(0));",
+                  "console.log(msg.result.content[0].text);",
+                  "if (out.next_since_index !== undefined) console.log('more orders: set since_index to', out.next_since_index);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 8,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_list_orders\",\n    \"arguments\": {\n      \"batch_id\": \"{{batch_id}}\",\n      \"since_index\": {{since_index}},\n      \"limit\": {{payload_limit}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Every order in the batch: its real order id, order status, payment status and amount, once the seller has assigned them. Cheapest of the payload-reading requests \u2014 reads only the last couple of payloads per order. Paginated by payload_limit."
+          },
+          "response": []
+        },
+        {
+          "name": "5. Batch payloads - one action for every order",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('one payload per order', () => out.orders.forEach(o => pm.expect(o.payloads.length).to.be.above(0)));",
+                  "console.log(msg.result.content[0].text);",
+                  "if (out.next_since_index !== undefined) console.log('more orders: set since_index to', out.next_since_index);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_payloads\",\n    \"arguments\": {\n      \"batch_id\": \"{{batch_id}}\",\n      \"actions\": [\"{{action}}\"],\n      \"parts\": \"{{parts}}\",\n      \"since_index\": {{since_index}},\n      \"limit\": {{payload_limit}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Set `action` (e.g. on_confirm) and every order in the batch returns that call, with context and message. `parts` = both | context | message. Paginated: set since_index to next_since_index for the next page."
+          },
+          "response": []
+        },
+        {
+          "name": "6. Batch payloads - complete batch (every step, every order)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "console.log(msg.result.content[0].text.length + ' chars of log');",
+                  "if (out.next_since_index !== undefined) console.log('more orders: set since_index to', out.next_since_index);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_payloads\",\n    \"arguments\": {\n      \"batch_id\": \"{{batch_id}}\",\n      \"parts\": \"{{parts}}\",\n      \"since_index\": {{since_index}},\n      \"limit\": {{payload_limit}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Every payload of every order (about 85KB per order), paginated by payload_limit orders per page."
+          },
+          "response": []
+        },
+        {
+          "name": "7. Cancel batch",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "pm.test('cancelled', () => pm.expect(out.state).to.eql('cancelled'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_cancel\",\n    \"arguments\": { \"batch_id\": \"{{batch_id}}\" }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Stops both the buyer and seller sides. Orders already in flight finish on their own."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Buyer ready",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/ready",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ready"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Seller ready",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{seller_url}}/ready",
+              "host": [
+                "{{seller_url}}"
+              ],
+              "path": [
+                "ready"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Viewer (read-only)",
+      "item": [
+        {
+          "name": "Sessions on buyer",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{viewer_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ui/api/sessions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ui",
+                "api",
+                "sessions"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Two-call form (advanced)",
+      "description": "The single-call form drives the seller for you. Use these only to run each side yourself: start the seller first.",
+      "item": [
+        {
+          "name": "Start seller (listener)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "if (out && out.batch_id) pm.collectionVariables.set('seller_batch_id', out.batch_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_start\",\n    \"arguments\": {\n      \"role\": \"listener\",\n      \"version\": \"{{version}}\",\n      \"counterparty_subscriber_url\": \"{{buyer_url}}/ONDC:TRV11/{{version}}/buyer\",\n      \"transaction_count\": {{transaction_count}},\n      \"concurrency\": {{concurrency}},\n      \"per_transaction_timeout_ms\": {{per_transaction_timeout_ms}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{seller_url}}/mcp",
+              "host": [
+                "{{seller_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Start this first."
+          },
+          "response": []
+        },
+        {
+          "name": "Start buyer (initiator)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The server answers with one SSE line: `data: {json-rpc message}`.",
+                  "const line = pm.response.text().split('\\n').find(l => l.startsWith('data:'));",
+                  "const msg = JSON.parse(line ? line.slice(5) : pm.response.text());",
+                  "const out = msg.result && msg.result.structuredContent;",
+                  "if (out && out.batch_id) pm.collectionVariables.set('batch_id', out.batch_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json, text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"batch_run_start\",\n    \"arguments\": {\n      \"role\": \"initiator\",\n      \"version\": \"{{version}}\",\n      \"counterparty_subscriber_url\": \"{{seller_url}}/ONDC:TRV11/{{version}}/seller\",\n      \"transaction_count\": {{transaction_count}},\n      \"concurrency\": {{concurrency}},\n      \"per_transaction_timeout_ms\": {{per_transaction_timeout_ms}}\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/mcp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "mcp"
+              ]
+            },
+            "description": "Then this."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

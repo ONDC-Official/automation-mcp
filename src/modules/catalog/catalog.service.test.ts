@@ -176,6 +176,30 @@ describe("flow description", () => {
   });
 });
 
+describe("concurrent fetches", () => {
+  it("shares one upstream fetch of a mock config between simultaneous callers", async () => {
+    const { service, gateway } = subject();
+    const results = await Promise.all(
+      Array.from({ length: 25 }, () =>
+        service.requireMockConfig(FIXTURE_BUILD, FIXTURE_FLOW_ID),
+      ),
+    );
+    expect(gateway.calls.mockConfig).toBe(1);
+    expect(new Set(results.map((r) => r.key)).size).toBe(1);
+  });
+
+  it("does not remember a failed fetch", async () => {
+    const { service, gateway } = subject();
+    await expect(
+      service.requireMockConfig(FIXTURE_BUILD, "NO_SUCH_FLOW"),
+    ).rejects.toThrow();
+    await expect(
+      service.requireMockConfig(FIXTURE_BUILD, "NO_SUCH_FLOW"),
+    ).rejects.toThrow();
+    expect(gateway.calls.mockConfig).toBe(2);
+  });
+});
+
 describe("mock-runner config", () => {
   it("summarises each step without returning the config itself", async () => {
     const { service } = subject();

@@ -433,6 +433,24 @@ const EnvSchema = z
      * default — means fetch is never injected into the sandbox at all.
      */
     RUNNER_FETCH_ALLOWLIST: csv.default([]),
+    /**
+     * Worker threads in the shared mock-runner pool. The underlying library
+     * defaults to 2, which is fine for one flow driven by one model but is the
+     * first thing to starve under many concurrent `flow_proceed`/inbound
+     * `validate` calls — every one of them contends for the same pool. Raise
+     * this for a `batch` run driving many transactions at once; there is
+     * nothing else to tune once it is sized right, because excess work simply
+     * queues in the runner's own FIFO rather than failing.
+     */
+    MOCK_RUNNER_POOL_SIZE: z.coerce.number().int().positive().default(8),
+    /**
+     * The other instance a `batch_run_start` with `role: "both"` drives as the
+     * seller — its base URL (the one it advertises), e.g. http://127.0.0.1:3010.
+     * Unset, `both` is refused and only the single-side roles work.
+     */
+    BATCH_PEER_URL: z.url().optional(),
+    /** Bearer token for the peer, when it runs with `AUTH_MODE=apikey`. */
+    BATCH_PEER_API_KEY: z.string().min(1).optional(),
     /** Budget for fetching a counterparty-hosted form. */
     FORM_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     /** Lifetime of a transaction record and its payloads. 48h, as the workbench. */

@@ -62,7 +62,7 @@ export function seedIdentity(
   stored: Record<string, unknown>,
 ): Record<string, unknown> {
   const ourUri = callbackUrl(session);
-  const ourId = deps.mockSubscriberId;
+  const ourId = session.mock_subscriber_id ?? deps.mockSubscriberId;
   const theirUri = session.np.subscriber_url;
   const theirId = session.np.subscriber_id ?? hostOf(theirUri);
 
@@ -239,12 +239,13 @@ export async function bindOutbound(
 export async function adoptTransaction(
   deps: FlowDeps,
   args: {
-  session: Session;
-  flowId: string;
-  transactionId: string;
-  autoAdvance: boolean;
-  scope: ExpectationScope;
-}): Promise<TransactionRecord> {
+    session: Session;
+    flowId: string;
+    transactionId: string;
+    autoAdvance: boolean;
+    scope: ExpectationScope;
+  },
+): Promise<TransactionRecord> {
   const { session, flowId, transactionId } = args;
 
   const record = await deps.records.createTransaction({
