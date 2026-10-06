@@ -251,9 +251,9 @@ describe("receiver — refusing a callback", () => {
     expect(response.body).toMatchObject({
       error: { code: "MALFORMED_CONTEXT" },
     });
-    expect(
-      (response.body["error"] as { message: string }).message,
-    ).toContain("bpp_uri");
+    expect((response.body["error"] as { message: string }).message).toContain(
+      "bpp_uri",
+    );
   });
 
   it("answers 412 when no transaction and no expectation exist", async () => {
@@ -412,9 +412,8 @@ describe("receiver — opening a transaction from an expectation", () => {
     // The whole point. `flow_start` used to mint an id of its own and file a
     // record under it, so this call opened a *second* one and left the caller
     // holding a handle that named nothing.
-    const ids = await container.services.record.listTransactionIds(
-      buyerSession,
-    );
+    const ids =
+      await container.services.record.listTransactionIds(buyerSession);
     expect(ids).toEqual(["np-chosen-txn"]);
   });
 
@@ -547,6 +546,56 @@ describe("receiver — opening a transaction from an expectation", () => {
   });
 });
 
+describe("receiver — one instance playing both sides of a transaction", () => {
+  /*
+   * A self-peered `role: "both"` run puts the buyer and the seller in one
+   * process over one store. The buyer has already indexed the transaction id
+   * by the time the seller's `search` arrives, and the seller must still be
+   * able to take it up. The buyer and seller use different subscriber URLs, so
+   * their records do not collide — the same as a real two-party transaction.
+   */
+  const BUYER = "https://buyer.example.com";
+
+  it("lets a listener on this endpoint take up a transaction the other side indexed first", async () => {
+    await sendSearch();
+
+    const created = (await callTool("session_create", {
+      subscriber_url: BUYER,
+      np_type: "BAP",
+      domain: RUNNABLE_BUILD.domain,
+      version: RUNNABLE_BUILD.version,
+      usecase: RUNNABLE_BUILD.usecase,
+      auto_advance: false,
+    })) as { session: Session };
+    const listener = created.session;
+    await container.services.flow.start({
+      sessionId: listener.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+
+    const response = await callback(
+      "search",
+      {
+        context: {
+          action: "search",
+          transaction_id: transactionId,
+          message_id: "m-self-1",
+          timestamp: new Date().toISOString(),
+          bap_uri: BUYER,
+        },
+        message: { intent: {} },
+      },
+      receiverPath(listener, "search"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ message: { ack: { status: "ACK" } } });
+    await expect(
+      container.services.record.requireTransaction(transactionId, BUYER),
+    ).resolves.toBeDefined();
+  });
+});
+
 describe("receiver — a counterparty whose advertised URI has drifted", () => {
   /**
    * The registered `subscriber_url` and the URI a participant advertises are
@@ -568,8 +617,7 @@ describe("receiver — a counterparty whose advertised URI has drifted", () => {
   it("still resolves when the pathname differs, and files it on the one record", async () => {
     await sendSearch();
     const body = onSearch();
-    (body["context"] as Record<string, unknown>)["bpp_uri"] =
-      `${NP}/ondc/v2`;
+    (body["context"] as Record<string, unknown>)["bpp_uri"] = `${NP}/ondc/v2`;
 
     const response = await callback("on_search", body);
 
