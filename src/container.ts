@@ -707,16 +707,32 @@ export async function createContainer(
     receiverPublicUrl,
     catalog,
     mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
-    ...(config.BATCH_PEER_URL !== undefined
-      ? {
-          peer: new HttpBatchPeer({
-            url: config.BATCH_PEER_URL,
-            ...(config.BATCH_PEER_API_KEY !== undefined
-              ? { apiKey: config.BATCH_PEER_API_KEY }
-              : {}),
-          }),
-        }
-      : {}),
+    // `role: "both"` needs somewhere to arm the seller side. `BATCH_PEER_URL`
+    // names a *different* instance for a genuine two-process deployment; left
+    // unset, this instance is its own peer — self-referential, over its own
+    // public URL, exactly like any other MCP caller reaching it. That default
+    // costs nothing to construct (`HttpBatchPeer`'s constructor makes no
+    // network call) and is never wrong to have present: a deployment that
+    // really does want a separate peer still overrides it with an explicit
+    // `BATCH_PEER_URL`, which takes precedence here unconditionally.
+    peer: new HttpBatchPeer({
+      url: config.BATCH_PEER_URL ?? receiverPublicUrl,
+      // Same self-referential default as the URL above: a genuinely separate
+      // peer still needs its own explicit `BATCH_PEER_API_KEY` (a different
+      // process's key is never guessable here), but a self-peer already
+      // trusts its own `/mcp` — it's the same process answering its own
+      // call — so falling back to one of *this* instance's own `AUTH_API_KEYS`
+      // avoids a second copy of the same secret existing only to hand back to
+      // itself. `apikey` mode with no keys configured is refused at boot
+      // (env.ts), so `[0]` is never reached on an empty list.
+      ...(config.BATCH_PEER_API_KEY !== undefined
+        ? { apiKey: config.BATCH_PEER_API_KEY }
+        : config.BATCH_PEER_URL === undefined &&
+            config.AUTH_MODE === "apikey" &&
+            config.AUTH_API_KEYS[0] !== undefined
+          ? { apiKey: config.AUTH_API_KEYS[0] }
+          : {}),
+    }),
   });
 
   // Built after `session`: it resolves a build from either a triple or a

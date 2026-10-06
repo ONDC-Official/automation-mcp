@@ -91,9 +91,7 @@ export async function resolve(
 
   /* 1. Known transaction. */
   const located = await deps.records.findTransactionLocations(transactionId);
-  const onThisEndpoint = located.filter((entry) =>
-    sameEndpoint(entry, scope),
-  );
+  const onThisEndpoint = located.filter((entry) => sameEndpoint(entry, scope));
 
   for (const candidate of rankLocations(onThisEndpoint, advertisedUri)) {
     const session = await loadSession(deps, candidate.sessionId);
@@ -107,12 +105,27 @@ export async function resolve(
     return { session, transactionId, record };
   }
 
+  /* 2. An armed expectation. */
+  const expectation = await deps.records.consumeExpectation(scope, {
+    action,
+    transactionId,
+    subscriberUrl: advertisedUri,
+  });
+
   /*
-   * The id is known, but on a different build or role. Worth its own answer:
-   * "no expectation" would send the integrator looking in the wrong place.
+   * The id is known, but this endpoint does not hold it, and nothing here is
+   * expecting this call. Worth its own answer: "no expectation" would send the
+   * integrator looking in the wrong place.
+   *
+   * It is checked *after* the expectation on purpose. One process can host both
+   * halves of a transaction (a self-peered `role: "both"` run), so the buyer
+   * side has already indexed the id by the time the seller side receives the
+   * `search`. The seller's armed expectation is exactly its standing permission
+   * to take that transaction up, so it wins; refusing first would turn every
+   * single-instance run into a `WRONG_ENDPOINT` with nobody told why.
    */
   const elsewhere = located[0];
-  if (elsewhere !== undefined && onThisEndpoint.length === 0) {
+  if (!expectation && elsewhere !== undefined && onThisEndpoint.length === 0) {
     const message = `Transaction "${transactionId}" belongs to ${elsewhere.domain}/${elsewhere.version}/${elsewhere.role}, not ${request.domain}/${request.version}/${request.role}.`;
     // The one refusal of the three where a session *is* known: the index says
     // whose transaction this is. Told to that session alone rather than
@@ -130,13 +143,6 @@ export async function resolve(
     });
     return { failure: { status: 412, body: nack("WRONG_ENDPOINT", message) } };
   }
-
-  /* 2. An armed expectation. */
-  const expectation = await deps.records.consumeExpectation(scope, {
-    action,
-    transactionId,
-    subscriberUrl: advertisedUri,
-  });
 
   if (!expectation) {
     // Nobody was listening for this action — but somebody on this endpoint is
@@ -211,7 +217,8 @@ export async function resolve(
     expectation.transactionId !== transactionId
   ) {
     return {
-      failure: await refuseMismatch(deps, 
+      failure: await refuseMismatch(
+        deps,
         session,
         scope,
         expectation,
@@ -254,7 +261,9 @@ export async function resolve(
  * miss propagates and surfaces as a 5xx, which is what it is.
  */
 export async function loadSession(
-  deps: ReceiverDeps,sessionId: string): Promise<Session | undefined> {
+  deps: ReceiverDeps,
+  sessionId: string,
+): Promise<Session | undefined> {
   try {
     return await deps.sessions.requireSession(sessionId);
   } catch (error) {

@@ -42,6 +42,22 @@ export class HttpBatchPeer implements BatchPeer {
 
   constructor(options: { url: string; apiKey?: string; fetch?: typeof fetch }) {
     this.receiverUrl = options.url.replace(/\/+$/, "");
+    // `/mcp` is mounted at the app's root *as the app sees the request* —
+    // but what the app sees and what a caller outside it sends are only the
+    // same path when nothing in front rewrites it. `app.ts` registers `/mcp`
+    // with no prefix, so under a bare, unproxied deployment the outside path
+    // really is `{origin}/mcp`. Behind a **prefix-stripping** reverse proxy —
+    // verified live against dev-workbench.ondc.tech: `/automation-mcp/mcp`
+    // externally reaches this app's `/mcp` (401, this app's own auth), while
+    // bare `/mcp` falls through to a completely different service sharing the
+    // host — reaching this app at all requires keeping the prefix in the
+    // *outside* URL, because that prefix is the proxy's own routing key, not
+    // a path this app is expected to strip itself. `RECEIVER_PUBLIC_URL`'s
+    // path is exactly that externally-visible prefix, so plain concatenation
+    // onto `receiverUrl` is correct for that (by far the more common) case.
+    // A deployment where the proxy does *not* rewrite the path — the app's
+    // own prefix and the external one are identical — has an empty path on
+    // `RECEIVER_PUBLIC_URL` in the first place, making this a no-op there too.
     this.#mcpUrl = `${this.receiverUrl}/mcp`;
     this.#apiKey = options.apiKey;
     this.#fetch = options.fetch ?? fetch;
