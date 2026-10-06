@@ -31,6 +31,7 @@ import { BatchRepository } from "@/modules/batch/batch.repository.js";
 import { BatchService } from "@/modules/batch/batch.service.js";
 import { HttpBatchPeer } from "@/modules/batch/batch.peer.js";
 import { completionUrl } from "@/modules/batch/batch.on-complete.js";
+import { DEFAULT_UI_BASE_URL } from "@/config/env.js";
 import { RecordRepository } from "@/modules/record/record.repository.js";
 import { RecordService } from "@/modules/record/record.service.js";
 import { MetricsObserver } from "@/modules/metrics/metrics.observer.js";
@@ -708,8 +709,11 @@ export async function createContainer(
     receiverPublicUrl,
     catalog,
     mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
-    ...(config.BATCH_ON_COMPLETE_URL !== undefined
-      ? { onCompleteUrl: completionUrl(config.BATCH_ON_COMPLETE_URL) }
+    // Completed orders are sent to this instance's own UI base, but only when it
+    // is set to something other than the public default: an instance that never
+    // configured it must not post its participants' data to that host.
+    ...(config.UI_BASE_URL !== DEFAULT_UI_BASE_URL
+      ? { onCompleteUrl: completionUrl(config.UI_BASE_URL) }
       : {}),
     // `role: "both"` needs somewhere to arm the seller side. `BATCH_PEER_URL`
     // names a *different* instance for a genuine two-process deployment; left

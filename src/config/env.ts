@@ -37,6 +37,9 @@ const optionalUrl = z.preprocess(
   z.url().optional(),
 );
 
+/** The public workbench, the default when `UI_BASE_URL` is not set. */
+export const DEFAULT_UI_BASE_URL = "https://workbench.ondc.tech";
+
 const EnvSchema = z
   .object({
     NODE_ENV: z
@@ -222,7 +225,7 @@ const EnvSchema = z
      * Where the viewer page is hosted — the origin of the link handed to the
      * human. The page is ours; the data never passes through it.
      */
-    UI_BASE_URL: z.url().default("https://workbench.ondc.tech"),
+    UI_BASE_URL: z.url().default(DEFAULT_UI_BASE_URL),
     /**
      * How the **browser** reaches this engine. Defaults at container build to
      * `RECEIVER_PUBLIC_URL`, which is already the address this process is known
@@ -451,12 +454,6 @@ const EnvSchema = z
     BATCH_PEER_URL: z.url().optional(),
     /** Bearer token for the peer, when it runs with `AUTH_MODE=apikey`. */
     BATCH_PEER_API_KEY: z.string().min(1).optional(),
-    /**
-     * Base URL a completed batch order is POSTed under, as an `on_confirm` body
-     * built from that order's own data. The route
-     * `/rsf/api/inbound/on_confirm` is appended in code. Unset, nothing is sent.
-     */
-    BATCH_ON_COMPLETE_URL: z.url().optional(),
     /** Budget for fetching a counterparty-hosted form. */
     FORM_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     /** Lifetime of a transaction record and its payloads. 48h, as the workbench. */
