@@ -30,6 +30,7 @@ import { FormsService } from "@/modules/forms/forms.service.js";
 import { BatchRepository } from "@/modules/batch/batch.repository.js";
 import { BatchService } from "@/modules/batch/batch.service.js";
 import { HttpBatchPeer } from "@/modules/batch/batch.peer.js";
+import { completionUrl } from "@/modules/batch/batch.on-complete.js";
 import { RecordRepository } from "@/modules/record/record.repository.js";
 import { RecordService } from "@/modules/record/record.service.js";
 import { MetricsObserver } from "@/modules/metrics/metrics.observer.js";
@@ -707,6 +708,9 @@ export async function createContainer(
     receiverPublicUrl,
     catalog,
     mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    ...(config.BATCH_ON_COMPLETE_URL !== undefined
+      ? { onCompleteUrl: completionUrl(config.BATCH_ON_COMPLETE_URL) }
+      : {}),
     // `role: "both"` needs somewhere to arm the seller side. `BATCH_PEER_URL`
     // names a *different* instance for a genuine two-process deployment; left
     // unset, this instance is its own peer — self-referential, over its own

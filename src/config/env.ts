@@ -451,6 +451,12 @@ const EnvSchema = z
     BATCH_PEER_URL: z.url().optional(),
     /** Bearer token for the peer, when it runs with `AUTH_MODE=apikey`. */
     BATCH_PEER_API_KEY: z.string().min(1).optional(),
+    /**
+     * Base URL a completed batch order is POSTed under, as an `on_confirm` body
+     * built from that order's own data. The route
+     * `/rsf/api/inbound/on_confirm` is appended in code. Unset, nothing is sent.
+     */
+    BATCH_ON_COMPLETE_URL: z.url().optional(),
     /** Budget for fetching a counterparty-hosted form. */
     FORM_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     /** Lifetime of a transaction record and its payloads. 48h, as the workbench. */

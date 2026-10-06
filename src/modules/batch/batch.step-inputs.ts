@@ -18,6 +18,8 @@ export type Step = UpstreamFlow["sequence"][number];
 interface Property {
   default?: unknown;
   enum?: unknown[];
+  /** An array's declared element schema, when it has one. */
+  items?: { properties?: Record<string, Property> };
 }
 
 /** Every property a step's input declarations mention, with its schema. */
@@ -57,6 +59,32 @@ export function needsStations(step: Step): boolean {
 export function needsItem(step: Step): boolean {
   const fields = declaredProperties(step);
   return fields.has("Item_id") || fields.has("items");
+}
+
+/**
+ * One element of an `items` array, shaped by the array's own declared element
+ * schema. The item id goes to the field named `itemId` (or `id`), the quantity
+ * to any count or quantity field, and everything else takes its published
+ * default. A flow that declares no element schema keeps the older `id` shape.
+ */
+function buildItem(
+  arrayProperty: Property,
+  itemId: string,
+  order: OrderInputs | undefined,
+): Record<string, unknown> {
+  const element = arrayProperty.items?.properties ?? {};
+  const item: Record<string, unknown> = {};
+  for (const [field, spec] of Object.entries(element)) {
+    if (/^(itemId|id)$/i.test(field)) item[field] = itemId;
+    else if (/count|quantity/i.test(field))
+      item[field] = order?.item_quantity ?? spec.default ?? 1;
+    else if (spec.default !== undefined) item[field] = spec.default;
+  }
+  if (Object.keys(item).length > 0) return item;
+  return {
+    id: itemId,
+    quantity: { selected: { count: order?.item_quantity ?? 1 } },
+  };
 }
 
 /** Inputs for one step. `itemId` is required only when {@link needsItem}. */
@@ -101,12 +129,7 @@ export function buildStepInputs(
         continue;
       case "items":
         if (ctx.itemId !== undefined) {
-          inputs[name] = [
-            {
-              id: ctx.itemId,
-              quantity: { selected: { count: order?.item_quantity ?? 1 } },
-            },
-          ];
+          inputs[name] = [buildItem(property, ctx.itemId, order)];
         }
         continue;
       default:

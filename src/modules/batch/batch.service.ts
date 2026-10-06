@@ -18,6 +18,11 @@ import type { DriverFlowConfig } from "@/modules/batch/batch.driver.js";
 import type { UpstreamFlow } from "@/modules/catalog/catalog.schema.js";
 import { runOneTransaction } from "@/modules/batch/batch.driver.js";
 import {
+  buildOnConfirm,
+  partiesFromOnConfirm,
+  postOnComplete,
+} from "@/modules/batch/batch.on-complete.js";
+import {
   findPreset,
   knownPresets,
 } from "@/modules/batch/batch.version-presets.js";
@@ -157,6 +162,8 @@ export interface BatchServiceOptions {
   receiverPublicUrl?: string;
   /** Pause after the seller is started, so its sessions are armed first. */
   armSettleMs?: number;
+  /** Where a COMPLETED order is POSTed as an on_confirm. Unset: nothing sent. */
+  onCompleteUrl?: string;
 }
 
 export class BatchService {
@@ -171,6 +178,7 @@ export class BatchService {
   readonly #peer: BatchPeer | undefined;
   readonly #receiverPublicUrl: string | undefined;
   readonly #armSettleMs: number;
+  readonly #onCompleteUrl: string | undefined;
   /**
    * In-process only, and that is sufficient: a batch's driving loop lives in
    * the same process that started it (`startRun`'s detached promise chain),
@@ -191,6 +199,7 @@ export class BatchService {
     this.#peer = options.peer;
     this.#receiverPublicUrl = options.receiverPublicUrl;
     this.#armSettleMs = options.armSettleMs ?? 1_000;
+    this.#onCompleteUrl = options.onCompleteUrl;
   }
 
   async startRun(input: StartBatchRunInput): Promise<StartBatchRunOutput> {
@@ -551,6 +560,61 @@ export class BatchService {
       steps,
       events,
     };
+  }
+
+  /**
+   * Send one completed order's on_confirm to the configured URL, if the order
+   * really is COMPLETED. The flow finishing is not enough on its own: the
+   * order's own status has to say so.
+   */
+  async #notifyOrderCompleted(
+    input: StartBatchRunInput,
+    result: BatchTransactionResult,
+  ): Promise<void> {
+    const url = this.#onCompleteUrl;
+    if (
+      url === undefined ||
+      result.session_id === undefined ||
+      result.transaction_id === null
+    ) {
+      return;
+    }
+    // Every body, not just the last few: the order's on_confirm is what carries
+    // the party identities, and it is not always among the final steps.
+    const { withPayloads, bodies } = await this.#loadJourney(
+      { session_id: result.session_id, transaction_id: result.transaction_id },
+      (rows) => rows,
+    );
+    const order = summariseOrder(latestOrderPayload(withPayloads, bodies));
+    if (order === undefined || order.order_id === undefined) return;
+    if (order.order_status?.toUpperCase() !== "COMPLETED") return;
+
+    // All four party fields come from the order's own on_confirm, as the seller
+    // wrote it. No on_confirm, or one missing any of them, means nothing is sent.
+    const parties = partiesFromOnConfirm(withPayloads, bodies);
+    if (parties === undefined) {
+      this.#logger.warn(
+        { transactionId: result.transaction_id, orderId: order.order_id },
+        "order is COMPLETED but its on_confirm lacks the party fields; not sent",
+      );
+      return;
+    }
+
+    const body = buildOnConfirm({
+      domain: input.domain,
+      version: input.version,
+      transactionId: result.transaction_id,
+      order,
+      bapId: parties.bap_id,
+      bapUri: parties.bap_uri,
+      bppId: parties.bpp_id,
+      bppUri: parties.bpp_uri,
+    });
+    await postOnComplete(url, body);
+    this.#logger.info(
+      { transactionId: result.transaction_id, orderId: order.order_id },
+      "sent the completed order's on_confirm",
+    );
   }
 
   /**
@@ -924,6 +988,26 @@ export class BatchService {
           this.#resultTtlMs,
         );
         await this.#repository.appendResult(batchId, result, this.#resultTtlMs);
+
+        // Only the buyer side notifies. A `role: "both"` run also drives the
+        // seller side, which sees the same order; sending from both would post
+        // every order twice. Scheduled, never awaited: a slow or failing
+        // notification must not hold this worker, and can never change the
+        // transaction's own result.
+        if (
+          role === "initiator" &&
+          result.status === "completed" &&
+          this.#onCompleteUrl !== undefined
+        ) {
+          void this.#notifyOrderCompleted(input, result).catch(
+            (error: unknown) => {
+              this.#logger.warn(
+                { err: error, batchId, index },
+                "could not send the completed order's on_confirm",
+              );
+            },
+          );
+        }
 
         if (!TERMINAL_STATUSES.includes(result.status)) {
           this.#logger.warn(
