@@ -142,7 +142,7 @@ describe("partiesFromOnConfirm", () => {
 
 describe("completionUrl", () => {
   it("appends the on_confirm route to the configured base", () => {
-    expect(completionUrl("https://dev-workbench.ondc.tech/rsf-api")).toBe(
+    expect(completionUrl("https://dev-workbench.ondc.tech")).toBe(
       "https://dev-workbench.ondc.tech/rsf-api/api/inbound/on_confirm",
     );
   });
@@ -168,7 +168,7 @@ describe("completionUrl", () => {
   });
 
   it("does not double the slash when the base ends with one", () => {
-    expect(completionUrl("https://dev-workbench.ondc.tech/rsf-api/")).toBe(
+    expect(completionUrl("https://dev-workbench.ondc.tech/")).toBe(
       "https://dev-workbench.ondc.tech/rsf-api/api/inbound/on_confirm",
     );
   });

@@ -127,7 +127,7 @@ export function partiesFromOnConfirm(
 }
 
 /** The route a completed order is posted to, under the configured base. */
-export const ON_COMPLETE_PATH = "/api/inbound/on_confirm";
+export const ON_COMPLETE_PATH = "/rsf-api/api/inbound/on_confirm";
 
 const SETTLEMENT_AMOUNT = "100.00";
 const SETTLEMENT_TYPE = "NEFT";
