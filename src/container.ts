@@ -30,6 +30,9 @@ import { FormsService } from "@/modules/forms/forms.service.js";
 import { BatchRepository } from "@/modules/batch/batch.repository.js";
 import { BatchService } from "@/modules/batch/batch.service.js";
 import { HttpBatchPeer } from "@/modules/batch/batch.peer.js";
+import { completionUrl } from "@/modules/batch/batch.on-complete.js";
+import { DEFAULT_UI_BASE_URL } from "@/config/env.js";
+import { OrderStatusWatch } from "@/modules/batch/batch.status-watch.js";
 import { RecordRepository } from "@/modules/record/record.repository.js";
 import { RecordService } from "@/modules/record/record.service.js";
 import { MetricsObserver } from "@/modules/metrics/metrics.observer.js";
@@ -339,6 +342,10 @@ export async function createContainer(
 
   const events = new TransactionEvents();
 
+  // Built before the record service so it can sit in the observer list; the
+  // batch service attaches itself once it exists.
+  const orderStatusWatch = new OrderStatusWatch();
+
   const recordRepository = new RecordRepository({
     cache: stateStore,
     transactionTtlMs: config.TRANSACTION_TTL_MS,
@@ -630,6 +637,7 @@ export async function createContainer(
       feedback,
       ...(features.enabled("metrics") ? [new MetricsObserver(metrics)] : []),
       mirror,
+      orderStatusWatch,
     ],
   });
 
@@ -707,6 +715,12 @@ export async function createContainer(
     receiverPublicUrl,
     catalog,
     mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    // Completed orders are sent to this instance's own UI base, but only when it
+    // is set to something other than the public default: an instance that never
+    // configured it must not post its participants' data to that host.
+    ...(config.UI_BASE_URL !== DEFAULT_UI_BASE_URL
+      ? { onCompleteUrl: completionUrl(config.UI_BASE_URL) }
+      : {}),
     // `role: "both"` needs somewhere to arm the seller side. `BATCH_PEER_URL`
     // names a *different* instance for a genuine two-process deployment; left
     // unset, this instance is its own peer — self-referential, over its own
@@ -734,6 +748,9 @@ export async function createContainer(
           : {}),
     }),
   });
+  orderStatusWatch.attach((sessionId, transactionId) =>
+    batch.onSellerStatus(sessionId, transactionId),
+  );
 
   // Built after `session`: it resolves a build from either a triple or a
   // session id, and validates the triple through the catalog first. Bundles

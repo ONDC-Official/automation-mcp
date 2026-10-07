@@ -83,6 +83,33 @@ describe("buildStepInputs", () => {
     ).toEqual({ items: [{ id: "I7", quantity: { selected: { count: 3 } } }] });
   });
 
+  it("shapes each item by the array's declared element schema, as the live init step does", () => {
+    // The published `init_with_user_input` declaration: each element is
+    // { itemId, count }, both required — the shape the seller's generator reads.
+    const initItems = {
+      items: {
+        type: "array",
+        default: [],
+        items: {
+          type: "object",
+          properties: {
+            itemId: { type: "string", default: "", payloadField: "$.id" },
+            count: {
+              type: "number",
+              default: 1,
+              payloadField: "$.quantity.selected.count",
+            },
+          },
+          required: ["itemId", "count"],
+        },
+      },
+    };
+
+    expect(
+      buildStepInputs(step("init", initItems), { order, itemId: "I7" }),
+    ).toEqual({ items: [{ itemId: "I7", count: 3 }] });
+  });
+
   it("never invents an item id", () => {
     expect(
       buildStepInputs(step("sel", { Item_id: {}, Item_Quantity: {} }), {

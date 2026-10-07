@@ -37,6 +37,9 @@ const optionalUrl = z.preprocess(
   z.url().optional(),
 );
 
+/** The public workbench, the default when `UI_BASE_URL` is not set. */
+export const DEFAULT_UI_BASE_URL = "https://workbench.ondc.tech";
+
 const EnvSchema = z
   .object({
     NODE_ENV: z
@@ -222,7 +225,7 @@ const EnvSchema = z
      * Where the viewer page is hosted — the origin of the link handed to the
      * human. The page is ours; the data never passes through it.
      */
-    UI_BASE_URL: z.url().default("https://workbench.ondc.tech"),
+    UI_BASE_URL: z.url().default(DEFAULT_UI_BASE_URL),
     /**
      * How the **browser** reaches this engine. Defaults at container build to
      * `RECEIVER_PUBLIC_URL`, which is already the address this process is known
