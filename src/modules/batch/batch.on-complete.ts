@@ -1,89 +1,54 @@
 import { randomUUID } from "node:crypto";
 import { UpstreamError } from "@/lib/errors.js";
-import type { OrderSummary } from "@/modules/batch/batch.journey.js";
 
 /**
- * What a completed batch order sends to `BATCH_ON_COMPLETE_URL`: an `on_confirm`
- * body in the shape of the Postman template the operator supplied, filled from
- * this order's own data.
- *
- * Only fields the batch actually knows are filled. The template's provider and
- * settlement-term values are not carried here, so they are left out rather than
- * invented; add them to {@link buildOnConfirm} if the receiving end needs them.
+ * What a completed batch order sends to the completion URL: the order's own
+ * on_confirm, as the seller wrote it, with only what has to change for this
+ * notice — a fresh message id, the time of sending, this transaction's id, and
+ * the state `Completed`. Every other value (provider, quote, payments, settlement
+ * terms, city, country, versions, ttl) comes from the seller's on_confirm, so
+ * nothing in the body is a constant of ours.
  */
-export interface OnConfirmInput {
-  domain: string;
-  version: string;
-  transactionId: string;
-  bapId?: string;
-  bapUri?: string;
-  bppId?: string;
-  bppUri?: string;
-  order: OrderSummary;
-  now?: Date;
-}
-
-export function buildOnConfirm(input: OnConfirmInput): Record<string, unknown> {
-  const { order } = input;
-  const orderId = order.order_id ?? "";
-  const amount = order.total;
-  const currency = order.currency ?? "INR";
-
+export function buildCompletedOnConfirm(
+  sellerOnConfirm: Record<string, unknown>,
+  input: { transactionId: string; now?: Date },
+): Record<string, unknown> | undefined {
+  const context = sellerOnConfirm["context"];
+  const message = sellerOnConfirm["message"] as
+    { order?: Record<string, unknown> } | undefined;
+  const order = message?.order;
+  if (typeof context !== "object" || context === null || order === undefined) {
+    return undefined;
+  }
   return {
     context: {
-      domain: input.domain,
-      country: "IND",
-      city: "std:080",
+      ...(context as Record<string, unknown>),
       action: "on_confirm",
-      core_version: "1.0.0",
-      ...(input.bapId !== undefined ? { bap_id: input.bapId } : {}),
-      ...(input.bapUri !== undefined ? { bap_uri: input.bapUri } : {}),
-      ...(input.bppId !== undefined ? { bpp_id: input.bppId } : {}),
-      ...(input.bppUri !== undefined ? { bpp_uri: input.bppUri } : {}),
       transaction_id: input.transactionId,
       message_id: randomUUID(),
       timestamp: (input.now ?? new Date()).toISOString(),
-      ttl: "P2D",
     },
     message: {
-      order: {
-        id: orderId,
-        state: "Completed",
-        ...(amount !== undefined
-          ? { quote: { price: { value: amount, currency } } }
-          : {}),
-        payments: [
-          {
-            id: `PAYMENT-${orderId}`,
-            collected_by: "BAP",
-            status: order.payment_status ?? "PAID",
-            type: "PRE-ORDER",
-            params: {
-              ...(amount !== undefined ? { amount } : {}),
-              currency,
-              transaction_id: input.transactionId,
-            },
-            // The receiving end requires these; the values are the template's.
-            tags: [
-              {
-                descriptor: { code: "SETTLEMENT_TERMS" },
-                list: [
-                  {
-                    descriptor: { code: "SETTLEMENT_AMOUNT" },
-                    value: SETTLEMENT_AMOUNT,
-                  },
-                  {
-                    descriptor: { code: "SETTLEMENT_TYPE" },
-                    value: SETTLEMENT_TYPE,
-                  },
-                ],
-              },
-            ],
-          },
-        ],
-      },
+      ...message,
+      order: { ...order, state: "Completed" },
     },
   };
+}
+
+/** The newest on_confirm body recorded for an order, as the seller sent it. */
+export function onConfirmBody(
+  rows: { key: string; payload_ids: string[] }[],
+  bodies: Map<string, unknown>,
+): Record<string, unknown> | undefined {
+  for (const row of [...rows].reverse()) {
+    if (!row.key.startsWith("on_confirm")) continue;
+    const id = row.payload_ids[0];
+    const body = id !== undefined ? bodies.get(id) : undefined;
+    if (typeof body === "object" && body !== null) {
+      return body as Record<string, unknown>;
+    }
+  }
+  return undefined;
 }
 
 export interface Parties {
@@ -128,9 +93,6 @@ export function partiesFromOnConfirm(
 
 /** The route a completed order is posted to, under the configured base. */
 export const ON_COMPLETE_PATH = "/rsf-api/api/inbound/on_confirm";
-
-const SETTLEMENT_AMOUNT = "100.00";
-const SETTLEMENT_TYPE = "NEFT";
 
 /** The full completion URL for a configured base, e.g. `https://host`. */
 export function completionUrl(base: string): string {

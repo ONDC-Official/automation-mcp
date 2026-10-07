@@ -1,31 +1,59 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildOnConfirm,
+  buildCompletedOnConfirm,
   completionUrl,
+  onConfirmBody,
   partiesFromOnConfirm,
   postOnComplete,
 } from "@/modules/batch/batch.on-complete.js";
 
-const order = {
-  order_id: "ord-42",
-  order_status: "COMPLETED",
-  payment_status: "PAID",
-  total: "180.00",
-  currency: "INR",
-  from_step: "on_confirm_METRO_200",
+const sellerOnConfirm = {
+  context: {
+    domain: "ONDC:TRV11",
+    country: "IND",
+    city: "std:080",
+    action: "on_confirm",
+    core_version: "2.0.0",
+    bap_id: "buyer.example.com",
+    bap_uri: "https://buyer.example.com/ONDC:TRV11/2.0.0/buyer",
+    bpp_id: "seller.example.com",
+    bpp_uri: "https://seller.example.com/ONDC:TRV11/2.0.0/seller",
+    transaction_id: "txn-1",
+    message_id: "seller-msg",
+    timestamp: "2026-10-06T10:00:00.000Z",
+    ttl: "PT30S",
+  },
+  message: {
+    order: {
+      id: "ord-42",
+      state: "Accepted",
+      provider: { id: "P1", descriptor: { name: "Metro Co" } },
+      quote: { price: { value: "180.00", currency: "INR" } },
+      payments: [
+        {
+          id: "PAY-1",
+          status: "PAID",
+          params: { amount: "180.00", currency: "INR" },
+          tags: [
+            {
+              descriptor: { code: "SETTLEMENT_TERMS" },
+              list: [
+                { descriptor: { code: "SETTLEMENT_AMOUNT" }, value: "162.00" },
+                { descriptor: { code: "SETTLEMENT_TYPE" }, value: "NEFT" },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  },
 };
 
-describe("buildOnConfirm", () => {
-  it("fills the on_confirm body from this order's own data", () => {
-    const body = buildOnConfirm({
-      domain: "ONDC:TRV11",
-      version: "2.0.0",
-      transactionId: "txn-1",
-      bapId: "mock-bap.local",
-      bppId: "mock-bpp.local",
-      bppUri: "https://seller.example.com/ONDC:TRV11/2.0.0/seller",
-      order,
-      now: new Date("2026-10-06T10:00:00.000Z"),
+describe("buildCompletedOnConfirm", () => {
+  it("keeps every value from the seller's on_confirm and changes only what must change", () => {
+    const body = buildCompletedOnConfirm(sellerOnConfirm, {
+      transactionId: "txn-9",
+      now: new Date("2026-10-06T12:00:00.000Z"),
     }) as {
       context: Record<string, unknown>;
       message: { order: Record<string, unknown> };
@@ -33,41 +61,44 @@ describe("buildOnConfirm", () => {
 
     expect(body.context).toMatchObject({
       domain: "ONDC:TRV11",
-      action: "on_confirm",
-      transaction_id: "txn-1",
-      timestamp: "2026-10-06T10:00:00.000Z",
-      bap_id: "mock-bap.local",
-      bpp_id: "mock-bpp.local",
+      country: "IND",
+      city: "std:080",
+      core_version: "2.0.0",
+      bap_id: "buyer.example.com",
       bpp_uri: "https://seller.example.com/ONDC:TRV11/2.0.0/seller",
-      ttl: "P2D",
+      ttl: "PT30S",
+      action: "on_confirm",
+      transaction_id: "txn-9",
+      timestamp: "2026-10-06T12:00:00.000Z",
     });
+    expect(body.context["message_id"]).not.toBe("seller-msg");
     expect(body.message.order).toMatchObject({
       id: "ord-42",
       state: "Completed",
+      provider: { id: "P1", descriptor: { name: "Metro Co" } },
       quote: { price: { value: "180.00", currency: "INR" } },
     });
-    expect(body.message.order["payments"]).toEqual([
-      expect.objectContaining({
-        status: "PAID",
-        params: { amount: "180.00", currency: "INR", transaction_id: "txn-1" },
-      }),
-    ]);
+    expect(JSON.stringify(body.message.order["payments"])).toContain("162.00");
   });
 
-  it("leaves out what the batch does not know, rather than inventing it", () => {
-    const body = buildOnConfirm({
-      domain: "ONDC:TRV11",
-      version: "2.0.0",
-      transactionId: "txn-2",
-      order: { order_id: "ord-9", order_status: "COMPLETED" },
-    }) as {
-      context: Record<string, unknown>;
-      message: { order: Record<string, unknown> };
-    };
+  it("returns nothing when the on_confirm has no order", () => {
+    expect(
+      buildCompletedOnConfirm({ context: {} }, { transactionId: "t" }),
+    ).toBeUndefined();
+  });
+});
 
-    expect(body.context).not.toHaveProperty("bap_id");
-    expect(body.context).not.toHaveProperty("bpp_uri");
-    expect(body.message.order).not.toHaveProperty("quote");
+describe("onConfirmBody", () => {
+  it("returns the newest on_confirm the order recorded", () => {
+    const rows = [
+      { key: "on_confirm_METRO_200", payload_ids: ["p1"] },
+      { key: "on_status_METRO_200", payload_ids: ["p2"] },
+    ];
+    const bodies = new Map<string, unknown>([
+      ["p1", sellerOnConfirm],
+      ["p2", { context: {}, message: {} }],
+    ]);
+    expect(onConfirmBody(rows, bodies)).toEqual(sellerOnConfirm);
   });
 });
 
@@ -144,26 +175,6 @@ describe("completionUrl", () => {
   it("appends the on_confirm route to the configured base", () => {
     expect(completionUrl("https://dev-workbench.ondc.tech")).toBe(
       "https://dev-workbench.ondc.tech/rsf-api/api/inbound/on_confirm",
-    );
-  });
-
-  it("carries the settlement terms the receiving end requires", () => {
-    const body = buildOnConfirm({
-      domain: "ONDC:TRV11",
-      version: "2.0.0",
-      transactionId: "txn-3",
-      order: {
-        order_id: "ord-3",
-        order_status: "COMPLETED",
-        total: "120.00",
-        currency: "INR",
-      },
-    }) as { message: { order: { payments: { tags: unknown }[] } } };
-    expect(JSON.stringify(body.message.order.payments[0]?.tags)).toContain(
-      "SETTLEMENT_AMOUNT",
-    );
-    expect(JSON.stringify(body.message.order.payments[0]?.tags)).toContain(
-      "NEFT",
     );
   });
 

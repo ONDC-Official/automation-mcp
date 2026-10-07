@@ -18,7 +18,8 @@ import type { DriverFlowConfig } from "@/modules/batch/batch.driver.js";
 import type { UpstreamFlow } from "@/modules/catalog/catalog.schema.js";
 import { runOneTransaction } from "@/modules/batch/batch.driver.js";
 import {
-  buildOnConfirm,
+  buildCompletedOnConfirm,
+  onConfirmBody,
   partiesFromOnConfirm,
   postOnComplete,
 } from "@/modules/batch/batch.on-complete.js";
@@ -179,6 +180,13 @@ export class BatchService {
   readonly #receiverPublicUrl: string | undefined;
   readonly #armSettleMs: number;
   readonly #onCompleteUrl: string | undefined;
+  /** Orders still waiting to reach COMPLETED: transaction id → where to look. */
+  readonly #awaitingCompletion = new Map<
+    string,
+    { sessionId: string; registeredAt: number }
+  >();
+  /** Transactions whose on_confirm has already been sent, so each goes once. */
+  readonly #sentCompletion = new Set<string>();
   /**
    * In-process only, and that is sufficient: a batch's driving loop lives in
    * the same process that started it (`startRun`'s detached promise chain),
@@ -563,58 +571,108 @@ export class BatchService {
   }
 
   /**
-   * Send one completed order's on_confirm to the configured URL, if the order
-   * really is COMPLETED. The flow finishing is not enough on its own: the
-   * order's own status has to say so.
+   * Send an order's on_confirm if the order is COMPLETED right now. Resolves
+   * `true` once sent, `false` while the order is still short of COMPLETED (or
+   * its on_confirm is incomplete) — the caller then waits for a later on_status.
    */
-  async #notifyOrderCompleted(
-    input: StartBatchRunInput,
-    result: BatchTransactionResult,
-  ): Promise<void> {
+  async #tryCompletionNotice(
+    sessionId: string,
+    transactionId: string,
+  ): Promise<boolean> {
     const url = this.#onCompleteUrl;
-    if (
-      url === undefined ||
-      result.session_id === undefined ||
-      result.transaction_id === null
-    ) {
-      return;
+    if (url === undefined || this.#sentCompletion.has(transactionId)) {
+      return this.#sentCompletion.has(transactionId);
     }
-    // Every body, not just the last few: the order's on_confirm is what carries
-    // the party identities, and it is not always among the final steps.
+    // Every body, not just the last few: the on_confirm and the newest status
+    // are not always among the final steps.
     const { withPayloads, bodies } = await this.#loadJourney(
-      { session_id: result.session_id, transaction_id: result.transaction_id },
+      { session_id: sessionId, transaction_id: transactionId },
       (rows) => rows,
     );
     const order = summariseOrder(latestOrderPayload(withPayloads, bodies));
-    if (order === undefined || order.order_id === undefined) return;
-    if (order.order_status?.toUpperCase() !== "COMPLETED") return;
+    if (order === undefined || order.order_id === undefined) return false;
+    if (order.order_status?.toUpperCase() !== "COMPLETED") return false;
 
-    // All four party fields come from the order's own on_confirm, as the seller
-    // wrote it. No on_confirm, or one missing any of them, means nothing is sent.
-    const parties = partiesFromOnConfirm(withPayloads, bodies);
-    if (parties === undefined) {
+    // The party fields must come from the order's own on_confirm, as the seller
+    // wrote it. Without them nothing is sent.
+    if (partiesFromOnConfirm(withPayloads, bodies) === undefined) {
       this.#logger.warn(
-        { transactionId: result.transaction_id, orderId: order.order_id },
+        { transactionId, orderId: order.order_id },
         "order is COMPLETED but its on_confirm lacks the party fields; not sent",
       );
-      return;
+      return false;
+    }
+    const sellerOnConfirm = onConfirmBody(withPayloads, bodies);
+    const body =
+      sellerOnConfirm === undefined
+        ? undefined
+        : buildCompletedOnConfirm(sellerOnConfirm, { transactionId });
+    if (body === undefined) {
+      this.#logger.warn(
+        { transactionId, orderId: order.order_id },
+        "order is COMPLETED but has no on_confirm to send; not sent",
+      );
+      return false;
     }
 
-    const body = buildOnConfirm({
-      domain: input.domain,
-      version: input.version,
-      transactionId: result.transaction_id,
-      order,
-      bapId: parties.bap_id,
-      bapUri: parties.bap_uri,
-      bppId: parties.bpp_id,
-      bppUri: parties.bpp_uri,
-    });
     await postOnComplete(url, body);
+    this.#sentCompletion.add(transactionId);
+    this.#awaitingCompletion.delete(transactionId);
     this.#logger.info(
-      { transactionId: result.transaction_id, orderId: order.order_id },
+      { transactionId, orderId: order.order_id },
       "sent the completed order's on_confirm",
     );
+    return true;
+  }
+
+  /** A transaction just settled: send now if its order is COMPLETED, else wait. */
+  async #settleCompletion(
+    sessionId: string,
+    transactionId: string,
+  ): Promise<void> {
+    let sent = false;
+    try {
+      sent = await this.#tryCompletionNotice(sessionId, transactionId);
+    } catch (error) {
+      this.#logger.warn(
+        { err: error, transactionId },
+        "could not send the completed order's on_confirm; will retry on the next on_status",
+      );
+    }
+    if (!sent && !this.#sentCompletion.has(transactionId)) {
+      this.#awaitWithin(transactionId, sessionId);
+    }
+  }
+
+  /**
+   * The seller's on_status just landed for a transaction this instance is still
+   * waiting on. Re-check the order; send once it is COMPLETED.
+   */
+  onSellerStatus(sessionId: string, transactionId: string): void {
+    const waiting = this.#awaitingCompletion.get(transactionId);
+    if (waiting === undefined || waiting.sessionId !== sessionId) return;
+    void this.#tryCompletionNotice(sessionId, transactionId).catch(
+      (error: unknown) => {
+        this.#logger.warn(
+          { err: error, transactionId },
+          "could not send the completed order's on_confirm",
+        );
+      },
+    );
+  }
+
+  /** Remember a transaction whose order is not COMPLETED yet; forget old ones. */
+  #awaitWithin(transactionId: string, sessionId: string): void {
+    const now = Date.now();
+    for (const [id, entry] of this.#awaitingCompletion) {
+      if (now - entry.registeredAt > this.#resultTtlMs) {
+        this.#awaitingCompletion.delete(id);
+      }
+    }
+    this.#awaitingCompletion.set(transactionId, {
+      sessionId,
+      registeredAt: now,
+    });
   }
 
   /**
@@ -994,19 +1052,16 @@ export class BatchService {
         // every order twice. Scheduled, never awaited: a slow or failing
         // notification must not hold this worker, and can never change the
         // transaction's own result.
+        // Any settled transaction is checked, not only the ones whose flow
+        // completed: the notifier sends only when the order's own status is
+        // COMPLETED, so a timed-out run whose order still completed is included.
         if (
           role === "initiator" &&
-          result.status === "completed" &&
-          this.#onCompleteUrl !== undefined
+          this.#onCompleteUrl !== undefined &&
+          result.session_id !== undefined &&
+          result.transaction_id !== null
         ) {
-          void this.#notifyOrderCompleted(input, result).catch(
-            (error: unknown) => {
-              this.#logger.warn(
-                { err: error, batchId, index },
-                "could not send the completed order's on_confirm",
-              );
-            },
-          );
+          void this.#settleCompletion(result.session_id, result.transaction_id);
         }
 
         if (!TERMINAL_STATUSES.includes(result.status)) {
