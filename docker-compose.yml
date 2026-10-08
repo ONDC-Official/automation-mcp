@@ -22,6 +22,10 @@ services:
       AUTH_AUDIENCE: ${AUTH_AUDIENCE:-}
       AUTH_JWKS_URL: ${AUTH_JWKS_URL:-}
       AUTH_REQUIRED_SCOPES: ${AUTH_REQUIRED_SCOPES:-mcp}
+      # Workbench user keys under AUTH_MODE=apikey; empty URL means only AUTH_API_KEYS work.
+      AUTH_APIKEY_VERIFY_URL: ${AUTH_APIKEY_VERIFY_URL:-}
+      AUTH_APIKEY_VERIFY_TOKEN: ${AUTH_APIKEY_VERIFY_TOKEN:-}
+      AUTH_APIKEY_VERIFY_TIMEOUT_MS: ${AUTH_APIKEY_VERIFY_TIMEOUT_MS:-5000}
       # Shared state store. Empty means unset, which keeps state in-process.
       REDIS_URL: ${REDIS_URL:-}
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-ondc-mcp}

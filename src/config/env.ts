@@ -68,9 +68,24 @@ const EnvSchema = z
      * Comma-separated list of valid API keys for `AUTH_MODE=apikey`.
      *
      * Clients send any of these as a bearer token. Keys are compared in
-     * constant time to prevent timing attacks.
+     * constant time to prevent timing attacks. Optional when
+     * `AUTH_APIKEY_VERIFY_URL` is set; then they are for service callers,
+     * such as the batch peer.
      */
     AUTH_API_KEYS: csv.default([]),
+    /** Full Workbench verify URL, e.g. `https://dev-workbench.ondc.tech/automation-user-management/mcp/verify`; unset, only `AUTH_API_KEYS` work. */
+    AUTH_APIKEY_VERIFY_URL: optionalUrl,
+    /** Workbench's service secret, sent as `X-Service-Token`; keep it in a secret store, never in the repo. */
+    AUTH_APIKEY_VERIFY_TOKEN: z.preprocess(
+      (v) => (v === "" ? undefined : v),
+      z.string().min(1).optional(),
+    ),
+    /** Time budget for one user key check; past it the request is refused with 503, never let through. */
+    AUTH_APIKEY_VERIFY_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(5_000),
 
     RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
     RATE_LIMIT_WINDOW: z.string().min(1).default("1 minute"),
@@ -452,7 +467,7 @@ const EnvSchema = z
      * Unset, `both` is refused and only the single-side roles work.
      */
     BATCH_PEER_URL: z.url().optional(),
-    /** Bearer token for the peer, when it runs with `AUTH_MODE=apikey`. */
+    /** Bearer token for the peer, when it runs with `AUTH_MODE=apikey`: one of its `AUTH_API_KEYS`. */
     BATCH_PEER_API_KEY: z.string().min(1).optional(),
     /** Budget for fetching a counterparty-hosted form. */
     FORM_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
@@ -535,10 +550,28 @@ const EnvSchema = z
       path: ["AUTH_MODE"],
     },
   )
-  .refine((env) => env.AUTH_MODE !== "apikey" || env.AUTH_API_KEYS.length > 0, {
-    message: "AUTH_MODE=apikey requires at least one key in AUTH_API_KEYS",
-    path: ["AUTH_API_KEYS"],
-  })
+  // With neither fixed keys nor a verify URL, apikey mode would refuse every caller.
+  .refine(
+    (env) =>
+      env.AUTH_MODE !== "apikey" ||
+      env.AUTH_API_KEYS.length > 0 ||
+      env.AUTH_APIKEY_VERIFY_URL !== undefined,
+    {
+      message:
+        "AUTH_MODE=apikey requires at least one key in AUTH_API_KEYS, or AUTH_APIKEY_VERIFY_URL",
+      path: ["AUTH_API_KEYS"],
+    },
+  )
+  // Without the secret, user-management would refuse every key check at request time instead of at boot.
+  .refine(
+    (env) =>
+      env.AUTH_APIKEY_VERIFY_URL === undefined ||
+      env.AUTH_APIKEY_VERIFY_TOKEN !== undefined,
+    {
+      message: "AUTH_APIKEY_VERIFY_URL requires AUTH_APIKEY_VERIFY_TOKEN",
+      path: ["AUTH_APIKEY_VERIFY_TOKEN"],
+    },
+  )
   // Refuse to run an unauthenticated MCP server in production. This is the
   // failure mode that quietly exposes every tool to the open internet.
   .refine(

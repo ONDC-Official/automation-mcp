@@ -217,8 +217,36 @@ Swap `lib/token-verifier.ts` for introspection or a vendor SDK; it is a
 one-method interface.
 
 > **Gotcha worth knowing:** the SDK rejects any token whose
-> `AuthInfo.expiresAt` is unset — silently, as a plain `401`. Both shipped
-> verifiers populate it from the JWT `exp` claim.
+> `AuthInfo.expiresAt` is unset — silently, as a plain `401`. Every shipped
+> verifier populates it.
+
+### Per-user API keys
+
+Under `AUTH_MODE=apikey`, setting `AUTH_APIKEY_VERIFY_URL` also accepts each
+user's own `ondc_mcp_…` key, which they get from the Workbench website after
+GitHub login and consent. Keys last 90 days. The MCP stores no keys: on every
+request it calls Workbench's `POST /mcp/verify`, sending
+`AUTH_APIKEY_VERIFY_TOKEN` as `X-Service-Token`. Nothing is cached, because the
+consent text promises a regenerated key stops working immediately.
+
+- `AUTH_APIKEY_VERIFY_URL` must include the `/automation-user-management`
+  prefix, e.g.
+  `https://dev-workbench.ondc.tech/automation-user-management/mcp/verify`. The
+  bare host is the website and answers every path with `200` and HTML; that is
+  refused with `503`, never read as a valid key.
+- `AUTH_API_KEYS` are checked first and need no network. They're for services
+  such as the batch peer, and for the old shared key during the move.
+- Valid user key: tools run as that user, and every tool-call log line carries
+  their `user_id` as `caller`.
+- Key not shaped like `ondc_mcp_` plus 43 base64url characters: `401`, with no
+  network call.
+- Workbench answers `401` (not found, revoked, expired): `401`, with a message
+  telling the user what to do.
+- Anything else (timeout, network error, `403` wrong service token, `429`,
+  `5xx`, an unexpected body): `503` with `Retry-After`. The request is never
+  let through unchecked.
+
+The verify contract and the rollout steps are in `API-KEY-PLAN.md`.
 
 `env.ts` refuses to boot with `AUTH_MODE=none` when `NODE_ENV=production`, so
 an unauthenticated production deploy cannot happen by configuration alone.

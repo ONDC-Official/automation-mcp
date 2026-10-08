@@ -488,3 +488,66 @@ describe("authorization", () => {
     expect(response.statusCode).toBe(200);
   });
 });
+
+describe("per-user API keys (AUTH_MODE=apikey with a verify URL)", () => {
+  // Passes Workbench's format check, so it gets as far as the verify call.
+  const WELL_FORMED_KEY = `ondc_mcp_${"aB3-_".repeat(8)}xyz`;
+
+  // Port 1 refuses connections, so this stands in for user-management being down.
+  const userKeyConfig = testConfig({
+    AUTH_MODE: "apikey",
+    AUTH_APIKEY_VERIFY_URL:
+      "http://127.0.0.1:1/automation-user-management/mcp/verify",
+    AUTH_APIKEY_VERIFY_TOKEN: "service-secret",
+    AUTH_APIKEY_VERIFY_TIMEOUT_MS: "500",
+    AUTH_API_KEYS: "batch-peer-key",
+  });
+
+  function listTools(authorization?: string) {
+    return app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        ...mcpHeaders("tools/list"),
+        ...(authorization ? { authorization } : {}),
+      },
+      payload: rpc("tools/list"),
+    });
+  }
+
+  it("without a verify URL, refuses user keys exactly as before", async () => {
+    await boot(
+      testConfig({ AUTH_MODE: "apikey", AUTH_API_KEYS: "batch-peer-key" }),
+    );
+
+    const response = await listTools(`Bearer ${WELL_FORMED_KEY}`);
+    expect(response.statusCode).toBe(401);
+  });
+
+  it("refuses a call with no key", async () => {
+    await boot(userKeyConfig);
+    const response = await listTools();
+    expect(response.statusCode).toBe(401);
+  });
+
+  it("refuses a key that is not a Workbench key", async () => {
+    await boot(userKeyConfig);
+    const response = await listTools("Bearer some-random-key");
+    expect(response.statusCode).toBe(401);
+  });
+
+  it("answers 503, not 401, when user-management cannot be reached", async () => {
+    await boot(userKeyConfig);
+    const response = await listTools(`Bearer ${WELL_FORMED_KEY}`);
+
+    expect(response.statusCode).toBe(503);
+    expect(response.headers["retry-after"]).toBe("5");
+    expect(response.json()).toMatchObject({ error: "temporarily_unavailable" });
+  });
+
+  it("still lets a fixed key through while user-management is down", async () => {
+    await boot(userKeyConfig);
+    const response = await listTools("Bearer batch-peer-key");
+    expect(response.statusCode).toBe(200);
+  });
+});

@@ -9,6 +9,10 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import type { Config } from "@/config/env.js";
 import { createTokenVerifier } from "@/lib/token-verifier.js";
+import { AuthUnavailableError } from "@/lib/user-key-check.js";
+
+/** Hint to the client on a 503; user-management outages are usually brief restarts. */
+const RETRY_AFTER_SECONDS = 5;
 
 /**
  * The Resource Server half of the MCP authorization flow.
@@ -81,6 +85,20 @@ async function plugin(app: FastifyInstance, config: Config): Promise<void> {
         // pass-through authInfo, which is how tools see `ctx.http.authInfo`.
         (request.raw as { auth?: AuthInfo }).auth = request.authInfo;
       } catch (error) {
+        // We could not check the key, which says nothing about the key itself, so the answer is 503, never 401.
+        if (error instanceof AuthUnavailableError) {
+          request.log.error({ err: error }, "API key verification unavailable");
+          await reply
+            .code(503)
+            .header("retry-after", String(RETRY_AFTER_SECONDS))
+            .send({
+              error: "temporarily_unavailable",
+              error_description:
+                "API key verification is temporarily unavailable; retry shortly",
+            });
+          return;
+        }
+
         request.log.warn({ err: error }, "bearer authentication failed");
         await sendWebResponse(
           reply,

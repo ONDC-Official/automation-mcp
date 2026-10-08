@@ -241,6 +241,8 @@ export function defineTool<
         const logger = requestLogger({
           tool: spec.name,
           method: ctx.mcpReq.method,
+          // Who made the call: the Workbench user_id for a user key, or "apikey-client" for a fixed key.
+          caller: ctx.http?.authInfo?.clientId,
           ...traceFieldsFrom(ctx),
           ...correlationFields(input),
         });
