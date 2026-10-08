@@ -1,3 +1,4 @@
+import type { OAuthTokenVerifier } from "@modelcontextprotocol/server";
 import { randomUUID } from "node:crypto";
 import { Agent } from "undici";
 import type { Logger } from "pino";
@@ -10,6 +11,7 @@ import { TransactionEvents } from "@/lib/events/transaction-events.js";
 import { logger as rootLogger } from "@/lib/logger.js";
 import { createMetrics, type Metrics } from "@/lib/metrics/metrics.js";
 import { MockEngine } from "@/lib/mock-engine/mock-engine.js";
+import { createTokenVerifier } from "@/lib/token-verifier.js";
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
 import { HttpConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
 import { CatalogService } from "@/modules/catalog/catalog.service.js";
@@ -110,6 +112,8 @@ export interface HealthCheck {
 export interface Container {
   readonly config: Config;
   readonly logger: Logger;
+  /** Checks bearer tokens on `/mcp`; undefined under AUTH_MODE=none. Built here because its cache lives in `stateStore`. */
+  readonly tokenVerifier: OAuthTokenVerifier | undefined;
   readonly services: {
     readonly catalog: CatalogService;
     readonly protocol: ProtocolService;
@@ -282,6 +286,12 @@ export async function createContainer(
    * whether shutdown may give a still-open incident a verdict.
    */
   const stateSurvivesShutdown = stateStore instanceof RedisCacheStore;
+
+  // Shares `stateStore`, so cached key checks sit in the Redis that Workbench clears on regenerate.
+  const tokenVerifier = createTokenVerifier(config, {
+    cache: stateStore,
+    logger,
+  });
 
   // ---- Derived: the flow catalog -----------------------------------------
   // Always in-process, deliberately. `FlowService.load()` reads a flow's
@@ -840,6 +850,7 @@ export async function createContainer(
   return {
     config,
     logger,
+    tokenVerifier,
     services,
     mockEngine,
     metrics,

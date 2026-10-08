@@ -217,8 +217,53 @@ Swap `lib/token-verifier.ts` for introspection or a vendor SDK; it is a
 one-method interface.
 
 > **Gotcha worth knowing:** the SDK rejects any token whose
-> `AuthInfo.expiresAt` is unset — silently, as a plain `401`. Both shipped
-> verifiers populate it from the JWT `exp` claim.
+> `AuthInfo.expiresAt` is unset — silently, as a plain `401`. Every shipped
+> verifier populates it.
+
+### Per-user API keys
+
+Under `AUTH_MODE=apikey`, setting `AUTH_APIKEY_VERIFY_URL` also accepts each
+user's own `ondc_mcp_…` key, which they get from the Workbench website after
+GitHub login and consent. Keys last 90 days. The MCP stores no keys: it calls
+Workbench's `POST /mcp/verify`, sending `AUTH_APIKEY_VERIFY_TOKEN` as
+`X-Service-Token`, and remembers the answer briefly (see "Key-check cache"
+below).
+
+- `AUTH_APIKEY_VERIFY_URL` must include the `/automation-user-management`
+  prefix, e.g.
+  `https://dev-workbench.ondc.tech/automation-user-management/mcp/verify`. The
+  bare host is the website and answers every path with `200` and HTML; that is
+  refused with `503`, never read as a valid key.
+- `AUTH_API_KEYS` are checked first and need no network. They're for services
+  such as the batch peer, and for the old shared key during the move.
+- Valid user key: tools run as that user, and every tool-call log line carries
+  their `user_id` as `caller`.
+- Key not shaped like `ondc_mcp_` plus 43 base64url characters: `401`, with no
+  network call.
+- Workbench answers `401` (not found, revoked, expired): `401`, with a message
+  telling the user what to do.
+- Anything else (timeout, network error, `403` wrong service token, `429`,
+  `5xx`, an unexpected body): `503` with `Retry-After`. The request is never
+  let through unchecked.
+
+#### Key-check cache
+
+Answers are remembered in the state store, which is Redis when `REDIS_URL` is
+set, under `<REDIS_KEY_PREFIX>::mcp_key_check:<sha256 hex of the key>`. Only
+the hash is stored, never the key.
+
+- Valid keys: `AUTH_APIKEY_CACHE_TTL_MS` (default 60s), never past the key's
+  own `expires_at`.
+- Rejected keys: 10s, with their reason, so the user still sees the right
+  message.
+- "Couldn't check" answers are never remembered.
+- **Workbench deletes the entry when a key is regenerated, revoked or
+  deleted**, so a dead key stops working at once, as the consent promises. If
+  that delete ever fails, the entry still expires within the TTL.
+- If Redis is down, lookups count as misses and Workbench is asked directly.
+- `AUTH_APIKEY_CACHE_TTL_MS=0` turns the cache off.
+
+The verify contract is Workbench's integration guide, `mcp-key-verification.md`.
 
 `env.ts` refuses to boot with `AUTH_MODE=none` when `NODE_ENV=production`, so
 an unauthenticated production deploy cannot happen by configuration alone.
