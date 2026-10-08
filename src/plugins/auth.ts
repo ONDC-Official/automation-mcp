@@ -3,12 +3,10 @@ import {
   getOAuthProtectedResourceMetadataUrl,
   verifyBearerToken,
   type AuthInfo,
-  type OAuthTokenVerifier,
 } from "@modelcontextprotocol/server";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
-import type { Config } from "@/config/env.js";
-import { createTokenVerifier } from "@/lib/token-verifier.js";
+import type { Container } from "@/container.js";
 import { AuthUnavailableError } from "@/lib/user-key-check.js";
 
 /** Hint to the client on a 503; user-management outages are usually brief restarts. */
@@ -57,10 +55,15 @@ async function sendWebResponse(
     .send(body);
 }
 
-async function plugin(app: FastifyInstance, config: Config): Promise<void> {
+async function plugin(
+  app: FastifyInstance,
+  container: Container,
+): Promise<void> {
+  const { config } = container;
   const resourceUrl = new URL(config.MCP_PUBLIC_URL);
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
-  const verifier: OAuthTokenVerifier | undefined = createTokenVerifier(config);
+  // Built by the container, which owns the state store the key-check cache lives in.
+  const verifier = container.tokenVerifier;
 
   app.decorateRequest("authInfo", undefined);
 

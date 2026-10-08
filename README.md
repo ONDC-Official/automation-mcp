@@ -224,10 +224,10 @@ one-method interface.
 
 Under `AUTH_MODE=apikey`, setting `AUTH_APIKEY_VERIFY_URL` also accepts each
 user's own `ondc_mcp_…` key, which they get from the Workbench website after
-GitHub login and consent. Keys last 90 days. The MCP stores no keys: on every
-request it calls Workbench's `POST /mcp/verify`, sending
-`AUTH_APIKEY_VERIFY_TOKEN` as `X-Service-Token`. Nothing is cached, because the
-consent text promises a regenerated key stops working immediately.
+GitHub login and consent. Keys last 90 days. The MCP stores no keys: it calls
+Workbench's `POST /mcp/verify`, sending `AUTH_APIKEY_VERIFY_TOKEN` as
+`X-Service-Token`, and remembers the answer briefly (see "Key-check cache"
+below).
 
 - `AUTH_APIKEY_VERIFY_URL` must include the `/automation-user-management`
   prefix, e.g.
@@ -245,6 +245,23 @@ consent text promises a regenerated key stops working immediately.
 - Anything else (timeout, network error, `403` wrong service token, `429`,
   `5xx`, an unexpected body): `503` with `Retry-After`. The request is never
   let through unchecked.
+
+#### Key-check cache
+
+Answers are remembered in the state store, which is Redis when `REDIS_URL` is
+set, under `<REDIS_KEY_PREFIX>::mcp_key_check:<sha256 hex of the key>`. Only
+the hash is stored, never the key.
+
+- Valid keys: `AUTH_APIKEY_CACHE_TTL_MS` (default 60s), never past the key's
+  own `expires_at`.
+- Rejected keys: 10s, with their reason, so the user still sees the right
+  message.
+- "Couldn't check" answers are never remembered.
+- **Workbench deletes the entry when a key is regenerated, revoked or
+  deleted**, so a dead key stops working at once, as the consent promises. If
+  that delete ever fails, the entry still expires within the TTL.
+- If Redis is down, lookups count as misses and Workbench is asked directly.
+- `AUTH_APIKEY_CACHE_TTL_MS=0` turns the cache off.
 
 The verify contract and the rollout steps are in `API-KEY-PLAN.md`.
 

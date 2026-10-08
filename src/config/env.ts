@@ -80,6 +80,12 @@ const EnvSchema = z
       (v) => (v === "" ? undefined : v),
       z.string().min(1).optional(),
     ),
+    /** How long a key check is remembered in the state store; Workbench clears it on regenerate/revoke. 0 = no cache. */
+    AUTH_APIKEY_CACHE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .nonnegative()
+      .default(60_000),
     /** Time budget for one user key check; past it the request is refused with 503, never let through. */
     AUTH_APIKEY_VERIFY_TIMEOUT_MS: z.coerce
       .number()

@@ -52,7 +52,7 @@ export async function buildHttpApp(container: Container, config: Config) {
 
   await app.register(errorHandlerPlugin);
   await app.register(securityPlugin, config);
-  await app.register(authPlugin, config);
+  await app.register(authPlugin, container);
   await app.register(mcpPlugin, container);
   await app.register(healthRoutes(container));
   // Beside health, and unauthenticated in the same sense: an operator's probe,

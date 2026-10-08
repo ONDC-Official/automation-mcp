@@ -78,7 +78,8 @@ guide is `mcp-key-verification.md` (received 2026-10-08). The parts the MCP depe
 
 1. **Fail closed (§8).** Any non-200, timeout or connection error refuses the request.
 2. **No caching of verification results (§3).** "The old key stops working immediately."
-   Adding a cache needs a consent change and version bump first.
+   Adding a cache needs a consent change and version bump first, **unless** Workbench clears
+   our cache whenever a key stops being valid, which keeps the promise true (section 5b).
 3. **Never store or log the key (§7).** If correlation is needed, log only its first 15
    characters, which is the same hint the profile page shows.
 
@@ -116,6 +117,9 @@ and user keys are checked with Workbench when a verify URL is set.
      body): **503** with `Retry-After`. Never let through. `403` and `429` are logged as our
      misconfiguration (the service token is missing or wrong).
 
+**Step 4 with the cache (follow-up, section 5b):** before asking Workbench, look up the cache.
+A hit answers without a network call; a miss asks Workbench and stores the answer.
+
 **3. 503 handling** (`src/plugins/auth.ts`): done. "Couldn't check" is a 503, not a 500.
 
 **4. Log who called** (`src/lib/define-tool.ts`): done. Every tool-call log line carries
@@ -144,6 +148,54 @@ Changes to follow Workbench's contract (2026-10-08):
   "Key not recognised…"; fixed key → 200; wrong token → 503; URL without the prefix → 503
 - [x] Live check with a **real** user key from dev (valid → 200, real tool call → 200, regenerate → old key 401, new key 200)
 
+## 5b. Follow-up: Redis cache for key checks (branch `feat/api-key-cache`)
+
+**Why:** PR #4 calls Workbench on every tool call. A short cache in the shared Redis cuts
+that to about one call per user per minute, with the same revocation guarantee.
+
+**The deal with Workbench** (needed before this ships): when a key stops being valid,
+whether through **regenerate, revoke or delete**, user-management deletes our cached answer
+from the shared Redis:
+
+```
+DEL ondc-mcp::mcp_key_check:<sha256 hex of the old key>
+```
+
+- `<sha256 hex>` is the lowercase hex SHA-256 of the full key string, the same value they
+  store in Mongo as the key hash, so they never need the plain key.
+- `ondc-mcp` is the MCP's `REDIS_KEY_PREFIX`; if that setting changes, their `DEL` must too.
+- Without this `DEL`, an old key would keep working for up to 60s, which breaks consent §3.
+
+**How the cache behaves:**
+
+- Lives in the MCP's state store: Redis when `REDIS_URL` is set, process memory otherwise.
+- Valid answers are kept for `AUTH_APIKEY_CACHE_TTL_MS` (default 60s), but **never past the
+  key's own `expires_at`**, so an expired key can't stay valid in the cache.
+- Invalid answers (`not_found`, `revoked`, `expired`) are kept for 10s, with their reason, so
+  the user still gets the right message. This keeps repeated bad keys off Workbench.
+- Malformed keys are never cached (they never reach Workbench anyway). "Couldn't check"
+  answers (503) are never cached.
+- Redis down → treated as a cache miss, so we ask Workbench. A Redis outage never locks
+  users out.
+- Only the key's hash is stored, never the key.
+- `AUTH_APIKEY_CACHE_TTL_MS=0` turns the cache off, giving PR #4's behaviour.
+
+### Progress (follow-up)
+
+- [x] `AUTH_APIKEY_CACHE_TTL_MS` setting (default 60s; 0 = off)
+- [x] Cache in `user-key-check.ts`: valid capped at `expires_at`, invalid 10s with reason,
+  Redis failures fall back
+- [x] Build the verifier in the container, so it shares the state store
+- [x] Tests: hit, miss, Workbench `DEL` revokes at once, expiry cap, invalid reason kept,
+  Redis down, cache off
+- [x] Docs: README, `.env.example`, `docker-compose.yml`
+- [x] Typecheck, lint, full suite (1259 passed)
+- [x] Local check with Redis + dev: valid key cached (60s, ~0.2s → ~0.02s), simulated Workbench
+  `DEL` forces a re-check, unknown key cached 10s with its reason, malformed key never cached,
+  fixed key and a real tool call work, Redis down falls back to Workbench (slower: ~2-3s per
+  call while down), no raw key in Redis or logs
+- [ ] Real regenerate on dev once Workbench's `DEL` is live (old key → 401 immediately)
+
 **Later, not in this change: session ownership** (parked 2026-10-08).
 
 - **The gap:** anyone with a valid key who has another user's `session_id` can run flows in it
@@ -164,7 +216,8 @@ Changes to follow Workbench's contract (2026-10-08):
 
 | Situation | What happens |
 |---|---|
-| User regenerates or a key is revoked | Every request is verified, so the old key gets `401` on its next call. |
+| User regenerates or a key is revoked | Without the cache, every request is verified, so the old key gets `401` on its next call. With the cache (5b), Workbench's `DEL` clears it, with the same result. |
+| Workbench's `DEL` fails | The old key keeps working until its cache entry expires, at most 60s. Workbench should log the failure. |
 | Key expires (90 days) | `401` with reason `expired`; the user generates a new one. |
 | Workbench is down or slow | Users get **503** after at most 5s. Fixed keys (batch peer) keep working. |
 | Wrong base URL (bare host answers HTML) | The body isn't the expected JSON, so the request is refused with 503 and logged. |

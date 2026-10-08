@@ -6,7 +6,9 @@ import {
 } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import { timingSafeEqual } from "node:crypto";
+import type { Logger } from "pino";
 import type { Config } from "@/config/env.js";
+import type { CacheStore } from "@/lib/cache/cache-store.js";
 import { createUserKeyCheck, type UserKeyCheck } from "@/lib/user-key-check.js";
 
 /**
@@ -108,9 +110,12 @@ export function createPermissiveVerifier(): OAuthTokenVerifier {
  * - per-user `ondc_mcp_…` keys from the Workbench website, checked with
  *   user-management when `AUTH_APIKEY_VERIFY_URL` is set.
  */
-export function createApiKeyVerifier(config: Config): OAuthTokenVerifier {
+export function createApiKeyVerifier(
+  config: Config,
+  deps: VerifierDeps,
+): OAuthTokenVerifier {
   const fixedKeys = config.AUTH_API_KEYS.map((key) => Buffer.from(key));
-  const checkUserKey = userKeyCheckFrom(config);
+  const checkUserKey = userKeyCheckFrom(config, deps);
   if (fixedKeys.length === 0 && checkUserKey === undefined) {
     // Unreachable: env.ts refuses to boot in apikey mode with neither.
     throw new Error(
@@ -131,7 +136,10 @@ export function createApiKeyVerifier(config: Config): OAuthTokenVerifier {
 }
 
 /** The Workbench user key check, or undefined when this deploy accepts only fixed keys. */
-function userKeyCheckFrom(config: Config): UserKeyCheck | undefined {
+function userKeyCheckFrom(
+  config: Config,
+  deps: VerifierDeps,
+): UserKeyCheck | undefined {
   if (config.AUTH_APIKEY_VERIFY_URL === undefined) return undefined;
   if (config.AUTH_APIKEY_VERIFY_TOKEN === undefined) {
     // Unreachable: env.ts refuses a verify URL without its token.
@@ -141,6 +149,9 @@ function userKeyCheckFrom(config: Config): UserKeyCheck | undefined {
     url: config.AUTH_APIKEY_VERIFY_URL,
     serviceToken: config.AUTH_APIKEY_VERIFY_TOKEN,
     timeoutMs: config.AUTH_APIKEY_VERIFY_TIMEOUT_MS,
+    cacheTtlMs: config.AUTH_APIKEY_CACHE_TTL_MS,
+    cache: deps.cache,
+    logger: deps.logger,
   });
 }
 
@@ -163,10 +174,17 @@ function fixedKeyAuthInfo(token: string): AuthInfo {
   };
 }
 
+/** What a verifier needs from the container: the shared state store (for the key-check cache) and a logger. */
+export interface VerifierDeps {
+  readonly cache: CacheStore;
+  readonly logger: Logger;
+}
+
 export function createTokenVerifier(
   config: Config,
+  deps: VerifierDeps,
 ): OAuthTokenVerifier | undefined {
   if (config.AUTH_MODE === "jwt") return createJwtVerifier(config);
-  if (config.AUTH_MODE === "apikey") return createApiKeyVerifier(config);
+  if (config.AUTH_MODE === "apikey") return createApiKeyVerifier(config, deps);
   return undefined;
 }

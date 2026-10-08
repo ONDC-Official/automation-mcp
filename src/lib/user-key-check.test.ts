@@ -1,10 +1,15 @@
 import { OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";
+import { createHash } from "node:crypto";
+import { pino } from "pino";
 import { MockAgent } from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseConfig } from "@/config/env.js";
+import { InMemoryCacheStore } from "@/lib/cache/in-memory-cache-store.js";
+import { UpstreamError } from "@/lib/errors.js";
 import {
   AuthUnavailableError,
   createUserKeyCheck,
+  userKeyCacheKey,
   type UserKeyCheckOptions,
 } from "@/lib/user-key-check.js";
 
@@ -13,6 +18,19 @@ const VERIFY_PATH = "/automation-user-management/mcp/verify";
 const SERVICE_TOKEN = "service-secret";
 /** Workbench's shape: `ondc_mcp_` plus 43 base64url characters. */
 const USER_KEY = `ondc_mcp_${"aB3-_".repeat(8)}xyz`;
+
+/** The entry Workbench deletes (the Redis store adds the `ondc-mcp::` prefix), computed independently. */
+const CACHE_KEY = `mcp_key_check:${createHash("sha256").update(USER_KEY).digest("hex")}`;
+
+/** A store that fails the way the Redis store does during an outage. */
+class UnreachableStore extends InMemoryCacheStore {
+  override get<T>(): Promise<T | undefined> {
+    return Promise.reject(new UpstreamError("redis", "ECONNREFUSED"));
+  }
+  override set(): Promise<void> {
+    return Promise.reject(new UpstreamError("redis", "ECONNREFUSED"));
+  }
+}
 
 const VALID_REPLY = {
   valid: true,
@@ -24,15 +42,19 @@ const VALID_REPLY = {
 
 describe("createUserKeyCheck", () => {
   let agent: MockAgent;
+  let store: InMemoryCacheStore;
 
   beforeEach(() => {
     agent = new MockAgent();
     // Any call without a matching intercept fails, which is how "no network call" is proven.
     agent.disableNetConnect();
+    // No sweep timer, so nothing outlives the test.
+    store = new InMemoryCacheStore({ sweepIntervalMs: 0 });
   });
 
   afterEach(async () => {
     await agent.close();
+    await store.close();
   });
 
   function userKeyCheck(overrides: Partial<UserKeyCheckOptions> = {}) {
@@ -40,6 +62,9 @@ describe("createUserKeyCheck", () => {
       url: `${ORIGIN}${VERIFY_PATH}`,
       serviceToken: SERVICE_TOKEN,
       timeoutMs: 1_000,
+      cacheTtlMs: 60_000,
+      cache: store,
+      logger: pino({ enabled: false }),
       dispatcher: agent,
       ...overrides,
     });
@@ -102,15 +127,102 @@ describe("createUserKeyCheck", () => {
     await expectInvalidToken(userKeyCheck()(key), "doesn't look like");
   });
 
-  it("verifies on every call, because nothing is cached", async () => {
-    expectVerify().reply(200, VALID_REPLY).times(2);
-    const check = userKeyCheck();
+  describe("remembers answers in the state store", () => {
+    it("answers a repeat call from the cache, without asking Workbench", async () => {
+      expectVerify().reply(200, VALID_REPLY);
+      const check = userKeyCheck();
 
-    await check(USER_KEY);
-    await check(USER_KEY);
+      await check(USER_KEY);
+      // Only one intercept exists, so a second network call would fail.
+      const again = await check(USER_KEY);
 
-    // Both intercepts were used, so both calls reached Workbench.
-    agent.assertNoPendingInterceptors();
+      expect(again.clientId).toBe("6ac73eeb76f3376f6c12e5a5");
+    });
+
+    it("stores the answer under the key name Workbench deletes", async () => {
+      expectVerify().reply(200, VALID_REPLY);
+
+      await userKeyCheck()(USER_KEY);
+
+      expect(userKeyCacheKey(USER_KEY)).toBe(CACHE_KEY);
+      expect(await store.get(CACHE_KEY)).toEqual(VALID_REPLY);
+    });
+
+    it("stops accepting a key as soon as Workbench deletes its entry", async () => {
+      expectVerify().reply(200, VALID_REPLY);
+      expectVerify().reply(401, { reason: "not_found", valid: false });
+      const check = userKeyCheck();
+
+      await check(USER_KEY);
+      // What user-management does on regenerate, revoke or delete.
+      await store.delete(CACHE_KEY);
+
+      await expectInvalidToken(check(USER_KEY), "Key not recognised");
+    });
+
+    it("never remembers a valid key past its own expiry", async () => {
+      const soon = new Date(Date.now() + 5_000).toISOString();
+      expectVerify().reply(200, { ...VALID_REPLY, expires_at: soon });
+      const set = vi.spyOn(store, "set");
+
+      await userKeyCheck()(USER_KEY);
+
+      const ttl = set.mock.calls[0]?.[2] ?? Infinity;
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(5_000);
+    });
+
+    it("remembers a rejected key for 10 seconds, with its reason", async () => {
+      expectVerify().reply(401, { reason: "revoked", valid: false });
+      const set = vi.spyOn(store, "set");
+      const check = userKeyCheck();
+
+      await expectInvalidToken(check(USER_KEY), "was revoked");
+      // Answered from the cache: same message, no second network call.
+      await expectInvalidToken(check(USER_KEY), "was revoked");
+
+      expect(set.mock.calls[0]?.[2]).toBe(10_000);
+    });
+
+    it("never remembers a failure to check", async () => {
+      expectVerify().reply(500, { reason: "internal_error" });
+      expectVerify().reply(200, VALID_REPLY);
+      const check = userKeyCheck();
+
+      await expect(check(USER_KEY)).rejects.toBeInstanceOf(
+        AuthUnavailableError,
+      );
+      const info = await check(USER_KEY);
+      expect(info.clientId).toBe("6ac73eeb76f3376f6c12e5a5");
+    });
+
+    it("re-checks, rather than trusts, an entry it cannot read", async () => {
+      await store.set(CACHE_KEY, { valid: "yes" }, 60_000);
+      expectVerify().reply(401, { reason: "not_found", valid: false });
+
+      await expectInvalidToken(userKeyCheck()(USER_KEY), "Key not recognised");
+    });
+
+    it("asks Workbench when the store is down, so users are not locked out", async () => {
+      expectVerify().reply(200, VALID_REPLY);
+      const down = new UnreachableStore({ sweepIntervalMs: 0 });
+
+      const info = await userKeyCheck({ cache: down })(USER_KEY);
+
+      expect(info.clientId).toBe("6ac73eeb76f3376f6c12e5a5");
+      await down.close();
+    });
+
+    it("asks Workbench on every call when the cache is off", async () => {
+      expectVerify().reply(200, VALID_REPLY).times(2);
+      const check = userKeyCheck({ cacheTtlMs: 0 });
+
+      await check(USER_KEY);
+      await check(USER_KEY);
+
+      // Both intercepts were used, so both calls reached Workbench.
+      agent.assertNoPendingInterceptors();
+    });
   });
 
   describe("tells the user what to do when Workbench rejects the key", () => {
@@ -230,5 +342,6 @@ describe("AUTH_MODE=apikey user key config", () => {
     });
 
     expect(config.AUTH_APIKEY_VERIFY_TIMEOUT_MS).toBe(5_000);
+    expect(config.AUTH_APIKEY_CACHE_TTL_MS).toBe(60_000);
   });
 });
