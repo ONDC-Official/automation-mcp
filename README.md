@@ -263,7 +263,7 @@ the hash is stored, never the key.
 - If Redis is down, lookups count as misses and Workbench is asked directly.
 - `AUTH_APIKEY_CACHE_TTL_MS=0` turns the cache off.
 
-The verify contract and the rollout steps are in `API-KEY-PLAN.md`.
+The verify contract is Workbench's integration guide, `mcp-key-verification.md`.
 
 `env.ts` refuses to boot with `AUTH_MODE=none` when `NODE_ENV=production`, so
 an unauthenticated production deploy cannot happen by configuration alone.

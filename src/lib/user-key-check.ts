@@ -18,7 +18,7 @@ import { UpstreamError } from "@/lib/errors.js";
  * the answer is remembered briefly in the shared state store (Redis in
  * production). Workbench deletes a remembered answer when its key is
  * regenerated or revoked, so a dead key still stops working at once.
- * Contract: Workbench's `mcp-key-verification.md`; plan: `API-KEY-PLAN.md` §5b.
+ * Contract: Workbench's `mcp-key-verification.md`.
  */
 
 /** The exact shape Workbench issues; anything else is refused without a network call. */
