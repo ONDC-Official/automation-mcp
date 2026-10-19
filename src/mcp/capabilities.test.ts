@@ -131,6 +131,7 @@ describe("the model is never told about a tool that is not there", () => {
     expect(instructions).toMatch(/before your next tool call/);
     expect(instructions).toMatch(/plain text on its own line/);
     expect(instructions).toMatch(/in auto mode too/);
+    expect(instructions).toMatch(/also open it in their browser/);
   });
 
   it("tells the model how to run the manual-mode journey", async () => {

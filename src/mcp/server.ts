@@ -100,15 +100,25 @@ function instructionsFor(container: Container): string {
       "holds in auto mode too, and for a second session in the same conversation —",
       "each session has its own link. Do not wait to be asked, and do not summarise",
       "it away. A human who never receives it has no view of the run except your",
-      "description of it.",
+      "description of it. It must be in your reply before you start any flow. If the",
+      "person asks for the link or the viewer, write it as plain text straight away",
+      "(session_get returns it again). Then, if you can run shell commands, also open it in their",
+      "browser — open '<url>' on macOS, xdg-open '<url>' on Linux, start \"\" \"<url>\"",
+      "on Windows — always quoting the URL, which contains & and #. The command is",
+      "hidden from the person, so it never counts as sharing the link.",
     );
   }
   if (features.enabled("catalog")) {
     lines.push(
       "",
-      "Then list the flows to the person — each one's name and description — and ask",
-      "whether to run one or explain one first. To explain a flow, describe its",
-      "scenario and steps in plain words.",
+      "Then list the flows to the person — each one's name and description.",
+      ...(features.enabled("ui")
+        ? [
+            "Right after the list, write the viewer_url as a plain URL on its own line.",
+          ]
+        : []),
+      "Then ask whether to run one or explain one first. To explain a flow, describe",
+      "its scenario and steps in plain words.",
       "",
       "catalog_describe_flow shows one flow's sequence. Every step is tagged",
       "with an actor: 'mock' means you must produce it, 'np' means you wait for the",
