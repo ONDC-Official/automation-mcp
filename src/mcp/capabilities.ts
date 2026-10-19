@@ -74,6 +74,7 @@ const BY_MODULE: Partial<Record<ModuleName, CapabilityFactory>> = {
   flow: (c) => [
     ...createFlowTools(c.services.flow, c.services.record, {
       maxAwaitMs: c.config.AWAIT_MAX_WAIT_MS,
+      viewerUrl: (sessionId) => c.services.session.viewerUrl(sessionId),
     }),
     ...createFlowPrompts(),
   ],

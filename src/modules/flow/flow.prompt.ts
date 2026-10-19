@@ -44,8 +44,10 @@ const LOOP = `
 2. \`session_create\` — the participant's subscriber URL and whether it is a BAP
    or a BPP. This server takes the opposite role automatically. **Ask the person
    first whether they want manual or auto mode**, and pass it as
-   \`interaction_mode\`. **Make the \`viewer_url\` it returns the first line of
-   your reply, as a plain URL on its own line** — do not wait to be asked. It is
+   \`interaction_mode\`. **Right after every \`session_create\`, before your next
+   tool call, write the \`viewer_url\` it returns to the person as a plain URL on
+   its own line** — in auto mode too, and for every new session, since each has
+   its own link. Do not wait to be asked. It is
    a live page showing every flow, every payload and every event in this
    session, and it is the only view of the run they have that is not you
    describing it. You keep driving; they get to watch.

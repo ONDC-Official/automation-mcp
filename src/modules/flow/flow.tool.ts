@@ -102,7 +102,8 @@ export function renderStep(step: FlowStepState): string {
  * first thing it reads rather than something it has to hunt for.
  */
 export function renderRuns(runs: RunSummary[]): string[] {
-  if (runs.length === 0) return ["no runs open in this session — call flow_start"];
+  if (runs.length === 0)
+    return ["no runs open in this session — call flow_start"];
 
   const rank: Record<string, number> = {
     INPUT_REQUIRED: 0,
@@ -169,6 +170,8 @@ export function renderStatus(status: FlowStatusOutput): string {
 export interface FlowToolOptions {
   /** Ceiling on one blocking wait, from `AWAIT_MAX_WAIT_MS`. */
   maxAwaitMs: number;
+  /** The session's live viewer link; absent when the viewer is off. */
+  viewerUrl?: (sessionId: string) => string | undefined;
 }
 
 /** How often a parked `flow_await` tells the client it is still waiting. */
@@ -276,11 +279,23 @@ export function createFlowTools(
           `  mock plays:  ${output.mock_role}`,
           `  callback:    ${output.callback_url}`,
           `  auto-advance: ${output.auto_advance ? "on" : "off"}`,
+          // A backstop for the link `session_create` already asked for: in an
+          // auto run the model goes straight from creating the session to
+          // starting a flow, and that is exactly where the link was dropped.
+          ...(output.viewer_url !== undefined
+            ? [
+                "",
+                "→ If you have not given the person this session's viewer link yet,",
+                "  write it to them now, as plain text on its own line:",
+                `  ${output.viewer_url}`,
+              ]
+            : []),
           "",
           renderOutcome(output.outcome),
           ...renderEvents(output.events),
         ].join("\n"),
       handler: async (input) => {
+        const viewerUrl = options.viewerUrl?.(input.session_id);
         const { runtime, outcome, autoAdvance } = await service.start({
           sessionId: input.session_id,
           flowId: input.flow_id,
@@ -300,6 +315,7 @@ export function createFlowTools(
           // Present only for a resumed run: a fresh one has no transaction and
           // therefore no cursor, and `flow_await` should be called without one.
           ...(runtime.bound ? { seq: runtime.record.seq } : {}),
+          ...(viewerUrl !== undefined ? { viewer_url: viewerUrl } : {}),
           ...(await eventsFor(records, input.session_id)),
         };
       },
@@ -528,8 +544,12 @@ export function createFlowTools(
           ...detail,
           ...adjusted,
           ...renderEvents(output.events),
-          ...(output.runs !== undefined ? ["", ...renderRuns(output.runs)] : []),
-          ...(output.next !== undefined ? ["", renderOutcome(output.next)] : []),
+          ...(output.runs !== undefined
+            ? ["", ...renderRuns(output.runs)]
+            : []),
+          ...(output.next !== undefined
+            ? ["", renderOutcome(output.next)]
+            : []),
         ].join("\n");
       },
       handler: async (input, tools) => {

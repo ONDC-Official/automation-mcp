@@ -94,11 +94,13 @@ function instructionsFor(container: Container): string {
     lines.push(
       "",
       "session_create also returns viewer_url: a live, read-only page of every flow,",
-      "payload and event in the session. Make it the first line of your reply to the",
-      "person you are testing for: the full URL as plain text on its own line, not a",
-      "markdown link, so they can copy it. Do not wait to be asked, and do not",
-      "summarise it away. A human who never receives it has no view of the run",
-      "except your description of it.",
+      "payload and event in the session. Right after every session_create, before",
+      "your next tool call, write it to the person you are testing for: the full URL",
+      "as plain text on its own line, not a markdown link, so they can copy it. This",
+      "holds in auto mode too, and for a second session in the same conversation —",
+      "each session has its own link. Do not wait to be asked, and do not summarise",
+      "it away. A human who never receives it has no view of the run except your",
+      "description of it.",
     );
   }
   if (features.enabled("catalog")) {

@@ -102,8 +102,9 @@ describe("session tools over MCP", () => {
      * which is the whole bug this shape exists to fix.
      */
     expect(text).toContain("HAND THIS TO THE PERSON YOU ARE TESTING FOR");
-    expect(text).toContain("first line of");
+    expect(text).toContain("before your next tool call");
     expect(text).toContain("plain text on its own line");
+    expect(text).toContain("auto mode too");
 
     const urlLine = lines.findIndex((line) => line.includes(viewer_url ?? ""));
     expect(urlLine).toBeGreaterThan(-1);

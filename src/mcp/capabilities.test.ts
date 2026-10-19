@@ -127,8 +127,10 @@ describe("the model is never told about a tool that is not there", () => {
     harness = await createHarness();
     const instructions = harness.client.getInstructions();
     expect(instructions).toMatch(/viewer_url/);
-    expect(instructions).toMatch(/first line of your reply/);
+    expect(instructions).toMatch(/Right after every session_create/);
+    expect(instructions).toMatch(/before your next tool call/);
     expect(instructions).toMatch(/plain text on its own line/);
+    expect(instructions).toMatch(/in auto mode too/);
   });
 
   it("tells the model how to run the manual-mode journey", async () => {
