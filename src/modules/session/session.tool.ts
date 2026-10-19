@@ -42,16 +42,19 @@ export function renderSession(session: Session, viewerUrl?: string): string {
      * stated, it reads as something owed rather than something known.
      *
      * The wording has to hold at both call sites, because `session_get` shares
-     * this function: "before your turn ends" is true mid-run, where "before you
-     * start a flow" would already be stale. Restating it on `session_get` is
-     * deliberate — that is the tool called when the link was lost.
+     * this function: "the first line of your reply" is true mid-run, where
+     * "before you start a flow" would already be stale. Restating it on
+     * `session_get` is deliberate — that is the tool called when the link was
+     * lost. "Plain text" because a markdown link hides the URL a human wants to
+     * copy.
      */
     ...(viewerUrl !== undefined
       ? [
           "",
-          "→ HAND THIS TO THE PERSON YOU ARE TESTING FOR — state the URL in full in",
-          "  your reply, before your turn ends. It is the only view of the run they",
-          "  have that is not you describing it; read-only, so you keep driving.",
+          "→ HAND THIS TO THE PERSON YOU ARE TESTING FOR — make it the first line of",
+          "  your reply, the full URL as plain text on its own line, so they can copy",
+          "  it. It is the only view of the run they have that is not you describing",
+          "  it; read-only, so you keep driving.",
           `  ${viewerUrl}`,
         ]
       : []),
@@ -84,7 +87,9 @@ export function createSessionTools(
       title: "Create mock session",
       description:
         "Open a session against a network participant under test and list every " +
-        "flow available for its build. Supply the participant's subscriber URL " +
+        "flow available for its build. Before calling, ask the person you are " +
+        "testing for whether they want manual or auto mode, and pass it as " +
+        "interaction_mode. Supply the participant's subscriber URL " +
         "and whether it is a BAP (buyer app) or BPP (seller app); this server " +
         "automatically takes the opposite role and answers as that counterparty. " +
         "Domain, version and use-case must be a published combination — call " +
@@ -93,9 +98,11 @@ export function createSessionTools(
         "The returned callback_url is what the participant must send its " +
         "callbacks to; give it to them before starting a flow. " +
         "The returned viewer_url is a live read-only page of this session's " +
-        "flows, payloads and events: state it in full in your reply to the " +
-        "person you are testing for, before your turn ends — a human who never " +
-        "receives it has no view of the run except your description of it.",
+        "flows, payloads and events: make it the first line of your reply to " +
+        "the person you are testing for, as a plain URL on its own line — a " +
+        "human who never receives it has no view of the run except your " +
+        "description of it. Then list the flows and ask whether to run one or " +
+        "explain one first.",
       inputSchema: CreateSessionInput,
       outputSchema: CreateSessionOutput,
       annotations: {
@@ -116,6 +123,9 @@ export function createSessionTools(
           "",
           `${String(total)} flow(s) available:`,
           ...flows.map(renderFlowSummary),
+          "",
+          "→ List these flows to the person, each with its description, and ask",
+          "  whether to run one or explain one first.",
         ].join("\n");
       },
       handler: (input) => service.createSession(input),

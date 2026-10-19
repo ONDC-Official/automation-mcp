@@ -30,6 +30,41 @@ const SERVER_NAME = "ondc-mcp";
 const SERVER_VERSION = "0.1.0";
 
 /**
+ * How to guide a human through a manual session.
+ *
+ * In the preamble rather than only in `mock_buyer` / `mock_seller`, because a
+ * prompt is opt-in in every client and a session that never selected one
+ * would otherwise run manual mode exactly like auto mode. The preamble is the
+ * same for every session, so the paragraph names its own condition.
+ */
+function manualModeLines(
+  features: ReturnType<typeof resolveFeatures>,
+): string[] {
+  const lines = [
+    "In a manual session the person is the participant under test: they send",
+    "its requests and fill its forms, and you guide them. Once they pick a flow,",
+    "list its steps — each one, who sends it (them or this mock) and what it does.",
+    "Ask whether they will send their steps from their app or with terminal",
+    "commands you give them. On each of their steps, tell them which request to",
+    "send and the exact URL. Before each of this mock's steps, ask whether to",
+    "send it now, and call flow_proceed only on yes; leave auto_advance off. If",
+    "their last request was NACKed, explain the findings and do not offer the",
+    "reply.",
+  ];
+  if (features.enabled("validate") && features.enabled("protocol")) {
+    lines.push(
+      "For a terminal command, build the request yourself:",
+      "protocol_describe_action for its fields, record_get_payload with a jsonpath",
+      "for the values it must echo from earlier messages, then payload_validate",
+      "until it passes. Ask them for any values the step declares as inputs. Only",
+      "then give them a curl to the step's URL with Content-Type:",
+      "application/json — never an unchecked body.",
+    );
+  }
+  return lines;
+}
+
+/**
  * The model-facing preamble.
  *
  * Built from the enabled module set rather than written as one constant,
@@ -45,6 +80,11 @@ function instructionsFor(container: Container): string {
     "(buyer app) you act as the BPP (seller app), and vice versa. The inversion is",
     "derived for you — never ask which role to play.",
     "",
+    "Before session_create, ask the person you are testing for which mode they",
+    "want: manual (they send their app's requests and fill its forms themselves,",
+    "and you guide each step) or auto (you drive the whole run). Pass their answer",
+    "as interaction_mode; do not pick one for them.",
+    "",
     "Start with session_create, giving the participant's subscriber URL, whether it",
     "is a BAP or a BPP, and the domain, version and use-case under test. Call",
     "catalog_list_builds first if any of those values are uncertain; use-case names",
@@ -54,19 +94,27 @@ function instructionsFor(container: Container): string {
     lines.push(
       "",
       "session_create also returns viewer_url: a live, read-only page of every flow,",
-      "payload and event in the session. State that URL in full in your reply to the",
-      "person you are testing for, before your turn ends — do not wait to be asked,",
-      "and do not summarise it away. A human who never receives it has no view of the",
-      "run except your description of it.",
+      "payload and event in the session. Make it the first line of your reply to the",
+      "person you are testing for: the full URL as plain text on its own line, not a",
+      "markdown link, so they can copy it. Do not wait to be asked, and do not",
+      "summarise it away. A human who never receives it has no view of the run",
+      "except your description of it.",
     );
   }
   if (features.enabled("catalog")) {
     lines.push(
       "",
-      "Then catalog_describe_flow to see one flow's sequence. Every step is tagged",
+      "Then list the flows to the person — each one's name and description — and ask",
+      "whether to run one or explain one first. To explain a flow, describe its",
+      "scenario and steps in plain words.",
+      "",
+      "catalog_describe_flow shows one flow's sequence. Every step is tagged",
       "with an actor: 'mock' means you must produce it, 'np' means you wait for the",
       "participant to send it.",
     );
+  }
+  if (features.enabled("flow")) {
+    lines.push("", ...manualModeLines(features));
   }
   if (features.enabled("protocol")) {
     lines.push(

@@ -102,7 +102,8 @@ describe("session tools over MCP", () => {
      * which is the whole bug this shape exists to fix.
      */
     expect(text).toContain("HAND THIS TO THE PERSON YOU ARE TESTING FOR");
-    expect(text).toContain("before your turn ends");
+    expect(text).toContain("first line of");
+    expect(text).toContain("plain text on its own line");
 
     const urlLine = lines.findIndex((line) => line.includes(viewer_url ?? ""));
     expect(urlLine).toBeGreaterThan(-1);
@@ -110,6 +111,22 @@ describe("session tools over MCP", () => {
     expect(lines.slice(0, urlLine).join("\n")).toContain(
       "HAND THIS TO THE PERSON",
     );
+  });
+
+  it("ends by telling the model to list the flows and ask run or explain", async () => {
+    const result = await harness.client.callTool({
+      name: "session_create",
+      arguments: createArgs(),
+    });
+
+    const text = (result.content as { text: string }[])[0]?.text ?? "";
+    expect(text.trimEnd()).toMatch(/run one or explain one first\.$/);
+  });
+
+  it("asks for the mode before a session is created", async () => {
+    const { tools } = await harness.client.listTools();
+    const create = tools.find((tool) => tool.name === "session_create");
+    expect(create?.description).toContain("manual or auto mode");
   });
 
   it("restates the viewer link on session_get, for a human who lost it", async () => {

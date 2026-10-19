@@ -267,6 +267,79 @@ describe("the flow loop", () => {
   });
 });
 
+/**
+ * A manual session guides a human, so the outcomes the model reads carry one
+ * extra sentence telling it what to say. Auto sessions must read as before.
+ */
+describe("outcome messages in a manual session", () => {
+  async function manualSession(): Promise<Session> {
+    const created = await container.services.session.createSession({
+      subscriber_url: NP,
+      np_type: "BPP",
+      domain: RUNNABLE_BUILD.domain,
+      version: RUNNABLE_BUILD.version,
+      usecase: RUNNABLE_BUILD.usecase,
+      interaction_mode: "manual",
+    });
+    return created.session;
+  }
+
+  it("asks the user before this mock sends its step", async () => {
+    const manual = await manualSession();
+    const started = await container.services.flow.start({
+      sessionId: manual.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+
+    expect(started.outcome.outcome).toBe("READY");
+    expect(started.outcome.message).toContain(
+      "ask the user whether to send search now",
+    );
+  });
+
+  it("tells the user where to send their request when it is their turn", async () => {
+    const manual = await manualSession();
+    acceptsAction(agent, NP, "search");
+    await container.services.flow.start({
+      sessionId: manual.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+
+    const sent = await container.services.flow.proceed({
+      sessionId: manual.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    expect(sent.outcome).toBe("SENT");
+
+    const status = await container.services.flow.status(manual.session_id, {
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    expect(status.next.outcome).toBe("WAITING");
+    expect(status.next.message).toContain(
+      `send on_search to ${manual.callback_url}/on_search`,
+    );
+  });
+
+  it("leaves auto-session messages unchanged", async () => {
+    acceptsAction(agent, NP, "search");
+    const started = await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    expect(started.outcome.outcome).toBe("READY");
+    expect(started.outcome.message).not.toContain("user");
+
+    await sendFirstAction();
+    const status = await container.services.flow.status(sessionId, {
+      transactionId,
+    });
+    expect(status.next.outcome).toBe("WAITING");
+    expect(status.next.message).toBe(
+      "Waiting for the participant to send on_search. Call flow_await.",
+    );
+  });
+});
+
 describe("a callback that overtakes its own ACK", () => {
   /**
    * The participant answers our `select` *and* fires `on_select` from the same
@@ -1580,11 +1653,9 @@ describe("payload_overrides", () => {
   function rejectUnlessPatched(): void {
     validation.setResponder((request) => {
       const name = (
-        (
-          (request.payload as { message?: { intent?: { descriptor?: unknown } } })
-            .message?.intent?.descriptor as { name?: unknown } | undefined
-        )?.name
-      );
+        (request.payload as { message?: { intent?: { descriptor?: unknown } } })
+          .message?.intent?.descriptor as { name?: unknown } | undefined
+      )?.name;
       return name === "patched"
         ? { status: "valid" }
         : invalidFrom(
@@ -1603,7 +1674,10 @@ describe("payload_overrides", () => {
      */
     const search = acceptsAction(agent, NP, "search");
     rejectUnlessPatched();
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
 
     const refused = await container.services.flow.proceed({
       sessionId,
@@ -1616,9 +1690,9 @@ describe("payload_overrides", () => {
     expect(search.seen).toHaveLength(0);
     // The block names the way out. Before this it said only "inspect it with
     // dry_run", which is where both runs stopped.
-    expect(
-      (refused.details as { recovery?: string }).recovery,
-    ).toContain("$.message.intent.descriptor.name");
+    expect((refused.details as { recovery?: string }).recovery).toContain(
+      "$.message.intent.descriptor.name",
+    );
 
     const sent = await container.services.flow.proceed({
       sessionId,
@@ -1639,7 +1713,10 @@ describe("payload_overrides", () => {
     // would write our defect into the participant's compliance report.
     const search = acceptsAction(agent, NP, "search");
     rejectUnlessPatched();
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
 
     const outcome = await container.services.flow.proceed({
       sessionId,
@@ -1659,7 +1736,10 @@ describe("payload_overrides", () => {
     // payload this flow's config did not produce is claiming more than it knows.
     acceptsAction(agent, NP, "search");
     rejectUnlessPatched();
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
 
     const sent = await container.services.flow.proceed({
       sessionId,
@@ -1674,7 +1754,9 @@ describe("payload_overrides", () => {
     const entry = record.apiList.find(
       (item) => item.entryType === "API" && item.direction === "outbound",
     );
-    expect(entry).toMatchObject({ overrides: ["$.message.intent.descriptor.name"] });
+    expect(entry).toMatchObject({
+      overrides: ["$.message.intent.descriptor.name"],
+    });
 
     // And on the journal, which is what the incident corpus reads — it is the
     // difference between RECOVERED and RECOVERED_WITH_OVERRIDE.
@@ -1730,7 +1812,10 @@ describe("payload_overrides", () => {
 
   it("refuses the transaction id and leaves the payload alone", async () => {
     const search = acceptsAction(agent, NP, "search");
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
 
     const outcome = await container.services.flow.proceed({
       sessionId,
@@ -1753,7 +1838,10 @@ describe("payload_overrides", () => {
     // Silently dropping them is exactly the failure this feature answers: a
     // caller states an intent and nothing honours it or says so.
     acceptsAction(agent, NP, "search");
-    await container.services.flow.start({ sessionId, flowId: RUNNABLE_FLOW_ID });
+    await container.services.flow.start({
+      sessionId,
+      flowId: RUNNABLE_FLOW_ID,
+    });
     await sendFirstAction();
 
     const outcome = await container.services.flow.proceed({

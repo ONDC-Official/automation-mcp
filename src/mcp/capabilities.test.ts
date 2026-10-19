@@ -127,7 +127,25 @@ describe("the model is never told about a tool that is not there", () => {
     harness = await createHarness();
     const instructions = harness.client.getInstructions();
     expect(instructions).toMatch(/viewer_url/);
-    expect(instructions).toMatch(/before your turn ends/);
+    expect(instructions).toMatch(/first line of your reply/);
+    expect(instructions).toMatch(/plain text on its own line/);
+  });
+
+  it("tells the model how to run the manual-mode journey", async () => {
+    harness = await createHarness();
+    const instructions = harness.client.getInstructions();
+    expect(instructions).toMatch(/which mode they want/);
+    expect(instructions).toMatch(/run one or explain one first/);
+    expect(instructions).toMatch(/In a manual session/);
+    expect(instructions).toMatch(/call flow_proceed only on yes/);
+    expect(instructions).toMatch(/payload_validate until it passes/);
+  });
+
+  it("omits the terminal-command rule when its tools are off", async () => {
+    harness = await createHarness({ env: { MODULES_DISABLED: "validate" } });
+    const instructions = harness.client.getInstructions();
+    expect(instructions).toMatch(/In a manual session/);
+    expect(instructions).not.toMatch(/payload_validate/);
   });
 
   it("omits the viewer sentence when the viewer is off", async () => {

@@ -319,6 +319,35 @@ describe("manual mode", () => {
       }),
     ).rejects.toThrow(/manual mode/);
   });
+
+  it("tells the model to hand the form link to the user and ask for the id", async () => {
+    await reachFormStep();
+
+    const status = await container.services.flow.status(sessionId, {
+      transactionId,
+    });
+
+    expect(status.next.outcome).toBe("FORM_PENDING");
+    expect(status.next.message).toContain("give it to the user");
+    expect(status.next.message).toContain("ask them for the submission id");
+  });
+});
+
+describe("the form message in auto mode", () => {
+  beforeEach(async () => {
+    await boot("llm_auto");
+  });
+
+  it("carries no user-facing line", async () => {
+    await reachFormStep();
+
+    const status = await container.services.flow.status(sessionId, {
+      transactionId,
+    });
+
+    expect(status.next.outcome).toBe("FORM_PENDING");
+    expect(status.next.message).not.toContain("user");
+  });
 });
 
 describe("a form this mock hosts", () => {

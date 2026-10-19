@@ -1,10 +1,7 @@
 import { describeInputs } from "@/modules/catalog/catalog.inputs.js";
 import type { MappedStep } from "@/modules/flow/engine/engine-types.js";
 import type { FlowRuntime } from "@/modules/flow/flow.types.js";
-import type {
-  InputProblem,
-  StepOutcome,
-} from "@/modules/flow/flow.schema.js";
+import type { InputProblem, StepOutcome } from "@/modules/flow/flow.schema.js";
 import { specFor } from "@/modules/flow/flow.step-config.js";
 
 /**
@@ -83,10 +80,26 @@ export function inputRequired(
   };
 }
 
-export function listening(step: MappedStep): StepOutcome {
+/**
+ * True when a human is the participant and the model is guiding them.
+ *
+ * Every manual-only sentence in an outcome hangs off this, so auto sessions
+ * read exactly as they did before.
+ */
+export function isManual(runtime: FlowRuntime): boolean {
+  return runtime.session.interaction_mode === "manual";
+}
+
+export function listening(runtime: FlowRuntime, step: MappedStep): StepOutcome {
+  // The URL is spelled out because the person sending the request is not the
+  // model: without it they have to work out where it goes from the callback
+  // base and the action, which is exactly what they asked to be guided through.
+  const manual = isManual(runtime)
+    ? ` Tell the user it is their turn: send ${step.actionType} to ${runtime.session.callback_url}/${step.actionType}, from their app or with the command you build for them.`
+    : "";
   return {
     outcome: "WAITING",
-    message: `Waiting for the participant to send ${step.actionType}. Call flow_await.`,
+    message: `Waiting for the participant to send ${step.actionType}. Call flow_await.${manual}`,
     step_key: step.actionId,
     action: step.actionType,
     expected_action: step.actionType,
