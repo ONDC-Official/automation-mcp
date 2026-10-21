@@ -446,6 +446,14 @@ export const StartFlowOutput = z.object({
     .int()
     .optional()
     .describe(`${RUN_SEQ_NOTE} Absent while the run has no transaction yet.`),
+  viewer_url: z
+    .string()
+    .optional()
+    .describe(
+      "This session's live viewer link, repeated from session_create. If you " +
+        "have not given it to the person yet, write it to them now as plain " +
+        "text on its own line.",
+    ),
   ...EventsField,
 });
 export type StartFlowOutput = z.infer<typeof StartFlowOutput>;

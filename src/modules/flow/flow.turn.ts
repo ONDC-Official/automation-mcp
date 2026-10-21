@@ -3,6 +3,7 @@ import { lockId } from "@/modules/flow/flow.load.js";
 import {
   abandonedOutcome,
   blocked,
+  isManual,
   listening,
   stamp,
 } from "@/modules/flow/flow.outcomes.js";
@@ -75,7 +76,7 @@ async function describe(
       return stamp(runtime, target.outcome);
     case "listen":
       if (options.arm) await armExpectation(deps, runtime, target.step);
-      return stamp(runtime, listening(target.step));
+      return stamp(runtime, listening(runtime, target.step));
     case "form":
       return stamp(
         runtime,
@@ -84,7 +85,11 @@ async function describe(
     case "dispatch":
       return stamp(runtime, {
         outcome: "READY",
-        message: `Step "${target.step.actionId}" (${target.step.actionType}) is this mock's to send. Call flow_proceed.`,
+        message:
+          `Step "${target.step.actionId}" (${target.step.actionType}) is this mock's to send. Call flow_proceed.` +
+          (isManual(runtime)
+            ? ` First ask the user whether to send ${target.step.actionType} now, and call flow_proceed only if they say yes.`
+            : ""),
         step_key: target.step.actionId,
         action: target.step.actionType,
       });
@@ -156,11 +161,22 @@ export async function formOutcome(
   );
   const resolved = businessData[step.actionId];
 
+  // In manual mode the person is the one who fills the form either way, so the
+  // model's job is to hand the link over — as plain text, because a markdown
+  // link hides the URL they need to open.
+  const manual = !isManual(runtime)
+    ? ""
+    : hosting
+      ? " Give the user the form URL as plain text on its own line, and wait for them to submit it."
+      : " Call form_fetch for the form URL, give it to the user as plain text on its own line, then ask them for the submission id and pass it to form_submit.";
+
   return {
     outcome: "FORM_PENDING",
-    message: hosting
-      ? `Form "${step.actionId}" is served by this mock; the participant has to submit it. Its URL is in the payload already sent.`
-      : `Form "${step.actionId}" is hosted by the participant. Call form_fetch to read it, then form_submit.`,
+    message:
+      (hosting
+        ? `Form "${step.actionId}" is served by this mock; the participant has to submit it. Its URL is in the payload already sent.`
+        : `Form "${step.actionId}" is hosted by the participant. Call form_fetch to read it, then form_submit.`) +
+      manual,
     step_key: step.actionId,
     action: step.actionType,
     form_role: hosting ? "host" : "fill",

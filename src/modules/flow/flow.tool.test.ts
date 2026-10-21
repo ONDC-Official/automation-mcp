@@ -106,6 +106,21 @@ describe("flow_start", () => {
     });
   });
 
+  it("repeats the viewer link, in case it was not handed over yet", async () => {
+    const result = await harness.client.callTool({
+      name: "flow_start",
+      arguments: { session_id: sessionId, flow_id: RUNNABLE_FLOW_ID },
+    });
+    const { viewer_url } = result.structuredContent as { viewer_url?: string };
+    expect(viewer_url).toBeDefined();
+
+    const text = (result.content as { text: string }[])[0]?.text ?? "";
+    expect(text).toContain(
+      "If you have not given the person this session's viewer link",
+    );
+    expect(text.split("\n").map((line) => line.trim())).toContain(viewer_url);
+  });
+
   it("refuses a flow with no published mock config", async () => {
     const result = await harness.client.callTool({
       name: "flow_start",
@@ -611,9 +626,7 @@ describe("flow_get_status", () => {
 });
 
 describe("flow_restart", () => {
-  async function restart(
-    extra: Record<string, unknown> = {},
-  ): Promise<{
+  async function restart(extra: Record<string, unknown> = {}): Promise<{
     output: Record<string, unknown>;
     text: string;
     isError: boolean;
@@ -773,8 +786,8 @@ describe("the seq a loop answer hands back", () => {
       after_seq_adjusted: 1,
       seq: 1,
     });
-    expect(
-      (result.content as { text: string }[])[0]?.text,
-    ).toContain("after_seq was ahead of this run");
+    expect((result.content as { text: string }[])[0]?.text).toContain(
+      "after_seq was ahead of this run",
+    );
   });
 });

@@ -122,7 +122,8 @@ export const CreateSessionInput = z.object({
     ),
   interaction_mode: InteractionMode.optional().describe(
     "'llm_auto' (default) — you supply every input and fill forms yourself. " +
-      "'manual' — a human supplies them; forms come back as links to hand over.",
+      "'manual' — a human supplies them; forms come back as links to hand over. " +
+      "Ask the person which they want before calling; do not choose for them.",
   ),
   auto_advance: z
     .boolean()

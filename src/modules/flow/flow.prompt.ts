@@ -42,14 +42,18 @@ const LOOP = `
    actually reach it. A loopback URL only works for a participant on this
    machine.
 2. \`session_create\` — the participant's subscriber URL and whether it is a BAP
-   or a BPP. This server takes the opposite role automatically. **State the
-   \`viewer_url\` it returns, in full, in your reply to the person you are testing
-   for, before your turn ends** — do not wait to be asked. It is a live page
-   showing every flow, every payload and every event in this session, and it is
-   the only view of the run they have that is not you describing it. You keep
-   driving; they get to watch.
-3. \`catalog_list_flows\` — pick a flow. \`catalog_describe_flow\` shows who owns
-   each step.
+   or a BPP. This server takes the opposite role automatically. **Ask the person
+   first whether they want manual or auto mode**, and pass it as
+   \`interaction_mode\`. **Right after every \`session_create\`, before your next
+   tool call, write the \`viewer_url\` it returns to the person as a plain URL on
+   its own line** — in auto mode too, and for every new session, since each has
+   its own link. Do not wait to be asked. It is
+   a live page showing every flow, every payload and every event in this
+   session, and it is the only view of the run they have that is not you
+   describing it. You keep driving; they get to watch.
+3. List the flows to the person, each with its description, and ask whether to
+   run one or explain one first. \`catalog_describe_flow\` shows who owns each
+   step.
 4. \`flow_start\` — opens the run. Give the participant the \`callback_url\` it
    returns before going further: that is the URI to register as this mock's
    subscriber URL, and the participant appends \`/{action}\` to it the same way
@@ -183,6 +187,30 @@ A step marked manual only fires when you name it: pass
 steps cannot go out as a side effect of a generic "proceed".
 `;
 
+const MANUAL = `
+## Manual sessions
+
+In a \`manual\` session the person is the participant under test: they send its
+requests and fill its forms, and you guide them.
+
+1. Once they pick a flow, list its steps — each one, who sends it (them or this
+   mock) and what it does.
+2. Ask whether they will send their steps from their app or with terminal
+   commands you give them.
+3. On each of their steps, tell them which request to send and the exact URL.
+   For a terminal command, build the request yourself:
+   \`protocol_describe_action\` for its fields, \`record_get_payload\` with a
+   \`jsonpath\` for the values it must echo from earlier messages, then
+   \`payload_validate\` until it passes. Ask them for any values the step
+   declares as inputs. Only then give them a \`curl\` with
+   \`Content-Type: application/json\` — never an unchecked body.
+4. Before each of this mock's steps, ask whether to send it now, and call
+   \`flow_proceed\` only on yes. Leave \`auto_advance\` off.
+5. If their last request was NACKed, explain the findings and do not offer the
+   reply.
+6. For a form, give them the link as a plain URL and wait for them to submit it.
+`;
+
 function persona(role: "buyer" | "seller"): string {
   const [playing, against] =
     role === "buyer"
@@ -203,7 +231,7 @@ without being asked. Your job is to supply the values the flow asks for, fill
 the forms it puts in front of you, and judge what comes back.
 
 ${ownership} \`flow_get_status\` marks every step \`us\` or \`np\` if you are unsure.
-${LOOP}${INPUTS}
+${LOOP}${INPUTS}${MANUAL}
 ## When the flow completes
 
 Say what happened: which steps completed, which were NACKed and why, and

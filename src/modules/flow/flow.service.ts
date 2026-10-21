@@ -20,21 +20,14 @@ import { restart } from "@/modules/flow/flow.restart.js";
 import { start } from "@/modules/flow/flow.start.js";
 import { flowView, listRuns, status } from "@/modules/flow/flow.view.js";
 import { dispatch } from "@/modules/flow/flow.dispatch.js";
-import {
-  adoptTransaction,
-  callbackUrl,
-} from "@/modules/flow/flow.identity.js";
+import { adoptTransaction, callbackUrl } from "@/modules/flow/flow.identity.js";
 import {
   armExpectation,
   describeNext,
   formOutcome,
 } from "@/modules/flow/flow.turn.js";
 import { selectTarget } from "@/modules/flow/flow.target.js";
-import {
-  load,
-  lockId,
-  runSeq,
-} from "@/modules/flow/flow.load.js";
+import { load, lockId, runSeq } from "@/modules/flow/flow.load.js";
 import {
   type FlowDeps,
   type FlowLoop,
@@ -71,7 +64,6 @@ import type { Session } from "@/modules/session/session.schema.js";
  * whole contract, and it is why `form_submit` needs no privileged path: it
  * calls `proceed` with `{submission_id}` like any other input.
  */
-
 
 /*
  * The loop's shapes live in `flow.types.ts` so the loop's own files can share
@@ -372,7 +364,7 @@ export class FlowService {
 
       case "listen":
         await armExpectation(this.#deps, runtime, target.step);
-        return stamp(runtime, listening(target.step));
+        return stamp(runtime, listening(runtime, target.step));
 
       case "form":
         return stamp(
@@ -435,7 +427,6 @@ export class FlowService {
   }
 
   /* ------------------------------ internals ------------------------------- */
-
 }
 
 /* -------------------------------------------------------------------------- */
