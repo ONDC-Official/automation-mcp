@@ -11,11 +11,7 @@ import {
   suggestOverrides,
 } from "@/modules/flow/flow.overrides.js";
 import type { ProceedArgs } from "@/modules/flow/flow.types.js";
-import {
-  blocked,
-  inputRequired,
-  stamp,
-} from "@/modules/flow/flow.outcomes.js";
+import { blocked, inputRequired, stamp } from "@/modules/flow/flow.outcomes.js";
 import { lockId } from "@/modules/flow/flow.load.js";
 import type { StepOutcome } from "@/modules/flow/flow.schema.js";
 import {
@@ -32,6 +28,7 @@ import {
   type ValidationVerdict,
 } from "@/modules/validate/validate.schema.js";
 import type { SendResult } from "@/modules/transport/sender.service.js";
+import { unauthorizedNote } from "@/modules/signing/signing.service.js";
 
 /**
  * The outbound path: requirements → generate → patch → validate → bind →
@@ -103,12 +100,7 @@ export async function dispatch(
 
   const mark = async (key: string): Promise<void> => {
     marked.add(key);
-    await deps.records.setFlowStatus(
-      key,
-      subscriberUrl,
-      "WORKING",
-      statusKey,
-    );
+    await deps.records.setFlowStatus(key, subscriberUrl, "WORKING", statusKey);
   };
 
   await mark(lockId(runtime));
@@ -122,10 +114,7 @@ export async function dispatch(
     // the field the default payload already had right. Nothing downstream
     // ties the L1 failure that follows back to the input, so this is the last
     // point at which the real cause is still visible.
-    const inputCheck = checkInputs(
-      specFor(step, runtime.config),
-      args.inputs,
-    );
+    const inputCheck = checkInputs(specFor(step, runtime.config), args.inputs);
     if (!inputCheck.ok) {
       return inputRequired(
         runtime,
@@ -229,8 +218,7 @@ export async function dispatch(
         "outbound payload patched by payload_overrides; this step is not a clean step",
       );
     }
-    const patched =
-      overridden.length > 0 ? { overrides: [...overridden] } : {};
+    const patched = overridden.length > 0 ? { overrides: [...overridden] } : {};
 
     if (bound) {
       // A run that already has an id keeps it for the rest of the flow.
@@ -409,7 +397,8 @@ export async function dispatch(
       saveDataFor(runtime.config, step.actionId),
     );
 
-    const sent = await dispatchSend(deps, 
+    const sent = await dispatchSend(
+      deps,
       { transactionId: txnId, subscriberUrl, seq, payloadId },
       step.actionType,
       payload,
@@ -428,6 +417,7 @@ export async function dispatch(
       summary:
         `${args.chained === true ? "Auto-sent" : "Sent"} ${step.actionType} — ` +
         `the participant answered ${sent.ack}.` +
+        unauthorizedNote(sent.httpStatus, deps.sender.signs) +
         (overridden.length > 0
           ? ` Patched first: ${overridden.join(", ")}.`
           : "") +
@@ -446,6 +436,7 @@ export async function dispatch(
         (sent.ack === "ACK"
           ? `Sent ${step.actionType}; the participant ACKed it. Call flow_await for the callback.`
           : `Sent ${step.actionType}; the participant answered ${sent.ack}. Read ack_body — this is a finding, not a transport failure.`) +
+        unauthorizedNote(sent.httpStatus, deps.sender.signs) +
         (overridden.length > 0
           ? ` Note: ${String(overridden.length)} path(s) were patched by ` +
             "payload_overrides, so this step was not generated purely by the " +
@@ -502,11 +493,7 @@ async function dispatchSend(
   payload: unknown,
 ): Promise<SendResult> {
   try {
-    const sent = await deps.sender.send(
-      entry.subscriberUrl,
-      action,
-      payload,
-    );
+    const sent = await deps.sender.send(entry.subscriberUrl, action, payload);
     await deps.records.settleApiEntry({
       ...entry,
       ackBody: sent.body,

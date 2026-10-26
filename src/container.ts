@@ -65,6 +65,7 @@ import {
 } from "@/modules/signing/signing.gateway.js";
 import { KeyProvider } from "@/modules/signing/signing.keys.js";
 import { SigningService } from "@/modules/signing/signing.service.js";
+import { SdkRequestSigner } from "@/modules/signing/signing.signer.js";
 
 /**
  * Boot-once singletons.
@@ -526,13 +527,20 @@ export async function createContainer(
           logger,
         })
       : undefined);
+  // With an identity, it is who we sign as — so it must also be the bap_id or
+  // bpp_id our payloads carry, or the participant sees a keyId naming a
+  // subscriber the payload does not.
+  const ourSubscriberId = identity?.subscriberId ?? config.MOCK_SUBSCRIBER_ID;
+  const signer =
+    options.signer ??
+    (identity !== undefined ? new SdkRequestSigner(identity) : undefined);
   const signing = new SigningService({
     keys: new KeyProvider({
       registry: registryGateway,
       cache: catalogCache,
       ttlMs: config.SIGNING_KEY_CACHE_TTL_MS,
     }),
-    realm: config.ONDC_SUBSCRIBER_ID ?? config.MOCK_SUBSCRIBER_ID,
+    realm: ourSubscriberId,
     logger,
   });
   if (!signing.canVerify) {
@@ -732,7 +740,7 @@ export async function createContainer(
     ...(options.senderDispatcher
       ? { dispatcher: options.senderDispatcher }
       : {}),
-    ...(options.signer ? { signer: options.signer } : {}),
+    ...(signer !== undefined ? { signer } : {}),
   });
 
   const flow = new FlowService({
@@ -746,7 +754,7 @@ export async function createContainer(
     validate,
     logger,
     receiverPublicUrl,
-    mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    mockSubscriberId: ourSubscriberId,
     feedback,
     metrics,
     mirror,
@@ -774,7 +782,7 @@ export async function createContainer(
     logger,
     receiverPublicUrl,
     catalog,
-    mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    mockSubscriberId: ourSubscriberId,
     // Completed orders are sent to this instance's own UI base, but only when it
     // is set to something other than the public default: an instance that never
     // configured it must not post its participants' data to that host.

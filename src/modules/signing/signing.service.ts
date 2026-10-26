@@ -42,6 +42,25 @@ export const SIGNING_TOPICS = [
   "27-digest-generation",
 ] as const;
 
+/** The same, for a participant whose *verification* refused our call. */
+export const VERIFICATION_TOPIC = "01-signature-verification";
+
+/**
+ * What an HTTP 401 to one of our calls means, for the model. Empty for any
+ * other status.
+ *
+ * Signed, it is the participant's verification that refused a valid signature
+ * — or our identity is not in the registry they query. Unsigned, it is ours:
+ * they want a signature and this server has no identity to sign with.
+ */
+export function unauthorizedNote(httpStatus: number, signed: boolean): string {
+  if (httpStatus !== 401) return "";
+  return signed
+    ? ` HTTP 401: the participant refused our signature. Our signature follows ONDC's guide (${SIGNATURE_GUIDE_URL}); ` +
+        `to help them check their verification, read ${VERIFICATION_TOPIC} with protocol_search_knowledge.`
+    : " HTTP 401: the participant requires a signature, and this server does not sign — it has no ONDC identity configured.";
+}
+
 export interface SigningServiceOptions {
   keys: KeyProvider;
   /** Our subscriber id, named in the `WWW-Authenticate` realm. */
