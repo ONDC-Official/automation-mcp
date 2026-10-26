@@ -7,7 +7,11 @@ import type {
   RegistryGateway,
 } from "@/modules/signing/signing.gateway.js";
 import { KeyProvider } from "@/modules/signing/signing.keys.js";
-import { SigningService } from "@/modules/signing/signing.service.js";
+import {
+  SIGNING_TOPICS,
+  SigningService,
+} from "@/modules/signing/signing.service.js";
+import { hasTopic } from "@/modules/protocol/protocol.knowledge.js";
 import { keyPair } from "@/test/signing-keys.js";
 
 const BODY = '{"context":{"action":"on_search"}}';
@@ -87,5 +91,14 @@ describe("SigningService — a rotated key", () => {
       "rejected",
     );
     expect(gateway.calls).toBe(1);
+  });
+});
+
+describe("SIGNING_TOPICS", () => {
+  it("names documents that exist in the knowledge corpus", () => {
+    // A KB re-sync that renames one fails here, not in front of a participant.
+    for (const topic of SIGNING_TOPICS) {
+      expect(hasTopic(topic), topic).toBe(true);
+    }
   });
 });

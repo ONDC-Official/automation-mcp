@@ -256,6 +256,9 @@ describe("a participant's callback on a known transaction", () => {
     expect(refusal?.summary).toContain(
       "https://dev-workbench.ondc.tech/developer-guide/auth-tools",
     );
+    expect(refusal?.summary).toContain(
+      "read 28-authorization-header-creation and 27-digest-generation with protocol_search_knowledge",
+    );
     expect(refusal?.payload_id).toBeDefined();
 
     const retry = await post(session, "on_search", body, await sign(body));

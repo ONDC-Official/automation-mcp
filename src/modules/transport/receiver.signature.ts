@@ -6,6 +6,7 @@ import {
   SIGNATURE_ERROR_CODE,
   SIGNATURE_ERROR_MESSAGE,
   SIGNATURE_GUIDE_URL,
+  SIGNING_TOPICS,
   type InboundVerdict,
 } from "@/modules/signing/signing.service.js";
 import { settingsOf, type Session } from "@/modules/session/session.schema.js";
@@ -111,6 +112,7 @@ export async function refuseSignature(
   const summary =
     `Refused ${action} with 401: its Authorization header is missing or does not verify. ` +
     `The participant must sign the exact request bytes — guide: ${SIGNATURE_GUIDE_URL}. ` +
+    `To help them fix it, read ${SIGNING_TOPICS.join(" and ")} with protocol_search_knowledge. ` +
     `Body kept out of line (${payloadId}); the flow did not advance.`;
 
   if (target.recorded) {

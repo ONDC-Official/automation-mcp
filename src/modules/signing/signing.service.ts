@@ -32,6 +32,16 @@ export const SIGNATURE_ERROR_CODE = "10001";
 
 export const SIGNATURE_ERROR_MESSAGE = `Invalid signature. See ${SIGNATURE_GUIDE_URL} for how to sign a request.`;
 
+/**
+ * Where the model reads how signing works. The guide page is rendered in the
+ * browser, so a model fetching it gets an empty shell; these are ONDC's own KB
+ * documents, already in the knowledge corpus.
+ */
+export const SIGNING_TOPICS = [
+  "28-authorization-header-creation",
+  "27-digest-generation",
+] as const;
+
 export interface SigningServiceOptions {
   keys: KeyProvider;
   /** Our subscriber id, named in the `WWW-Authenticate` realm. */
