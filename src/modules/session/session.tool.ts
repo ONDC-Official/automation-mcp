@@ -5,6 +5,9 @@ import {
   CreateSessionOutput,
   GetSessionInput,
   GetSessionOutput,
+  settingsOf,
+  UpdateSessionSettingsInput,
+  UpdateSessionSettingsOutput,
   type Session,
 } from "@/modules/session/session.schema.js";
 import type { SessionService } from "@/modules/session/session.service.js";
@@ -30,6 +33,7 @@ export function renderSession(session: Session, viewerUrl?: string): string {
     `  callback:   ${session.callback_url}`,
     `  inputs:     ${session.interaction_mode === "manual" ? "manual — ask the human" : "llm_auto — you supply them"}`,
     `  advance:    ${session.auto_advance ? "auto" : "step by step"}`,
+    `  signatures: ${settingsOf(session).header_validation ? "checked" : "not checked"} (header_validation)`,
     `  expires:    ${session.expires_at}`,
     /*
      * The viewer link is a directive, not a field.
@@ -165,6 +169,39 @@ export function createSessionTools(
           ...(await eventsFor(records, session_id)),
         };
       },
+    }),
+
+    defineTool({
+      name: "session_update_settings",
+      title: "Update session settings",
+      description:
+        "Change a session's settings without starting a new one. Pass only " +
+        "the settings to change. header_validation: when true (the default), " +
+        "every call the participant sends must carry a valid ONDC " +
+        "Authorization header or it is refused with 401; set it false when " +
+        "the person asks to switch signature checks off. A change applies " +
+        "from the participant's next call.",
+      inputSchema: UpdateSessionSettingsInput,
+      outputSchema: UpdateSessionSettingsOutput,
+      annotations: {
+        // Setting the same value twice leaves the session as it was.
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      render: ({ session_id, settings, events }) =>
+        [
+          `session ${session_id} settings`,
+          `  header_validation: ${String(settings.header_validation)}`,
+          "  applies from the participant's next call",
+          ...renderEvents(events),
+        ].join("\n"),
+      handler: async ({ session_id, settings }) => ({
+        session_id,
+        settings: await service.updateSettings(session_id, settings),
+        ...(await eventsFor(records, session_id)),
+      }),
     }),
   ];
 }

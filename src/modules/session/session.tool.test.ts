@@ -304,3 +304,86 @@ describe("session tools over MCP", () => {
     });
   });
 });
+
+describe("session settings over MCP", () => {
+  async function create(args: Record<string, unknown> = {}) {
+    const created = await harness.client.callTool({
+      name: "session_create",
+      arguments: createArgs(args),
+    });
+    return (created.structuredContent as { session: { session_id: string } })
+      .session.session_id;
+  }
+
+  async function settingsOf(sessionId: string) {
+    const got = await harness.client.callTool({
+      name: "session_get",
+      arguments: { session_id: sessionId },
+    });
+    return (got.structuredContent as { session: { settings: unknown } }).session
+      .settings;
+  }
+
+  it("checks signatures by default", async () => {
+    expect(await settingsOf(await create())).toEqual({
+      header_validation: true,
+    });
+  });
+
+  it("takes settings at creation", async () => {
+    const sessionId = await create({ settings: { header_validation: false } });
+    expect(await settingsOf(sessionId)).toEqual({ header_validation: false });
+  });
+
+  it("turns header validation off mid-session, and says so", async () => {
+    const sessionId = await create();
+
+    const result = await harness.client.callTool({
+      name: "session_update_settings",
+      arguments: {
+        session_id: sessionId,
+        settings: { header_validation: false },
+      },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      session_id: sessionId,
+      settings: { header_validation: false },
+    });
+    expect(await settingsOf(sessionId)).toEqual({ header_validation: false });
+
+    const got = await harness.client.callTool({
+      name: "session_get",
+      arguments: { session_id: sessionId },
+    });
+    const text = (got.content as { type: string; text: string }[])[0]?.text;
+    expect(text).toContain("signatures: not checked");
+  });
+
+  it("leaves settings it was not given alone", async () => {
+    const sessionId = await create({ settings: { header_validation: false } });
+
+    await harness.client.callTool({
+      name: "session_update_settings",
+      arguments: { session_id: sessionId, settings: {} },
+    });
+
+    expect(await settingsOf(sessionId)).toEqual({ header_validation: false });
+  });
+
+  it("reports an unknown session as an error result", async () => {
+    const result = await harness.client.callTool({
+      name: "session_update_settings",
+      arguments: {
+        session_id: "does-not-exist",
+        settings: { header_validation: false },
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: "not_found" },
+    });
+  });
+});

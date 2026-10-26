@@ -62,6 +62,7 @@ describe("the default profile", () => {
       "record_get_payload",
       "session_create",
       "session_get",
+      "session_update_settings",
     ]);
   });
 });

@@ -48,6 +48,33 @@ export type NetworkParticipant = z.infer<typeof NetworkParticipant>;
 export const InteractionMode = z.enum(["llm_auto", "manual"]);
 export type InteractionMode = z.infer<typeof InteractionMode>;
 
+/**
+ * Session settings a person can change mid-session — the workbench's session
+ * settings panel. One today; a new one is one more field here.
+ *
+ * Read live by the receiver on every call, so a change applies to the next
+ * call, never retroactively and never needing a restart.
+ */
+export const SessionSettings = z.object({
+  header_validation: z
+    .boolean()
+    .describe(
+      "When true, every call the participant sends must carry a valid ONDC " +
+        "Authorization header, or it is refused with 401 and a NACK. Turn it " +
+        "off to test a participant that does not sign yet — or when this " +
+        "server has no keys to check signatures with.",
+    ),
+});
+export type SessionSettings = z.infer<typeof SessionSettings>;
+
+export const DEFAULT_SESSION_SETTINGS: SessionSettings = {
+  header_validation: true,
+};
+
+/** Settings as given, partially; omitted fields keep their current value. */
+export const SessionSettingsPatch = SessionSettings.partial();
+export type SessionSettingsPatch = z.infer<typeof SessionSettingsPatch>;
+
 export const Session = z.object({
   session_id: z.string().describe("Identifier for every later call."),
   created_at: z.string().describe("ISO 8601 creation timestamp."),
@@ -86,8 +113,22 @@ export const Session = z.object({
         "session on the same build and role — inbound calls are matched by " +
         "transaction_id, not by this URL.",
     ),
+  settings: SessionSettings.optional().describe(
+    "Session settings; change them with session_update_settings.",
+  ),
 });
 export type Session = z.infer<typeof Session>;
+
+/**
+ * A session's settings, with defaults for any it does not carry.
+ *
+ * `settings` is optional on `Session` because a session saved before settings
+ * existed is still read back from the store as it was written. Read it through
+ * this, never directly.
+ */
+export function settingsOf(session: Session): SessionSettings {
+  return { ...DEFAULT_SESSION_SETTINGS, ...session.settings };
+}
 
 /* --------------------------------- create --------------------------------- */
 
@@ -144,6 +185,9 @@ export const CreateSessionInput = z.object({
         "address (ngrok, cloudflared) whenever the participant is not on this " +
         "machine — otherwise its callbacks go somewhere it cannot reach.",
     ),
+  settings: SessionSettingsPatch.optional().describe(
+    "Session settings. header_validation defaults to true.",
+  ),
 });
 export type CreateSessionInput = z.infer<typeof CreateSessionInput>;
 
@@ -190,3 +234,26 @@ export const GetSessionOutput = z.object({
   ...EventsField,
 });
 export type GetSessionOutput = z.infer<typeof GetSessionOutput>;
+
+/* ----------------------------- update settings ---------------------------- */
+
+export const UpdateSessionSettingsInput = z.object({
+  session_id: z.string().min(1).describe("Session returned by session_create."),
+  settings: SessionSettingsPatch.describe(
+    "Only the settings to change; the rest keep their current value.",
+  ),
+});
+export type UpdateSessionSettingsInput = z.infer<
+  typeof UpdateSessionSettingsInput
+>;
+
+export const UpdateSessionSettingsOutput = z.object({
+  session_id: z.string(),
+  settings: SessionSettings.describe(
+    "Every setting after the change. Applies from the next inbound call.",
+  ),
+  ...EventsField,
+});
+export type UpdateSessionSettingsOutput = z.infer<
+  typeof UpdateSessionSettingsOutput
+>;

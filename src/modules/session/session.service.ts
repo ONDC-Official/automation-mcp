@@ -10,10 +10,14 @@ import {
 } from "@/modules/catalog/catalog.service.js";
 import type { ExpectationScope } from "@/modules/record/record.schema.js";
 import type { SessionRepository } from "@/modules/session/session.repository.js";
-import type {
-  CreateSessionInput,
-  CreateSessionOutput,
-  Session,
+import {
+  DEFAULT_SESSION_SETTINGS,
+  settingsOf,
+  type CreateSessionInput,
+  type CreateSessionOutput,
+  type Session,
+  type SessionSettings,
+  type SessionSettingsPatch,
 } from "@/modules/session/session.schema.js";
 
 /**
@@ -167,6 +171,7 @@ export class SessionService {
       // would have meant silent traffic on a real participant's wire.
       auto_advance: input.auto_advance ?? interactionMode === "llm_auto",
       callback_url: advertisedUri(base, build, mockRole),
+      settings: { ...DEFAULT_SESSION_SETTINGS, ...input.settings },
     };
 
     await this.#repository.save(session, this.#ttl);
@@ -206,6 +211,34 @@ export class SessionService {
       flows,
       total: flows.length,
     };
+  }
+
+  /**
+   * Change some of a session's settings; the rest keep their value.
+   *
+   * Saved for the session's remaining lifetime, so changing a setting never
+   * extends when the session expires.
+   */
+  async updateSettings(
+    sessionId: string,
+    patch: SessionSettingsPatch,
+    now: Date = new Date(),
+  ): Promise<SessionSettings> {
+    const session = await this.requireSession(sessionId);
+    const remainingMs = Date.parse(session.expires_at) - now.getTime();
+    if (remainingMs <= 0) {
+      throw new NotFoundError("session", sessionId, {
+        hint: "Sessions expire. Call session_create to start a new one.",
+      });
+    }
+
+    const settings = { ...settingsOf(session), ...patch };
+    await this.#repository.save({ ...session, settings }, remainingMs);
+    this.#logger.info(
+      { session_id: sessionId, settings },
+      "session settings changed",
+    );
+    return settings;
   }
 
   /**

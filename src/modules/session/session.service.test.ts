@@ -8,7 +8,10 @@ import {
   advertisedUri,
   SessionService,
 } from "@/modules/session/session.service.js";
-import type { CreateSessionInput } from "@/modules/session/session.schema.js";
+import {
+  settingsOf,
+  type CreateSessionInput,
+} from "@/modules/session/session.schema.js";
 import { createFakeConfigServiceGateway, FIXTURE_BUILD } from "@/test/fakes.js";
 
 const SESSION_TTL_MS = 48 * 60 * 60 * 1000;
@@ -210,5 +213,54 @@ describe("the URI this mock advertises", () => {
         "BAP",
       ),
     ).toThrow(ValidationError);
+  });
+});
+
+describe("changing a session's settings", () => {
+  it("does not extend the session's lifetime", async () => {
+    const { service, clock } = subject(1_000);
+    const created = new Date(clock.value);
+    const { session } = await service.createSession(input(), created);
+
+    clock.value += 600;
+    await service.updateSettings(
+      session.session_id,
+      { header_validation: false },
+      new Date(clock.value),
+    );
+
+    // Still there just before the original expiry, gone just after it.
+    clock.value += 399;
+    await expect(
+      service.requireSession(session.session_id),
+    ).resolves.toMatchObject({ settings: { header_validation: false } });
+    clock.value += 2;
+    await expect(
+      service.requireSession(session.session_id),
+    ).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("refuses a session past its expiry", async () => {
+    const { service, clock } = subject(1_000);
+    const { session } = await service.createSession(
+      input(),
+      new Date(clock.value),
+    );
+
+    await expect(
+      service.updateSettings(
+        session.session_id,
+        { header_validation: false },
+        new Date(clock.value + 1_000),
+      ),
+    ).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("reads a session saved before settings existed as checking signatures", async () => {
+    const { service } = subject();
+    const { session } = await service.createSession(input());
+    const { settings: _dropped, ...legacy } = session;
+
+    expect(settingsOf(legacy)).toEqual({ header_validation: true });
   });
 });
