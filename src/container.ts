@@ -59,6 +59,12 @@ import {
   type ValidationGateway,
 } from "@/modules/validate/validate.gateway.js";
 import { ValidateService } from "@/modules/validate/validate.service.js";
+import {
+  HttpRegistryGateway,
+  type RegistryGateway,
+} from "@/modules/signing/signing.gateway.js";
+import { KeyProvider } from "@/modules/signing/signing.keys.js";
+import { SigningService } from "@/modules/signing/signing.service.js";
 
 /**
  * Boot-once singletons.
@@ -124,6 +130,7 @@ export interface Container {
     readonly batch: BatchService;
     readonly validate: ValidateService;
     readonly feedback: FeedbackService;
+    readonly signing: SigningService;
   };
   /** Where a participant reaches this server's inbound receiver. */
   readonly receiverPublicUrl: string;
@@ -202,6 +209,8 @@ export interface CreateContainerOptions {
    * default reaches the real api-service over the network.
    */
   validationGateway?: ValidationGateway;
+  /** Override the registry participants' keys are looked up in. */
+  registryGateway?: RegistryGateway;
   /** Override the outbound HTTP dispatcher, e.g. undici's `MockAgent`. */
   senderDispatcher?: ConstructorParameters<
     typeof SenderService
@@ -494,6 +503,46 @@ export async function createContainer(
     );
   }
 
+  // Signing. Keys fetched from the registry live in the catalog cache: derived,
+  // re-fetchable, and read inside the ACK window.
+  const identity =
+    config.ONDC_SUBSCRIBER_ID !== undefined &&
+    config.ONDC_UNIQUE_KEY_ID !== undefined &&
+    config.ONDC_SIGNING_PRIVATE_KEY !== undefined
+      ? {
+          subscriberId: config.ONDC_SUBSCRIBER_ID,
+          uniqueKeyId: config.ONDC_UNIQUE_KEY_ID,
+          privateKey: config.ONDC_SIGNING_PRIVATE_KEY,
+        }
+      : undefined;
+  const registryGateway =
+    options.registryGateway ??
+    (config.ONDC_REGISTRY_URL !== undefined && identity !== undefined
+      ? new HttpRegistryGateway({
+          baseUrl: config.ONDC_REGISTRY_URL,
+          identity,
+          timeoutMs: config.VALIDATION_TIMEOUT_MS,
+          dispatcher: httpAgent,
+          logger,
+        })
+      : undefined);
+  const signing = new SigningService({
+    keys: new KeyProvider({
+      registry: registryGateway,
+      cache: catalogCache,
+      ttlMs: config.SIGNING_KEY_CACHE_TTL_MS,
+    }),
+    realm: config.ONDC_SUBSCRIBER_ID ?? config.MOCK_SUBSCRIBER_ID,
+    logger,
+  });
+  if (!signing.canVerify) {
+    // Every session is forced to header_validation off; say why at boot.
+    logger.warn(
+      "no ONDC_REGISTRY_URL: participants' signatures cannot be verified, " +
+        "so header validation is off for every session",
+    );
+  }
+
   const session = new SessionService({
     repository: sessionRepository,
     catalog,
@@ -501,6 +550,7 @@ export async function createContainer(
     receiverPublicUrl,
     receiverRoutePrefix,
     viewerUrl,
+    headerValidationAvailable: signing.canVerify,
     logger,
     metrics,
     mirror,
@@ -787,6 +837,7 @@ export async function createContainer(
     batch,
     validate,
     feedback,
+    signing,
   } as const;
 
   const inbound = new ReceiverService({
@@ -796,6 +847,7 @@ export async function createContainer(
     forms,
     mockEngine,
     validate,
+    signing,
     logger,
     metrics,
   });

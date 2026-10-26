@@ -6,6 +6,7 @@ import type { FlowService } from "@/modules/flow/flow.service.js";
 import type { FormsService } from "@/modules/forms/forms.service.js";
 import type { RecordService } from "@/modules/record/record.service.js";
 import type { SessionService } from "@/modules/session/session.service.js";
+import type { SigningService } from "@/modules/signing/signing.service.js";
 import type { ValidateService } from "@/modules/validate/validate.service.js";
 
 /**
@@ -52,6 +53,8 @@ export interface ReceiverServiceOptions {
   mockEngine: MockEngine;
   /** L0 + L1 on what arrives, inside the ACK window. */
   validate: ValidateService;
+  /** The participant's `Authorization` header, inside the ACK window. */
+  signing: SigningService;
   logger: Logger;
   /** Optional; absent in unit tests. The verdict is the same either way. */
   metrics?: Metrics;
@@ -64,6 +67,8 @@ export interface BecknContext {
   timestamp?: unknown;
   bap_uri?: unknown;
   bpp_uri?: unknown;
+  bap_id?: unknown;
+  bpp_id?: unknown;
 }
 
 /**

@@ -5,12 +5,8 @@ import type {
 } from "@/modules/signing/signing.gateway.js";
 
 /**
- * Where a participant's signing public key comes from.
- *
- * 1. `ONDC_COUNTERPARTY_KEYS` — keys known up front, for participants not (yet)
- *    in a registry. Never cached, never expires.
- * 2. The cache — a key fetched from the registry, for `SIGNING_KEY_CACHE_TTL_MS`.
- * 3. The registry.
+ * Where a participant's signing public key comes from: the cache, for
+ * `SIGNING_KEY_CACHE_TTL_MS`, then the registry.
  *
  * The cache is `catalogCache`, in-process: a key is derived data we can always
  * fetch again, and reading it must cost nothing inside the ACK window.
@@ -23,7 +19,7 @@ import type {
 export type KeyResult =
   | (LookupResult & {
       status: "found";
-      source: "static" | "cache" | "registry";
+      source: "cache" | "registry";
     })
   | Exclude<LookupResult, { status: "found" }>;
 
@@ -33,8 +29,7 @@ const NOT_FOUND_TTL_MS = 60_000;
 const NOT_FOUND = "__not_found__";
 
 export interface KeyProviderOptions {
-  staticKeys: Record<string, string>;
-  /** Absent when no registry is configured: only static keys can be found. */
+  /** Absent when no registry is configured: then no key can be found. */
   registry: RegistryGateway | undefined;
   cache: CacheStore;
   ttlMs: number;
@@ -47,22 +42,20 @@ export class KeyProvider {
     this.#options = options;
   }
 
+  /** Whether any key can be found at all. */
+  get hasSource(): boolean {
+    return this.#options.registry !== undefined;
+  }
+
   async lookup(
     subscriberId: string,
     uniqueKeyId: string,
     { fresh = false }: { fresh?: boolean } = {},
   ): Promise<KeyResult> {
-    const id = `${subscriberId}|${uniqueKeyId}`;
-
-    const known = this.#options.staticKeys[id];
-    if (known !== undefined) {
-      return { status: "found", publicKey: known, source: "static" };
-    }
-
     const { registry, cache, ttlMs } = this.#options;
     if (registry === undefined) return { status: "not_found" };
 
-    const cacheKey = `signing_key::${id}`;
+    const cacheKey = `signing_key::${subscriberId}|${uniqueKeyId}`;
     if (!fresh) {
       const cached = await cache.get<string>(cacheKey);
       if (cached === NOT_FOUND) return { status: "not_found" };

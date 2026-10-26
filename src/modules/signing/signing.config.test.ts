@@ -40,7 +40,6 @@ describe("signing config", () => {
   it("boots with nothing configured", () => {
     const config = boot({});
     expect(config.ONDC_SUBSCRIBER_ID).toBeUndefined();
-    expect(config.ONDC_COUNTERPARTY_KEYS).toEqual({});
     expect(config.SIGNING_KEY_CACHE_TTL_MS).toBe(900_000);
   });
 
@@ -84,23 +83,8 @@ describe("signing config", () => {
       ONDC_UNIQUE_KEY_ID: "",
       ONDC_SIGNING_PRIVATE_KEY: "",
       ONDC_REGISTRY_URL: "",
-      ONDC_COUNTERPARTY_KEYS: "",
     });
     expect(config.ONDC_SUBSCRIBER_ID).toBeUndefined();
-    expect(config.ONDC_COUNTERPARTY_KEYS).toEqual({});
-  });
-
-  it("reads static counterparty keys as a map", () => {
-    expect(
-      boot({ ONDC_COUNTERPARTY_KEYS: '{"np.example|k1":"PUB"}' })
-        .ONDC_COUNTERPARTY_KEYS,
-    ).toEqual({ "np.example|k1": "PUB" });
-  });
-
-  it.each([
-    ["not JSON", "np.example|k1=PUB", "must be a JSON object"],
-    ["a non-string key", '{"np.example|k1":42}', "ONDC_COUNTERPARTY_KEYS"],
-  ])("refuses counterparty keys that are %s", (_label, value, message) => {
-    expect(bootError({ ONDC_COUNTERPARTY_KEYS: value })).toContain(message);
+    expect(config.ONDC_REGISTRY_URL).toBeUndefined();
   });
 });

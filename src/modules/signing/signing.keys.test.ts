@@ -21,12 +21,8 @@ function fakeRegistry(answers: LookupResult[]): RegistryGateway & {
   return fake;
 }
 
-function provider(
-  registry: RegistryGateway | undefined,
-  staticKeys: Record<string, string> = {},
-) {
+function provider(registry: RegistryGateway | undefined) {
   return new KeyProvider({
-    staticKeys,
     registry,
     cache: new InMemoryCacheStore(),
     ttlMs: 60_000,
@@ -34,20 +30,10 @@ function provider(
 }
 
 describe("KeyProvider", () => {
-  it("answers a static key without asking the registry", async () => {
-    const registry = fakeRegistry([{ status: "found", publicKey: "REG" }]);
-    const keys = provider(registry, { "np.example|k1": "STATIC" });
-
+  it("answers not_found, and has no source, when there is no registry", async () => {
+    const keys = provider(undefined);
+    expect(keys.hasSource).toBe(false);
     expect(await keys.lookup("np.example", "k1")).toEqual({
-      status: "found",
-      publicKey: "STATIC",
-      source: "static",
-    });
-    expect(registry.calls).toBe(0);
-  });
-
-  it("answers not_found when there is no registry and no static key", async () => {
-    expect(await provider(undefined).lookup("np.example", "k1")).toEqual({
       status: "not_found",
     });
   });

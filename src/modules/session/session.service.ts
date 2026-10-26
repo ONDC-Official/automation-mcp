@@ -63,6 +63,12 @@ export interface SessionServiceOptions {
    */
   viewerUrl?: (sessionId: string) => string | undefined;
   /**
+   * Whether this server can verify signatures at all — false when it has no
+   * registry to fetch keys from. Then every session has `header_validation`
+   * off and it cannot be turned on. Defaults to false.
+   */
+  headerValidationAvailable?: boolean;
+  /**
    * Optional, and absent in most unit tests. Nothing about a session depends on
    * it — a run must behave identically whether or not anybody is counting.
    */
@@ -93,6 +99,7 @@ export class SessionService {
   readonly #metrics: Metrics | undefined;
   readonly #mirror: SessionMirror | undefined;
   readonly #viewerUrl: ((sessionId: string) => string | undefined) | undefined;
+  readonly #headerValidationAvailable: boolean;
 
   constructor(options: SessionServiceOptions) {
     this.#repository = options.repository;
@@ -104,6 +111,13 @@ export class SessionService {
     this.#metrics = options.metrics;
     this.#mirror = options.mirror;
     this.#viewerUrl = options.viewerUrl;
+    this.#headerValidationAvailable =
+      options.headerValidationAvailable ?? false;
+  }
+
+  /** Whether `header_validation` can be on in any session on this server. */
+  get headerValidationAvailable(): boolean {
+    return this.#headerValidationAvailable;
   }
 
   /**
@@ -171,7 +185,10 @@ export class SessionService {
       // would have meant silent traffic on a real participant's wire.
       auto_advance: input.auto_advance ?? interactionMode === "llm_auto",
       callback_url: advertisedUri(base, build, mockRole),
-      settings: { ...DEFAULT_SESSION_SETTINGS, ...input.settings },
+      settings: this.#effective({
+        ...DEFAULT_SESSION_SETTINGS,
+        ...input.settings,
+      }),
     };
 
     await this.#repository.save(session, this.#ttl);
@@ -208,6 +225,7 @@ export class SessionService {
     return {
       session,
       ...(viewerUrl !== undefined ? { viewer_url: viewerUrl } : {}),
+      header_validation_available: this.#headerValidationAvailable,
       flows,
       total: flows.length,
     };
@@ -232,6 +250,13 @@ export class SessionService {
       });
     }
 
+    if (patch.header_validation === true && !this.#headerValidationAvailable) {
+      throw new ValidationError(
+        "header_validation cannot be turned on: this server has no signing " +
+          "keys configured (ONDC_REGISTRY_URL and our ONDC identity), so it " +
+          "cannot verify a participant's signature.",
+      );
+    }
     const settings = { ...settingsOf(session), ...patch };
     await this.#repository.save({ ...session, settings }, remainingMs);
     this.#logger.info(
@@ -239,6 +264,13 @@ export class SessionService {
       "session settings changed",
     );
     return settings;
+  }
+
+  /** Settings as they can actually apply on this server. */
+  #effective(settings: SessionSettings): SessionSettings {
+    return this.#headerValidationAvailable
+      ? settings
+      : { ...settings, header_validation: false };
   }
 
   /**

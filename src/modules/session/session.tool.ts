@@ -22,7 +22,11 @@ import type { RecordService } from "@/modules/record/record.service.js";
  * the available flows are legible at a glance.
  */
 
-export function renderSession(session: Session, viewerUrl?: string): string {
+export function renderSession(
+  session: Session,
+  viewerUrl: string | undefined,
+  headerValidationAvailable: boolean,
+): string {
   return [
     `session ${session.session_id}`,
     `  under test: ${session.np.type} at ${session.np.subscriber_url}`,
@@ -33,7 +37,13 @@ export function renderSession(session: Session, viewerUrl?: string): string {
     `  callback:   ${session.callback_url}`,
     `  inputs:     ${session.interaction_mode === "manual" ? "manual — ask the human" : "llm_auto — you supply them"}`,
     `  advance:    ${session.auto_advance ? "auto" : "step by step"}`,
-    `  signatures: ${settingsOf(session).header_validation ? "checked" : "not checked"} (header_validation)`,
+    `  signatures: ${
+      !headerValidationAvailable
+        ? "not checked — this server has no signing keys, so header validation is off and cannot be turned on; tell the person"
+        : settingsOf(session).header_validation
+          ? "checked (header_validation)"
+          : "not checked (header_validation off)"
+    }`,
     `  expires:    ${session.expires_at}`,
     /*
      * The viewer link is a directive, not a field.
@@ -122,8 +132,18 @@ export function createSessionTools(
         idempotentHint: false,
         openWorldHint: true,
       },
-      render: ({ session, viewer_url, flows, total }) => {
-        const header = renderSession(session, viewer_url);
+      render: ({
+        session,
+        viewer_url,
+        header_validation_available,
+        flows,
+        total,
+      }) => {
+        const header = renderSession(
+          session,
+          viewer_url,
+          header_validation_available,
+        );
         if (total === 0) {
           return `${header}\n\nNo flows are published for this build.`;
         }
@@ -156,16 +176,18 @@ export function createSessionTools(
         idempotentHint: true,
         openWorldHint: false,
       },
-      render: ({ session, viewer_url, events }) =>
-        [renderSession(session, viewer_url), ...renderEvents(events)].join(
-          "\n",
-        ),
+      render: ({ session, viewer_url, header_validation_available, events }) =>
+        [
+          renderSession(session, viewer_url, header_validation_available),
+          ...renderEvents(events),
+        ].join("\n"),
       handler: async ({ session_id }) => {
         const session = await service.requireSession(session_id);
         const viewerUrl = service.viewerUrl(session_id);
         return {
           session,
           ...(viewerUrl !== undefined ? { viewer_url: viewerUrl } : {}),
+          header_validation_available: service.headerValidationAvailable,
           ...(await eventsFor(records, session_id)),
         };
       },

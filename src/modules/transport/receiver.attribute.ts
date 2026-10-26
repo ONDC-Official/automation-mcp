@@ -18,6 +18,12 @@ import {
   refuseMalformed,
   refuseMismatch,
 } from "@/modules/transport/receiver.refuse.js";
+import {
+  checkSignature,
+  refuseSignature,
+  type SignatureVerdict,
+  type SignedCall,
+} from "@/modules/transport/receiver.signature.js";
 
 /**
  * Working out whose call this is.
@@ -67,8 +73,15 @@ export async function resolve(
   advertisedUri: string,
   /** Enough to file the call as evidence when resolution itself refuses it. */
   call: { body: unknown; messageId: string; timestamp: string },
+  /** The call's signature, checked once the session is known. */
+  signed: SignedCall,
 ): Promise<
-  | { session: Session; transactionId: string; record: TransactionRecord }
+  | {
+      session: Session;
+      transactionId: string;
+      record: TransactionRecord;
+      signature: SignatureVerdict;
+    }
   | { failure: InboundResult }
 > {
   const transactionId =
@@ -102,7 +115,19 @@ export async function resolve(
     );
     if (!record) continue;
     warnOnUriDrift(deps, session, advertisedUri, transactionId);
-    return { session, transactionId, record };
+    const signature = await checkSignature(deps, session, request, signed);
+    if (signature.status === "rejected") {
+      return {
+        failure: await refuseSignature(
+          deps,
+          session,
+          { flowId: record.flowId, transactionId, recorded: true },
+          action,
+          call,
+        ),
+      };
+    }
+    return { session, transactionId, record, signature };
   }
 
   /* 2. An armed expectation. */
@@ -229,6 +254,25 @@ export async function resolve(
     };
   }
 
+  // Before adopting: a refused call must not bind the run to its id.
+  const signature = await checkSignature(deps, session, request, signed);
+  if (signature.status === "rejected") {
+    return {
+      failure: await refuseSignature(
+        deps,
+        session,
+        {
+          flowId: expectation.flowId,
+          transactionId,
+          recorded: false,
+          expectation: { scope, entry: expectation },
+        },
+        action,
+        call,
+      ),
+    };
+  }
+
   const record = await deps.flows.adoptTransaction({
     session,
     flowId: expectation.flowId,
@@ -247,7 +291,7 @@ export async function resolve(
     "opened a transaction from an armed expectation; the participant chose the id",
   );
 
-  return { session, transactionId, record };
+  return { session, transactionId, record, signature };
 }
 
 /**

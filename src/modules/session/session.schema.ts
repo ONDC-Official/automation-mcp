@@ -211,9 +211,21 @@ const ViewerUrlField = {
     ),
 };
 
+/** Whether header validation can be on at all, on this server. */
+const HeaderValidationAvailableField = {
+  header_validation_available: z
+    .boolean()
+    .describe(
+      "False when this server has no signing keys: header_validation is then " +
+        "off for every session and cannot be turned on. Tell the person " +
+        "signatures are not being checked.",
+    ),
+};
+
 export const CreateSessionOutput = z.object({
   session: Session,
   ...ViewerUrlField,
+  ...HeaderValidationAvailableField,
   flows: z
     .array(FlowSummary)
     .describe("Every flow published for this build, ready to start."),
@@ -231,6 +243,7 @@ export type GetSessionInput = z.infer<typeof GetSessionInput>;
 export const GetSessionOutput = z.object({
   session: Session,
   ...ViewerUrlField,
+  ...HeaderValidationAvailableField,
   ...EventsField,
 });
 export type GetSessionOutput = z.infer<typeof GetSessionOutput>;

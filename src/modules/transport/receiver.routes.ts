@@ -109,6 +109,7 @@ export function receiverRoutes(container: Container) {
         { domain, version, role, action },
         request.body,
         request.headers,
+        request.rawBody,
       );
 
       // The ACK goes out first, always. Chaining our next step before

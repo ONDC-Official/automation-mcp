@@ -43,21 +43,6 @@ const optionalString = z.preprocess(
   z.string().min(1).optional(),
 );
 
-/** `{"subscriber_id|unique_key_id": "base64 public key"}`; blank is `{}`. */
-const counterpartyKeys = z
-  .string()
-  .optional()
-  .transform((value, ctx) => {
-    if (value === undefined || value.trim() === "") return {};
-    try {
-      return JSON.parse(value) as unknown;
-    } catch {
-      ctx.addIssue({ code: "custom", message: "must be a JSON object" });
-      return z.NEVER;
-    }
-  })
-  .pipe(z.record(z.string(), z.string().min(1)));
-
 /** The public workbench, the default when `UI_BASE_URL` is not set. */
 export const DEFAULT_UI_BASE_URL = "https://workbench.ondc.tech";
 
@@ -221,8 +206,6 @@ const EnvSchema = z
     ONDC_SIGNING_PRIVATE_KEY: optionalString,
     /** Registry participants' keys are looked up in, e.g. `https://staging.registry.ondc.org/v2.0/`. */
     ONDC_REGISTRY_URL: optionalUrl,
-    /** Participants' public keys known up front, checked before the registry. */
-    ONDC_COUNTERPARTY_KEYS: counterpartyKeys,
     /** How long a public key fetched from the registry is cached. */
     SIGNING_KEY_CACHE_TTL_MS: z.coerce
       .number()
