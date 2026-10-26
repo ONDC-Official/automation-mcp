@@ -2,6 +2,41 @@ import type { FastifyInstance } from "fastify";
 import type { Container } from "@/container.js";
 import { roleFromSegment } from "@/modules/catalog/catalog.service.js";
 
+declare module "fastify" {
+  interface FastifyRequest {
+    /** The JSON body exactly as received, on the receiver routes only. */
+    rawBody?: string;
+  }
+}
+
+/**
+ * Parse JSON as Fastify always has, but keep the text it was parsed from.
+ *
+ * An ONDC signature covers the **exact bytes** the participant sent. Once the
+ * body is parsed, those bytes are gone — re-serialising produces different
+ * ones the moment the participant pretty-prints, orders keys differently or
+ * escapes a character — and every correctly signed call would fail.
+ *
+ * Parsing is delegated to Fastify's own default parser, so malformed and empty
+ * bodies get exactly the 400s they always did, with the same prototype-
+ * poisoning protection. Registered on the receiver's scope only.
+ */
+export function keepRawJsonBody(app: FastifyInstance): void {
+  const parseJson = app.getDefaultJsonParser("error", "error");
+  app.decorateRequest("rawBody", undefined);
+  app.removeContentTypeParser("application/json");
+  app.addContentTypeParser(
+    "application/json",
+    { parseAs: "string" },
+    (request, body, done) => {
+      // `parseAs: "string"` guarantees a string; the type does not narrow.
+      const text = body.toString();
+      request.rawBody = text;
+      void parseJson(request, text, done);
+    },
+  );
+}
+
 /**
  * The mock's wire presence: the routes a real network participant calls.
  *
@@ -48,6 +83,8 @@ export function receiverRoutes(container: Container) {
   const inbound = container.inbound;
 
   return async function register(app: FastifyInstance): Promise<void> {
+    keepRawJsonBody(app);
+
     app.post<{
       Params: {
         domain: string;
@@ -77,6 +114,7 @@ export function receiverRoutes(container: Container) {
       // The ACK goes out first, always. Chaining our next step before
       // answering would hold the participant's connection open for the
       // length of our own outbound call, and blow its ACK window.
+      if (result.headers) reply.headers(result.headers);
       await reply.code(result.status).send(result.body);
 
       if (result.chain) {

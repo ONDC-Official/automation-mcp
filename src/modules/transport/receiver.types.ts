@@ -30,6 +30,8 @@ export interface InboundRequest {
 export interface InboundResult {
   status: number;
   body: unknown;
+  /** Response headers, e.g. `WWW-Authenticate` on a signature refusal. */
+  headers?: Record<string, string>;
   /** Set when the call was filed against a transaction. */
   transactionId?: string;
   /** Set when auto-advance should run once the ACK has been written. */
