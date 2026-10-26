@@ -37,6 +37,27 @@ const optionalUrl = z.preprocess(
   z.url().optional(),
 );
 
+/** An optional string where blank means "not configured", as `optionalUrl`. */
+const optionalString = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().min(1).optional(),
+);
+
+/** `{"subscriber_id|unique_key_id": "base64 public key"}`; blank is `{}`. */
+const counterpartyKeys = z
+  .string()
+  .optional()
+  .transform((value, ctx) => {
+    if (value === undefined || value.trim() === "") return {};
+    try {
+      return JSON.parse(value) as unknown;
+    } catch {
+      ctx.addIssue({ code: "custom", message: "must be a JSON object" });
+      return z.NEVER;
+    }
+  })
+  .pipe(z.record(z.string(), z.string().min(1)));
+
 /** The public workbench, the default when `UI_BASE_URL` is not set. */
 export const DEFAULT_UI_BASE_URL = "https://workbench.ondc.tech";
 
@@ -186,6 +207,24 @@ const EnvSchema = z
     VALIDATION_MODE: z.enum(["off", "advisory", "enforce"]).default("enforce"),
     /** TTL for a cached verdict. Keyed on the payload's own bytes. */
     VALIDATION_CACHE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(900_000),
+
+    /* ---- Signing (the Authorization header) ---- */
+    /** Our registered subscriber id. Set with the two below, or not at all. */
+    ONDC_SUBSCRIBER_ID: optionalString,
+    /** Our `unique_key_id` in the registry. */
+    ONDC_UNIQUE_KEY_ID: optionalString,
+    /** Base64 Ed25519 private key, 32-byte seed or 64-byte expanded; keep it in a secret store. */
+    ONDC_SIGNING_PRIVATE_KEY: optionalString,
+    /** Registry participants' keys are looked up in, e.g. `https://staging.registry.ondc.org/v2.0/`. */
+    ONDC_REGISTRY_URL: optionalUrl,
+    /** Participants' public keys known up front, checked before the registry. */
+    ONDC_COUNTERPARTY_KEYS: counterpartyKeys,
+    /** How long a public key fetched from the registry is cached. */
+    SIGNING_KEY_CACHE_TTL_MS: z.coerce
       .number()
       .int()
       .positive()
@@ -542,6 +581,46 @@ const EnvSchema = z
       });
     }
   })
+  // Half an identity cannot sign anything; say so at boot, not on the first lookup.
+  .refine(
+    (env) => {
+      const set = [
+        env.ONDC_SUBSCRIBER_ID,
+        env.ONDC_UNIQUE_KEY_ID,
+        env.ONDC_SIGNING_PRIVATE_KEY,
+      ].filter((value) => value !== undefined).length;
+      return set === 0 || set === 3;
+    },
+    {
+      message:
+        "ONDC_SUBSCRIBER_ID, ONDC_UNIQUE_KEY_ID and ONDC_SIGNING_PRIVATE_KEY must be set together",
+      path: ["ONDC_SUBSCRIBER_ID"],
+    },
+  )
+  .refine(
+    (env) =>
+      env.ONDC_SIGNING_PRIVATE_KEY === undefined ||
+      [32, 64].includes(
+        Buffer.from(env.ONDC_SIGNING_PRIVATE_KEY, "base64").length,
+      ),
+    {
+      message:
+        "ONDC_SIGNING_PRIVATE_KEY must be a base64 Ed25519 key of 32 or 64 bytes",
+      path: ["ONDC_SIGNING_PRIVATE_KEY"],
+    },
+  )
+  // A v2.0 lookup is itself signed. Without an identity every lookup fails, and
+  // since an unreachable registry fails open, every signature would pass unchecked.
+  .refine(
+    (env) =>
+      env.ONDC_REGISTRY_URL === undefined ||
+      env.ONDC_SUBSCRIBER_ID !== undefined,
+    {
+      message:
+        "ONDC_REGISTRY_URL requires ONDC_SUBSCRIBER_ID, ONDC_UNIQUE_KEY_ID and ONDC_SIGNING_PRIVATE_KEY",
+      path: ["ONDC_REGISTRY_URL"],
+    },
+  )
   // `jwt` mode is useless without somewhere to fetch keys and something to
   // check them against. Catch it at boot, not on the first 401.
   .refine(
