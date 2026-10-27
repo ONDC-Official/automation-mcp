@@ -50,6 +50,14 @@ const LookupResponse = z.array(
   }),
 );
 
+/**
+ * The registry's "No matching network participant found". Only this code:
+ * any other NACK may be the registry refusing *our* lookup.
+ */
+const NoSuchParticipant = z.object({
+  error: z.object({ code: z.literal("15045") }),
+});
+
 export class HttpRegistryGateway implements RegistryGateway {
   readonly #url: string;
   readonly #identity: SigningIdentity;
@@ -122,6 +130,9 @@ export class HttpRegistryGateway implements RegistryGateway {
     } catch {
       return unavailable("registry answered with a non-JSON body");
     }
+    // An unknown subscriber or ukId is a 200 carrying a NACK, not an empty list.
+    if (NoSuchParticipant.safeParse(json).success)
+      return { status: "not_found" };
     const parsed = LookupResponse.safeParse(json);
     if (!parsed.success) {
       return unavailable("registry answered in an unexpected shape");

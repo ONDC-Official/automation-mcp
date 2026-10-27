@@ -90,8 +90,28 @@ describe("HttpRegistryGateway", () => {
     });
   });
 
+  it("answers not_found for the registry's no-matching-participant NACK", async () => {
+    // Captured from the preprod registry for an unknown ukId.
+    registry().reply(200, {
+      message: { ack: { status: "NACK" } },
+      error: {
+        code: "15045",
+        message:
+          "No matching network participant found. Unrecognized values for: ukId",
+      },
+    });
+    expect(await gateway.lookup("np.example", "k1")).toEqual({
+      status: "not_found",
+    });
+  });
+
   it.each([
     ["a refused lookup", 401, "{}"],
+    [
+      "any other NACK",
+      200,
+      '{"message":{"ack":{"status":"NACK"}},"error":{"code":"15000"}}',
+    ],
     ["a server error", 500, "oops"],
     ["a non-JSON body", 200, "<html>"],
     ["an unexpected shape", 200, '{"keys":[]}'],
