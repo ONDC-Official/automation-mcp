@@ -322,7 +322,7 @@ describe("a participant's first call, on an armed expectation", () => {
 });
 
 describe("when the key cannot be had", () => {
-  function onSearchFor(session: Session): Promise<number> {
+  function onSearchFor(session: Session) {
     return post(
       session,
       "search",
@@ -338,21 +338,56 @@ describe("when the key cannot be had", () => {
         message: { intent: {} },
       }),
       'Signature keyId="np.example.com|k1|ed25519",algorithm="ed25519",created="1",expires="9999999999",headers="(created) (expires) digest",signature="AAAA"',
-    ).then((response) => response.status);
+    );
   }
 
-  it("lets the call through when the registry is unreachable", async () => {
-    const { container: c } = await boot({
-      lookup: () =>
-        Promise.resolve({ status: "unavailable", reason: "registry down" }),
-    });
+  const REGISTRY_DOWN: RegistryGateway = {
+    lookup: () =>
+      Promise.resolve({ status: "unavailable", reason: "registry down" }),
+  };
+
+  it("refuses the call when the registry is unreachable, without blaming the signature", async () => {
+    const { container: c } = await boot(REGISTRY_DOWN);
     const session = await createSession(c, "BAP");
     await c.services.flow.start({
       sessionId: session.session_id,
       flowId: RUNNABLE_FLOW_ID,
     });
 
-    expect(await onSearchFor(session)).toBe(200);
+    const response = await onSearchFor(session);
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({
+      message: { ack: { status: "NACK" } },
+      error: {
+        code: "10001",
+        message:
+          "Could not verify signature: the registry lookup for your keyId failed.",
+      },
+    });
+
+    const events = await c.services.record.readEvents(session.session_id);
+    const refusal = events.find((event) => event.nack_code === "10001");
+    expect(refusal?.summary).toContain(
+      "could not get the participant's key from the registry (registry down)",
+    );
+    expect(refusal?.summary).not.toContain("28-authorization-header-creation");
+    // A refused first call binds nothing.
+    expect(
+      await c.services.record.listTransactionIds(session.session_id),
+    ).toEqual([]);
+  });
+
+  it("accepts the call when the registry is unreachable and checking is off", async () => {
+    const { container: c } = await boot(REGISTRY_DOWN);
+    const session = await createSession(c, "BAP", {
+      header_validation: false,
+    });
+    await c.services.flow.start({
+      sessionId: session.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+
+    expect((await onSearchFor(session)).status).toBe(200);
   });
 
   it("does not check at all on a server with no keys", async () => {
@@ -366,6 +401,6 @@ describe("when the key cannot be had", () => {
       flowId: RUNNABLE_FLOW_ID,
     });
 
-    expect(await onSearchFor(session)).toBe(200);
+    expect((await onSearchFor(session)).status).toBe(200);
   });
 });

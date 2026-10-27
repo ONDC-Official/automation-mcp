@@ -20,6 +20,7 @@ import {
 } from "@/modules/transport/receiver.refuse.js";
 import {
   checkSignature,
+  isRefused,
   refuseSignature,
   type SignatureVerdict,
   type SignedCall,
@@ -116,7 +117,7 @@ export async function resolve(
     if (!record) continue;
     warnOnUriDrift(deps, session, advertisedUri, transactionId);
     const signature = await checkSignature(deps, session, request, signed);
-    if (signature.status === "rejected") {
+    if (isRefused(signature)) {
       return {
         failure: await refuseSignature(
           deps,
@@ -124,6 +125,7 @@ export async function resolve(
           { flowId: record.flowId, transactionId, recorded: true },
           action,
           call,
+          signature,
         ),
       };
     }
@@ -256,7 +258,7 @@ export async function resolve(
 
   // Before adopting: a refused call must not bind the run to its id.
   const signature = await checkSignature(deps, session, request, signed);
-  if (signature.status === "rejected") {
+  if (isRefused(signature)) {
     return {
       failure: await refuseSignature(
         deps,
@@ -269,6 +271,7 @@ export async function resolve(
         },
         action,
         call,
+        signature,
       ),
     };
   }

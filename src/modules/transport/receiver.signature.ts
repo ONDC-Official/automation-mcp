@@ -3,6 +3,7 @@ import type {
   ExpectationScope,
 } from "@/modules/record/record.schema.js";
 import {
+  REGISTRY_ERROR_MESSAGE,
   SIGNATURE_ERROR_CODE,
   SIGNATURE_ERROR_MESSAGE,
   SIGNATURE_GUIDE_URL,
@@ -34,6 +35,23 @@ import type {
 
 export type SignatureVerdict = InboundVerdict | { status: "skipped" };
 
+/** A verdict the call may not pass: checking is on and it was not shown valid. */
+export type RefusedVerdict = Extract<
+  SignatureVerdict,
+  { status: "rejected" | "unavailable" }
+>;
+
+/**
+ * With `header_validation` on, a call we could not verify is refused like one
+ * that failed: the participant asked to be tested on its signature, and an
+ * ACK would say it passed. Off, nothing is checked and nothing is refused.
+ */
+export function isRefused(
+  verdict: SignatureVerdict,
+): verdict is RefusedVerdict {
+  return verdict.status === "rejected" || verdict.status === "unavailable";
+}
+
 export interface SignedCall {
   headers: Record<string, unknown>;
   rawBody: string | undefined;
@@ -64,6 +82,14 @@ export async function checkSignature(
  * Refuse an unsigned or badly signed call: 401, a NACK carrying ONDC's
  * `10001`, and the guide.
  *
+ * Or one we could not verify, because the registry gave us no key. Same 401
+ * and `10001`, but neither the participant nor the model is told the signature
+ * is wrong: it may be fine, and the lookup that failed was ours.
+ *
+ * Or one we could not verify, because the registry gave us no key. Same 401
+ * and `10001`, but neither the participant nor the model is told the signature
+ * is wrong: it may be fine, and the lookup that failed was ours.
+ *
  * Kept **out of line**, like `refuseMismatch`: appending it would match the
  * pending step and advance the flow on a call we refused, when the participant
  * still has to send it — signed. An expectation this call consumed is put
@@ -82,6 +108,7 @@ export async function refuseSignature(
   },
   action: string,
   call: { body: unknown; messageId: string; timestamp: string },
+  verdict: RefusedVerdict,
 ): Promise<InboundResult> {
   if (target.expectation !== undefined) {
     const { scope, entry } = target.expectation;
@@ -97,7 +124,11 @@ export async function refuseSignature(
     });
   }
 
-  const ackBody = nack(SIGNATURE_ERROR_CODE, SIGNATURE_ERROR_MESSAGE);
+  const unverified = verdict.status === "unavailable";
+  const ackBody = nack(
+    SIGNATURE_ERROR_CODE,
+    unverified ? REGISTRY_ERROR_MESSAGE : SIGNATURE_ERROR_MESSAGE,
+  );
   const payloadId = await deps.records.storePayload({
     transactionId: target.transactionId,
     subscriberUrl: session.np.subscriber_url,
@@ -110,9 +141,13 @@ export async function refuseSignature(
   });
 
   const summary =
-    `Refused ${action} with 401: its Authorization header is missing or does not verify. ` +
-    `The participant must sign the exact request bytes — guide: ${SIGNATURE_GUIDE_URL}. ` +
-    `To help them fix it, read ${SIGNING_TOPICS.join(" and ")} with protocol_search_knowledge. ` +
+    (unverified
+      ? `Refused ${action} with 401: we could not get the participant's key from the registry (${verdict.reason}). ` +
+        "Their signature may be fine — the lookup that failed is ours: check ONDC_REGISTRY_URL and our ONDC identity, " +
+        "or turn header_validation off with session_update_settings to carry on unverified. "
+      : `Refused ${action} with 401: its Authorization header is missing or does not verify. ` +
+        `The participant must sign the exact request bytes — guide: ${SIGNATURE_GUIDE_URL}. ` +
+        `To help them fix it, read ${SIGNING_TOPICS.join(" and ")} with protocol_search_knowledge. `) +
     `Body kept out of line (${payloadId}); the flow did not advance.`;
 
   if (target.recorded) {

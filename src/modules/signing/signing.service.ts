@@ -15,8 +15,9 @@ import type { KeyProvider } from "@/modules/signing/signing.keys.js";
  * than told which. `reason` exists for our own logs only.
  *
  * `unavailable` is different in kind: we could not ask the registry, so we
- * cannot say. The receiver lets those calls through, because our outage is not
- * the participant's non-compliance.
+ * cannot say. The receiver still refuses those calls when checking is on — an
+ * ACK would claim a signature passed that nobody checked — but says the lookup
+ * failed rather than that the signature is wrong.
  */
 
 export type InboundVerdict =
@@ -31,6 +32,10 @@ export const SIGNATURE_GUIDE_URL =
 export const SIGNATURE_ERROR_CODE = "10001";
 
 export const SIGNATURE_ERROR_MESSAGE = `Invalid signature. See ${SIGNATURE_GUIDE_URL} for how to sign a request.`;
+
+/** Sent when the registry gave us no key: the signature may be fine. */
+export const REGISTRY_ERROR_MESSAGE =
+  "Could not verify signature: the registry lookup for your keyId failed.";
 
 /**
  * Where the model reads how signing works. The guide page is rendered in the

@@ -15,8 +15,8 @@ import { signRequest } from "@/modules/signing/signing.crypto.js";
  *
  * Called inside the receiver's ACK window. `not_found` (the registry answered,
  * and has no such key) and `unavailable` (we got no answer) are different
- * verdicts: the first rejects the call, the second lets it through, because
- * our outage is not the participant's non-compliance.
+ * verdicts: the first says the signature is wrong, the second only that we
+ * could not check it — the receiver refuses both, but tells them apart.
  */
 
 export type LookupResult =
