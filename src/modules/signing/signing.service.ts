@@ -9,10 +9,9 @@ import type { KeyProvider } from "@/modules/signing/signing.keys.js";
 /**
  * Is this inbound call signed by the participant it claims to come from?
  *
- * One answer, no diagnosis. Every way a signature can be wrong — missing,
- * unparseable, expired, signed by somebody else, unknown key, bad bytes — is
- * the same `rejected`, and the participant is pointed at ONDC's guide rather
- * than told which. `reason` exists for our own logs only.
+ * Every way a signature can be wrong — missing, unparseable, expired, signed
+ * by somebody else, unknown key, bad bytes — is `rejected`, and `reason` says
+ * which, in words the participant is sent.
  *
  * `unavailable` is different in kind: we could not ask the registry, so we
  * cannot say. The receiver still refuses those calls when checking is on — an
@@ -31,7 +30,13 @@ export const SIGNATURE_GUIDE_URL =
 /** The ONDC error code for an invalid signature, as the workbench sends it. */
 export const SIGNATURE_ERROR_CODE = "10001";
 
-export const SIGNATURE_ERROR_MESSAGE = `Invalid signature. See ${SIGNATURE_GUIDE_URL} for how to sign a request.`;
+/**
+ * Sent to the participant: which check failed, as ONIX does. The guide goes to
+ * the model, which is who helps them act on it.
+ */
+export function signatureErrorMessage(reason: string): string {
+  return `Invalid signature: ${reason}.`;
+}
 
 /** Sent when the registry gave us no key: the signature may be fine. */
 export const REGISTRY_ERROR_MESSAGE =
@@ -123,15 +128,19 @@ export class SigningService {
     nowSeconds?: number;
   }): Promise<InboundVerdict> {
     const header = parseAuthorizationHeader(args.header);
-    if (header === undefined) return rejected("missing or unparseable header");
-    if (args.rawBody === undefined) return rejected("no raw body to verify");
+    if (header === undefined) {
+      return rejected("the Authorization header is missing or malformed");
+    }
+    if (args.rawBody === undefined) {
+      return rejected("the request body could not be read");
+    }
     if (!isWithinValidity(header, args.nowSeconds)) {
-      return rejected("outside created/expires");
+      return rejected("the header is expired or not yet valid");
     }
     // A valid signature only proves *some* registered participant signed the
     // call. It must be the one the payload says it is from.
     if (header.subscriberId !== args.claimedSubscriberId) {
-      return rejected("keyId subscriber is not the payload's sender");
+      return rejected("the keyId's subscriber is not the payload's sender");
     }
 
     const key = await this.#keys.lookup(
@@ -139,7 +148,9 @@ export class SigningService {
       header.uniqueKeyId,
     );
     if (key.status === "unavailable") return key;
-    if (key.status === "not_found") return rejected("no key for keyId");
+    if (key.status === "not_found") {
+      return rejected("the registry has no key for this keyId");
+    }
 
     const input = { header: args.header ?? "", body: args.rawBody };
     if (await verifySignature({ ...input, publicKey: key.publicKey })) {
@@ -162,10 +173,11 @@ export class SigningService {
         return { status: "valid" };
       }
     }
-    return rejected("signature does not verify");
+    return rejected("the signature does not verify against the registered key");
   }
 }
 
+/** Sent to the participant, so its wording is theirs to act on. */
 function rejected(reason: string): InboundVerdict {
   return { status: "rejected", reason };
 }

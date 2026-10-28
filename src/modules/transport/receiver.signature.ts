@@ -1,7 +1,7 @@
 import {
   REGISTRY_ERROR_MESSAGE,
   SIGNATURE_ERROR_CODE,
-  SIGNATURE_ERROR_MESSAGE,
+  signatureErrorMessage,
   SIGNATURE_GUIDE_URL,
   SIGNING_TOPICS,
   type InboundVerdict,
@@ -98,7 +98,7 @@ export async function refuseSignature(
   const unverified = verdict.status === "unavailable";
   const ackBody = nack(
     SIGNATURE_ERROR_CODE,
-    unverified ? REGISTRY_ERROR_MESSAGE : SIGNATURE_ERROR_MESSAGE,
+    unverified ? REGISTRY_ERROR_MESSAGE : signatureErrorMessage(verdict.reason),
   );
   const { payloadId } = await record(
     deps,
@@ -116,8 +116,9 @@ export async function refuseSignature(
       ? `Refused ${action} with 401: we could not get the participant's key from the registry (${verdict.reason}). ` +
         "Their signature may be fine — the lookup that failed is ours: check ONDC_REGISTRY_URL and our ONDC identity, " +
         "or turn header_validation off with session_update_settings to carry on unverified. "
-      : `Refused ${action} with 401: its Authorization header is missing or does not verify. ` +
-        `The participant must sign the exact request bytes — guide: ${SIGNATURE_GUIDE_URL}. ` +
+      : `Refused ${action} with 401: ${verdict.reason}. ` +
+        "Tell the person you are testing for what failed, " +
+        `and write ONDC's signing guide to them as the full URL, plain text on its own line: ${SIGNATURE_GUIDE_URL} . ` +
         `To help them fix it, read ${SIGNING_TOPICS.join(" and ")} with protocol_search_knowledge. `) +
     `Recorded as a NACK on this step${payloadId !== undefined ? ` (${payloadId})` : ""}; ` +
     "the flow has moved past it, so to try again, call flow_restart.";

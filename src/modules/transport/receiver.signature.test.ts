@@ -119,14 +119,13 @@ async function post(
   };
 }
 
-const REFUSED = {
-  message: { ack: { status: "NACK" } },
-  error: {
-    code: "10001",
-    message:
-      "Invalid signature. See https://dev-workbench.ondc.tech/developer-guide/auth-tools for how to sign a request.",
-  },
-};
+/** The NACK names the check that failed; the guide goes to the model. */
+function refused(reason: string) {
+  return {
+    message: { ack: { status: "NACK" } },
+    error: { code: "10001", message: `Invalid signature: ${reason}.` },
+  };
+}
 
 /** Mock is the BAP: we send `search`, the participant answers `on_search`. */
 describe("a participant's callback on a known transaction", () => {
@@ -197,22 +196,29 @@ describe("a participant's callback on a known transaction", () => {
   });
 
   it.each([
-    ["no Authorization header", (_body: string) => Promise.resolve(undefined)],
+    [
+      "no Authorization header",
+      (_body: string) => Promise.resolve(undefined),
+      "the Authorization header is missing or malformed",
+    ],
     [
       "a signature over different bytes",
       async (body: string) => sign(`${body} `),
+      "the signature does not verify against the registered key",
     ],
     [
       "a key that is not the participant's",
       async (body: string) => sign(body, stranger.seed),
+      "the signature does not verify against the registered key",
     ],
     [
       "a keyId naming somebody other than the payload's sender",
       async (body: string) => sign(body, np.seed, "someone-else.example.com"),
+      "the keyId's subscriber is not the payload's sender",
     ],
   ])(
     "refuses %s with 401, and records it as a NACK on the step",
-    async (_label, header) => {
+    async (_label, header, reason) => {
       const { session, onSearch, onSearchStep } = await waitingForOnSearch();
       const body = JSON.stringify(onSearch());
 
@@ -224,7 +230,7 @@ describe("a participant's callback on a known transaction", () => {
       );
 
       expect(response.status).toBe(401);
-      expect(response.body).toEqual(REFUSED);
+      expect(response.body).toEqual(refused(reason));
       expect(response.challenge).toBe(
         'Signature realm="mock.ondc-mcp.local",headers="(created) (expires) digest"',
       );
@@ -249,7 +255,11 @@ describe("a participant's callback on a known transaction", () => {
       expires: String(now - 3600),
     });
 
-    expect((await post(session, "on_search", body, expired)).status).toBe(401);
+    const response = await post(session, "on_search", body, expired);
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual(
+      refused("the header is expired or not yet valid"),
+    );
   });
 
   it("tells the model, and a signed retry needs flow_restart", async () => {
@@ -266,8 +276,13 @@ describe("a participant's callback on a known transaction", () => {
     const events = await c.services.record.readEvents(session.session_id);
     const refusal = events.find((event) => event.nack_code === "10001");
     expect(refusal).toMatchObject({ kind: "ATTENTION", action: "on_search" });
+    // The model gets the reason and the guide; the participant only the reason.
     expect(refusal?.summary).toContain(
-      "https://dev-workbench.ondc.tech/developer-guide/auth-tools",
+      "the Authorization header is missing or malformed",
+    );
+    expect(refusal?.summary).toContain(
+      "write ONDC's signing guide to them as the full URL, plain text on its own line: " +
+        "https://dev-workbench.ondc.tech/developer-guide/auth-tools",
     );
     expect(refusal?.summary).toContain(
       "read 28-authorization-header-creation and 27-digest-generation with protocol_search_knowledge",
