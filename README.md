@@ -39,6 +39,7 @@ src/
   modules/flow/          the loop — derived state machine, start/proceed/await
   modules/record/        exchanges, payloads and business data
   modules/transport/     inbound receiver routes + outbound signed sender
+  modules/signing/       sign + verify the Authorization header, registry lookup
   modules/forms/         forms this mock hosts, and forms it has to fill
   modules/health/        /health and /ready
   lib/                   errors · define-tool · logger · cache · mock-engine · events
@@ -305,6 +306,49 @@ Two deliberate choices worth knowing:
 - **A failed read throws, it does not return `undefined`.** `undefined` means
   "no such session", and the model answers that by starting a _new_ transaction
   against a real participant. An outage has to look like an outage.
+
+## Signing
+
+The mock signs what it sends and can verify what it receives, using ONDC's
+`Authorization` header (Ed25519 over a BLAKE2b-512 digest of the exact bytes,
+via `ondc-crypto-sdk-nodejs`). Both depend only on the environment:
+
+| Set in `.env`                                                            | Outbound calls | Inbound signatures                        |
+| ------------------------------------------------------------------------ | -------------- | ----------------------------------------- |
+| nothing                                                                  | unsigned       | not checked; cannot be turned on          |
+| `ONDC_SUBSCRIBER_ID` + `ONDC_UNIQUE_KEY_ID` + `ONDC_SIGNING_PRIVATE_KEY` | signed         | not checked; cannot be turned on          |
+| the three above + `ONDC_REGISTRY_URL`                                    | signed         | checked per session (`header_validation`) |
+
+The three identity variables are set together or not at all, and
+`ONDC_REGISTRY_URL` requires them, because a v2.0 registry lookup is itself
+signed — the server refuses to boot otherwise. The identity is also the
+`bap_id` / `bpp_id` the mock puts in its payloads, so a participant sees a
+`keyId` that names the payload's sender.
+
+`header_validation` is on by default for every session that can have it.
+`session_create` takes `settings`, and `session_update_settings` changes it
+mid-session, from the next inbound call. With it on, a call is refused with
+**HTTP 401, NACK `10001`**:
+
+| Why                                                               | Message the participant gets                                                   |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| no header, or a garbled one                                       | `Invalid signature: the Authorization header is missing or malformed.`         |
+| expired or not yet valid                                          | `Invalid signature: the header is expired or not yet valid.`                   |
+| `keyId` names somebody other than the payload's sender            | `Invalid signature: the keyId's subscriber is not the payload's sender.`       |
+| the registry has no such key (`15045`)                            | `Invalid signature: the registry has no key for this keyId.`                   |
+| wrong key, or bytes changed after signing                         | `Invalid signature: the signature does not verify against the registered key.` |
+| the registry could not be asked (down, 4xx/5xx, unexpected shape) | `Could not verify signature: the registry lookup for your keyId failed.`       |
+
+The last row is our failure, not theirs, and is still refused: an ACK would
+say a signature passed that nobody checked. Turn `header_validation` off to
+carry on unverified.
+
+A refused call is **recorded on its step**, as the workbench records it: the
+live viewer shows it as a NACK, and the flow moves past it, so trying again
+takes `flow_restart`. The model is told the reason, and to hand the person
+ONDC's signing guide. Registry keys are cached for `SIGNING_KEY_CACHE_TTL_MS`;
+a signature that fails against a cached key is retried once against a fresh
+lookup, so a participant who has just rotated its key is not refused.
 
 ## Issue reporting
 
