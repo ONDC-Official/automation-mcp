@@ -20,8 +20,8 @@ import { keyPair } from "@/test/signing-keys.js";
 
 /**
  * The receiver's signature check, end to end through the real routes: the raw
- * bytes, the session setting, the 401, and — the part that is easy to get
- * wrong — that a refused call neither advances a flow nor binds one.
+ * bytes, the session setting, the 401, and that a refused call is recorded on
+ * its step as a NACK, as the workbench records it.
  */
 
 const NP = "https://np.example.com";
@@ -158,14 +158,22 @@ describe("a participant's callback on a known transaction", () => {
       },
       message: { catalog: { providers: [{ id: "provider-1" }] } },
     });
-    const onSearchStatus = async () => {
+    const onSearchStep = async () => {
       const status = await booted.container.services.flow.status(
         session.session_id,
-        { transactionId },
+        { flowId: RUNNABLE_FLOW_ID },
       );
-      return status.sequence.find((step) => step.key === "on_search_1")?.status;
+      return status.sequence.find((step) => step.key === "on_search_1");
     };
-    return { ...booted, session, transactionId, onSearch, onSearchStatus };
+    const onSearchStatus = async () => (await onSearchStep())?.status;
+    return {
+      ...booted,
+      session,
+      transactionId,
+      onSearch,
+      onSearchStep,
+      onSearchStatus,
+    };
   }
 
   it("ACKs a correctly signed call", async () => {
@@ -203,9 +211,9 @@ describe("a participant's callback on a known transaction", () => {
       async (body: string) => sign(body, np.seed, "someone-else.example.com"),
     ],
   ])(
-    "refuses %s with 401, without advancing the flow",
+    "refuses %s with 401, and records it as a NACK on the step",
     async (_label, header) => {
-      const { session, onSearch, onSearchStatus } = await waitingForOnSearch();
+      const { session, onSearch, onSearchStep } = await waitingForOnSearch();
       const body = JSON.stringify(onSearch());
 
       const response = await post(
@@ -220,7 +228,11 @@ describe("a participant's callback on a known transaction", () => {
       expect(response.challenge).toBe(
         'Signature realm="mock.ondc-mcp.local",headers="(created) (expires) digest"',
       );
-      expect(await onSearchStatus()).not.toBe("COMPLETE");
+      // As the workbench draws it: the step was taken, and refused.
+      expect(await onSearchStep()).toMatchObject({
+        status: "COMPLETE",
+        ack: "NACK",
+      });
     },
   );
 
@@ -240,12 +252,13 @@ describe("a participant's callback on a known transaction", () => {
     expect((await post(session, "on_search", body, expired)).status).toBe(401);
   });
 
-  it("tells the model, and lets a signed retry through", async () => {
+  it("tells the model, and a signed retry needs flow_restart", async () => {
     const {
       session,
       container: c,
+      agent: a,
       onSearch,
-      onSearchStatus,
+      onSearchStep,
     } = await waitingForOnSearch();
     const body = JSON.stringify(onSearch());
 
@@ -259,11 +272,41 @@ describe("a participant's callback on a known transaction", () => {
     expect(refusal?.summary).toContain(
       "read 28-authorization-header-creation and 27-digest-generation with protocol_search_knowledge",
     );
+    expect(refusal?.summary).toContain("call flow_restart");
     expect(refusal?.payload_id).toBeDefined();
 
-    const retry = await post(session, "on_search", body, await sign(body));
-    expect(retry.status).toBe(200);
-    expect(await onSearchStatus()).toBe("COMPLETE");
+    // The flow has moved past the refused step, so a retry on it is late.
+    const late = await post(session, "on_search", body, await sign(body));
+    expect(late.body).toMatchObject({ message: { ack: { status: "NACK" } } });
+
+    await c.services.flow.restart({
+      sessionId: session.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    acceptsAction(a, NP, "search");
+    const resent = await c.services.flow.proceed({
+      sessionId: session.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    const retryBody = JSON.stringify({
+      ...onSearch(),
+      context: {
+        ...onSearch().context,
+        transaction_id: resent.transaction_id,
+        message_id: "msg-callback-2",
+      },
+    });
+    const retry = await post(
+      session,
+      "on_search",
+      retryBody,
+      await sign(retryBody),
+    );
+    expect(retry.body).toEqual({ message: { ack: { status: "ACK" } } });
+    expect(await onSearchStep()).toMatchObject({
+      status: "COMPLETE",
+      ack: "ACK",
+    });
   });
 
   it("stops checking from the next call once the setting is off", async () => {
@@ -298,26 +341,44 @@ describe("a participant's first call, on an armed expectation", () => {
     });
   }
 
-  it("does not bind the run to a refused call's transaction id", async () => {
+  it("records a refused first call on the run it opens", async () => {
     const { container: c } = await boot();
     const session = await createSession(c, "BAP");
     await c.services.flow.start({
       sessionId: session.session_id,
       flowId: RUNNABLE_FLOW_ID,
     });
+    const searchStep = async () =>
+      (
+        await c.services.flow.status(session.session_id, {
+          flowId: RUNNABLE_FLOW_ID,
+        })
+      ).sequence.find((step) => step.action === "search");
 
     const refused = await post(session, "search", search("txn-unsigned"));
     expect(refused.status).toBe(401);
-
-    // The signed retry carries a fresh id, as a participant re-initiating
-    // would. Had the refusal bound the run, this would be TRANSACTION_MISMATCH.
-    const body = search("txn-signed");
-    const accepted = await post(session, "search", body, await sign(body));
-    expect(accepted.status).toBe(200);
-    expect(accepted.body).toEqual({ message: { ack: { status: "ACK" } } });
+    // As the workbench does: the call opened the transaction, and its step
+    // shows as taken and refused.
     expect(
       await c.services.record.listTransactionIds(session.session_id),
-    ).toEqual(["txn-signed"]);
+    ).toEqual(["txn-unsigned"]);
+    expect(await searchStep()).toMatchObject({
+      status: "COMPLETE",
+      ack: "NACK",
+    });
+
+    // Delete and play again: a signed search with a fresh id opens attempt 2.
+    await c.services.flow.restart({
+      sessionId: session.session_id,
+      flowId: RUNNABLE_FLOW_ID,
+    });
+    const body = search("txn-signed");
+    const accepted = await post(session, "search", body, await sign(body));
+    expect(accepted.body).toEqual({ message: { ack: { status: "ACK" } } });
+    expect(await searchStep()).toMatchObject({
+      status: "COMPLETE",
+      ack: "ACK",
+    });
   });
 });
 
@@ -371,10 +432,10 @@ describe("when the key cannot be had", () => {
       "could not get the participant's key from the registry (registry down)",
     );
     expect(refusal?.summary).not.toContain("28-authorization-header-creation");
-    // A refused first call binds nothing.
+    // Recorded on the run it opened, like any other refusal.
     expect(
       await c.services.record.listTransactionIds(session.session_id),
-    ).toEqual([]);
+    ).toEqual(["txn-1"]);
   });
 
   it("accepts the call when the registry is unreachable and checking is off", async () => {

@@ -122,7 +122,7 @@ export async function resolve(
         failure: await refuseSignature(
           deps,
           session,
-          { flowId: record.flowId, transactionId, recorded: true },
+          { flowId: record.flowId, transactionId },
           action,
           call,
           signature,
@@ -256,26 +256,6 @@ export async function resolve(
     };
   }
 
-  // Before adopting: a refused call must not bind the run to its id.
-  const signature = await checkSignature(deps, session, request, signed);
-  if (isRefused(signature)) {
-    return {
-      failure: await refuseSignature(
-        deps,
-        session,
-        {
-          flowId: expectation.flowId,
-          transactionId,
-          recorded: false,
-          expectation: { scope, entry: expectation },
-        },
-        action,
-        call,
-        signature,
-      ),
-    };
-  }
-
   const record = await deps.flows.adoptTransaction({
     session,
     flowId: expectation.flowId,
@@ -293,6 +273,22 @@ export async function resolve(
     },
     "opened a transaction from an armed expectation; the participant chose the id",
   );
+
+  // After adopting, as the workbench does: a refused first call is recorded
+  // on the run it opened, so the step shows as refused.
+  const signature = await checkSignature(deps, session, request, signed);
+  if (isRefused(signature)) {
+    return {
+      failure: await refuseSignature(
+        deps,
+        session,
+        { flowId: expectation.flowId, transactionId },
+        action,
+        call,
+        signature,
+      ),
+    };
+  }
 
   return { session, transactionId, record, signature };
 }

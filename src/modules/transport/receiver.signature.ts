@@ -1,7 +1,3 @@
-import type {
-  Expectation,
-  ExpectationScope,
-} from "@/modules/record/record.schema.js";
 import {
   REGISTRY_ERROR_MESSAGE,
   SIGNATURE_ERROR_CODE,
@@ -11,7 +7,10 @@ import {
   type InboundVerdict,
 } from "@/modules/signing/signing.service.js";
 import { settingsOf, type Session } from "@/modules/session/session.schema.js";
-import { journalInbound } from "@/modules/transport/receiver.persist.js";
+import {
+  journalInbound,
+  record,
+} from "@/modules/transport/receiver.persist.js";
 import { nack } from "@/modules/transport/receiver.refuse.js";
 import type {
   BecknContext,
@@ -25,12 +24,9 @@ import type {
  * check.
  *
  * It needs the session (whose `header_validation` setting decides whether to
- * check at all), and it must run **before** anything is bound: `resolve` opens
- * a transaction from an armed expectation by adopting the participant's
- * `transaction_id`, and binding a run to the id of a call we then refuse would
- * leave the participant's signed retry — often under a fresh id — answered
- * `TRANSACTION_MISMATCH`. So `resolve` calls this at the moment the session is
- * known, and nowhere else does.
+ * check at all) and a transaction to record a refusal on, so `resolve` calls it
+ * once both are known — after adopting the participant's `transaction_id` on a
+ * first call, as the workbench does — and nowhere else does.
  */
 
 export type SignatureVerdict = InboundVerdict | { status: "skipped" };
@@ -86,59 +82,34 @@ export async function checkSignature(
  * and `10001`, but neither the participant nor the model is told the signature
  * is wrong: it may be fine, and the lookup that failed was ours.
  *
- * Or one we could not verify, because the registry gave us no key. Same 401
- * and `10001`, but neither the participant nor the model is told the signature
- * is wrong: it may be fine, and the lookup that failed was ours.
- *
- * Kept **out of line**, like `refuseMismatch`: appending it would match the
- * pending step and advance the flow on a call we refused, when the participant
- * still has to send it — signed. An expectation this call consumed is put
- * back, for the same reason.
+ * **Recorded on the transaction**, like every other NACK and like the
+ * workbench, which records the call before it checks the signature. The step
+ * shows as taken and refused, and the flow moves past it: a signed retry no
+ * longer matches, and the way to try again is `flow_restart`.
  */
 export async function refuseSignature(
   deps: ReceiverDeps,
   session: Session,
-  target: {
-    flowId: string;
-    transactionId: string;
-    /** Whether a transaction record exists to flag. */
-    recorded: boolean;
-    /** The expectation this call consumed, to put back. */
-    expectation?: { scope: ExpectationScope; entry: Expectation };
-  },
+  target: { flowId: string; transactionId: string },
   action: string,
   call: { body: unknown; messageId: string; timestamp: string },
   verdict: RefusedVerdict,
 ): Promise<InboundResult> {
-  if (target.expectation !== undefined) {
-    const { scope, entry } = target.expectation;
-    await deps.records.armExpectation(scope, {
-      sessionId: entry.sessionId,
-      flowId: entry.flowId,
-      ...(entry.transactionId !== undefined
-        ? { transactionId: entry.transactionId }
-        : {}),
-      expectedAction: entry.expectedAction,
-      subscriberUrl: entry.subscriberUrl,
-      autoAdvance: entry.autoAdvance,
-    });
-  }
-
   const unverified = verdict.status === "unavailable";
   const ackBody = nack(
     SIGNATURE_ERROR_CODE,
     unverified ? REGISTRY_ERROR_MESSAGE : SIGNATURE_ERROR_MESSAGE,
   );
-  const payloadId = await deps.records.storePayload({
-    transactionId: target.transactionId,
-    subscriberUrl: session.np.subscriber_url,
-    direction: "inbound",
+  const { payloadId } = await record(
+    deps,
+    session,
+    target.transactionId,
     action,
-    messageId: call.messageId,
-    timestamp: call.timestamp,
-    body: call.body,
+    call.messageId,
+    call.timestamp,
+    call.body,
     ackBody,
-  });
+  );
 
   const summary =
     (unverified
@@ -148,26 +119,25 @@ export async function refuseSignature(
       : `Refused ${action} with 401: its Authorization header is missing or does not verify. ` +
         `The participant must sign the exact request bytes — guide: ${SIGNATURE_GUIDE_URL}. ` +
         `To help them fix it, read ${SIGNING_TOPICS.join(" and ")} with protocol_search_knowledge. `) +
-    `Body kept out of line (${payloadId}); the flow did not advance.`;
+    `Recorded as a NACK on this step${payloadId !== undefined ? ` (${payloadId})` : ""}; ` +
+    "the flow has moved past it, so to try again, call flow_restart.";
 
-  if (target.recorded) {
-    await deps.records.setAttention(
-      target.transactionId,
-      session.np.subscriber_url,
-      {
-        kind: "SIGNATURE_INVALID",
-        message: summary,
-        at: new Date().toISOString(),
-      },
-    );
-  }
+  await deps.records.setAttention(
+    target.transactionId,
+    session.np.subscriber_url,
+    {
+      kind: "SIGNATURE_INVALID",
+      message: summary,
+      at: new Date().toISOString(),
+    },
+  );
 
   await journalInbound(deps, session, {
     flowId: target.flowId,
     transactionId: target.transactionId,
     action,
     nackCode: SIGNATURE_ERROR_CODE,
-    payloadId,
+    ...(payloadId !== undefined ? { payloadId } : {}),
     attention: true,
     summary,
   });
@@ -176,6 +146,6 @@ export async function refuseSignature(
     status: 401,
     body: ackBody,
     headers: { "www-authenticate": deps.signing.challenge },
-    ...(target.recorded ? { transactionId: target.transactionId } : {}),
+    transactionId: target.transactionId,
   };
 }
