@@ -97,18 +97,6 @@ export class ReceiverService {
   }
 
   /**
-   * Verify the request's signature.
-   *
-   * Deliberately a no-op for now, and deliberately a named hook rather than an
-   * absence: the place a signature check belongs is a design decision, and
-   * leaving the seam visible is what keeps it from being bolted on somewhere
-   * that runs after the payload has already been recorded.
-   */
-  verifyAuth(_headers: Record<string, unknown>): boolean {
-    return true;
-  }
-
-  /**
    * Handle one inbound protocol call.
    *
    * Never throws: this is an HTTP handler for a third party, and an unhandled
@@ -119,6 +107,8 @@ export class ReceiverService {
     request: InboundRequest,
     body: unknown,
     headers: Record<string, unknown> = {},
+    /** The body exactly as received — what a signature covers. */
+    rawBody?: string,
   ): Promise<InboundResult> {
     // The ACK window, measured end to end: everything between the participant's
     // request landing and this mock deciding. It is the number their timeouts
@@ -126,11 +116,14 @@ export class ReceiverService {
     // line says a call was ACKed, never how long their socket was held.
     const started = performance.now();
     try {
-      const result = await this.#handle(request, body, headers);
+      const result = await this.#handle(request, body, headers, rawBody);
       this.#timeAck(request.action, result, started);
       return result;
     } catch (error) {
-      this.#deps.logger.error({ err: error, ...request }, "inbound request failed");
+      this.#deps.logger.error(
+        { err: error, ...request },
+        "inbound request failed",
+      );
       const failure: InboundResult = {
         status: 500,
         body: nack(
@@ -173,6 +166,7 @@ export class ReceiverService {
     request: InboundRequest,
     body: unknown,
     headers: Record<string, unknown>,
+    rawBody: string | undefined,
   ): Promise<InboundResult> {
     const scope: ExpectationScope = {
       domain: request.domain,
@@ -214,25 +208,22 @@ export class ReceiverService {
         messageId,
         action,
         timestamp,
-        detail:
-          `context.${counterpartyField} is required: this endpoint is a ${
-            request.role === "buyer" ? "BAP" : "BPP"
-          }, so the ${counterpartyField} identifies the caller.`,
+        detail: `context.${counterpartyField} is required: this endpoint is a ${
+          request.role === "buyer" ? "BAP" : "BPP"
+        }, so the ${counterpartyField} identifies the caller.`,
       });
     }
 
-    if (!this.verifyAuth(headers)) {
-      return { status: 401, body: undefined };
-    }
-
     /* 3. Resolve the transaction, or create it from an armed expectation. */
-    const resolved = await resolve(this.#deps, 
+    const resolved = await resolve(
+      this.#deps,
       request,
       scope,
       context,
       action,
       advertisedUri,
       { body, messageId, timestamp },
+      { headers, rawBody, context },
     );
     if ("failure" in resolved) return resolved.failure;
     const { session, transactionId } = resolved;
@@ -261,7 +252,8 @@ export class ReceiverService {
         "ACTION_MISMATCH",
         `This call arrived on the "${request.action}" endpoint but its context.action is "${action}".`,
       );
-      const appended = await record(this.#deps, 
+      const appended = await record(
+        this.#deps,
         session,
         transactionId,
         action,
@@ -328,7 +320,8 @@ export class ReceiverService {
       // Recorded anyway. An unexpected call is one of the most valuable things
       // a compliance run can catch, and dropping it would erase the evidence —
       // the mapper classifies it as out-of-sequence on the next read.
-      const appended = await record(this.#deps, 
+      const appended = await record(
+        this.#deps,
         session,
         transactionId,
         action,
@@ -390,7 +383,8 @@ export class ReceiverService {
         "VALIDATION_FUNCTION_ERROR",
         verdict.error?.message ?? "The validation function failed to run.",
       );
-      const appended = await record(this.#deps, 
+      const appended = await record(
+        this.#deps,
         session,
         transactionId,
         action,
@@ -418,7 +412,8 @@ export class ReceiverService {
         code,
         verdict.result.description ?? "Validation failed.",
       );
-      const appended = await record(this.#deps, 
+      const appended = await record(
+        this.#deps,
         session,
         transactionId,
         action,
@@ -452,7 +447,8 @@ export class ReceiverService {
     if (protocol.status === "invalid" && this.#deps.validate.enforces) {
       const code = primaryCode(protocol.findings);
       const ackBody = nack(code, summariseFindings(protocol.findings));
-      const appended = await record(this.#deps, 
+      const appended = await record(
+        this.#deps,
         session,
         transactionId,
         action,
@@ -488,7 +484,8 @@ export class ReceiverService {
 
     /* 6-7. Accepted: record it, then fold it into the business data. */
     const ackBody = ack();
-    const appended = await record(this.#deps, 
+    const appended = await record(
+      this.#deps,
       session,
       transactionId,
       action,

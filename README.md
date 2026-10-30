@@ -39,6 +39,7 @@ src/
   modules/flow/          the loop — derived state machine, start/proceed/await
   modules/record/        exchanges, payloads and business data
   modules/transport/     inbound receiver routes + outbound signed sender
+  modules/signing/       sign + verify the Authorization header, registry lookup
   modules/forms/         forms this mock hosts, and forms it has to fill
   modules/health/        /health and /ready
   lib/                   errors · define-tool · logger · cache · mock-engine · events
@@ -305,6 +306,18 @@ Two deliberate choices worth knowing:
 - **A failed read throws, it does not return `undefined`.** `undefined` means
   "no such session", and the model answers that by starting a _new_ transaction
   against a real participant. An outage has to look like an outage.
+
+## Header validation
+
+The mock signs its outbound calls and can verify participants' signatures on
+inbound calls (ONDC's `Authorization` header). Verification is a per-session
+setting, `header_validation`: on by default, and it can be turned on or off
+at `session_create` or mid-session with `session_update_settings`. A call that
+fails it is refused with HTTP 401, NACK `10001`.
+
+It needs `WORKBENCH_SUBSCRIBER_ID`, `UKID`, `SIGN_PRIVATE_KEY` and
+`IN_HOUSE_REGISTRY` set in `.env` (see `.env.example`); without them, header
+validation stays off.
 
 ## Issue reporting
 

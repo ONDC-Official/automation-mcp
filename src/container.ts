@@ -59,6 +59,13 @@ import {
   type ValidationGateway,
 } from "@/modules/validate/validate.gateway.js";
 import { ValidateService } from "@/modules/validate/validate.service.js";
+import {
+  HttpRegistryGateway,
+  type RegistryGateway,
+} from "@/modules/signing/signing.gateway.js";
+import { KeyProvider } from "@/modules/signing/signing.keys.js";
+import { SigningService } from "@/modules/signing/signing.service.js";
+import { SdkRequestSigner } from "@/modules/signing/signing.signer.js";
 
 /**
  * Boot-once singletons.
@@ -124,6 +131,7 @@ export interface Container {
     readonly batch: BatchService;
     readonly validate: ValidateService;
     readonly feedback: FeedbackService;
+    readonly signing: SigningService;
   };
   /** Where a participant reaches this server's inbound receiver. */
   readonly receiverPublicUrl: string;
@@ -202,6 +210,8 @@ export interface CreateContainerOptions {
    * default reaches the real api-service over the network.
    */
   validationGateway?: ValidationGateway;
+  /** Override the registry participants' keys are looked up in. */
+  registryGateway?: RegistryGateway;
   /** Override the outbound HTTP dispatcher, e.g. undici's `MockAgent`. */
   senderDispatcher?: ConstructorParameters<
     typeof SenderService
@@ -494,6 +504,53 @@ export async function createContainer(
     );
   }
 
+  // Signing. Keys fetched from the registry live in the catalog cache: derived,
+  // re-fetchable, and read inside the ACK window.
+  const identity =
+    config.WORKBENCH_SUBSCRIBER_ID !== undefined &&
+    config.UKID !== undefined &&
+    config.SIGN_PRIVATE_KEY !== undefined
+      ? {
+          subscriberId: config.WORKBENCH_SUBSCRIBER_ID,
+          uniqueKeyId: config.UKID,
+          privateKey: config.SIGN_PRIVATE_KEY,
+        }
+      : undefined;
+  const registryGateway =
+    options.registryGateway ??
+    (config.IN_HOUSE_REGISTRY !== undefined && identity !== undefined
+      ? new HttpRegistryGateway({
+          baseUrl: config.IN_HOUSE_REGISTRY,
+          identity,
+          timeoutMs: config.VALIDATION_TIMEOUT_MS,
+          dispatcher: httpAgent,
+          logger,
+        })
+      : undefined);
+  // With an identity, it is who we sign as — so it must also be the bap_id or
+  // bpp_id our payloads carry, or the participant sees a keyId naming a
+  // subscriber the payload does not.
+  const ourSubscriberId = identity?.subscriberId ?? config.MOCK_SUBSCRIBER_ID;
+  const signer =
+    options.signer ??
+    (identity !== undefined ? new SdkRequestSigner(identity) : undefined);
+  const signing = new SigningService({
+    keys: new KeyProvider({
+      registry: registryGateway,
+      cache: catalogCache,
+      ttlMs: config.SIGNING_KEY_CACHE_TTL_MS,
+    }),
+    realm: ourSubscriberId,
+    logger,
+  });
+  if (!signing.canVerify) {
+    // Every session is forced to header_validation off; say why at boot.
+    logger.warn(
+      "no IN_HOUSE_REGISTRY: participants' signatures cannot be verified, " +
+        "so header validation is off for every session",
+    );
+  }
+
   const session = new SessionService({
     repository: sessionRepository,
     catalog,
@@ -501,6 +558,7 @@ export async function createContainer(
     receiverPublicUrl,
     receiverRoutePrefix,
     viewerUrl,
+    headerValidationAvailable: signing.canVerify,
     logger,
     metrics,
     mirror,
@@ -682,7 +740,7 @@ export async function createContainer(
     ...(options.senderDispatcher
       ? { dispatcher: options.senderDispatcher }
       : {}),
-    ...(options.signer ? { signer: options.signer } : {}),
+    ...(signer !== undefined ? { signer } : {}),
   });
 
   const flow = new FlowService({
@@ -696,7 +754,7 @@ export async function createContainer(
     validate,
     logger,
     receiverPublicUrl,
-    mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    mockSubscriberId: ourSubscriberId,
     feedback,
     metrics,
     mirror,
@@ -724,7 +782,7 @@ export async function createContainer(
     logger,
     receiverPublicUrl,
     catalog,
-    mockSubscriberId: config.MOCK_SUBSCRIBER_ID,
+    mockSubscriberId: ourSubscriberId,
     // Completed orders are sent to this instance's own UI base, but only when it
     // is set to something other than the public default: an instance that never
     // configured it must not post its participants' data to that host.
@@ -787,6 +845,7 @@ export async function createContainer(
     batch,
     validate,
     feedback,
+    signing,
   } as const;
 
   const inbound = new ReceiverService({
@@ -796,6 +855,7 @@ export async function createContainer(
     forms,
     mockEngine,
     validate,
+    signing,
     logger,
     metrics,
   });

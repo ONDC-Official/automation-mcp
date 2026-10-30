@@ -304,3 +304,120 @@ describe("session tools over MCP", () => {
     });
   });
 });
+
+describe("session settings over MCP", () => {
+  /** A server that can verify signatures: it has a registry to ask. */
+  async function withKeys(): Promise<void> {
+    await harness.close();
+    harness = await createHarness({
+      registryGateway: {
+        lookup: () => Promise.resolve({ status: "not_found" }),
+      },
+    });
+  }
+
+  async function create(args: Record<string, unknown> = {}) {
+    const created = await harness.client.callTool({
+      name: "session_create",
+      arguments: createArgs(args),
+    });
+    return created.structuredContent as {
+      session: { session_id: string; settings: unknown };
+      header_validation_available: boolean;
+    };
+  }
+
+  function update(sessionId: string, settings: Record<string, unknown>) {
+    return harness.client.callTool({
+      name: "session_update_settings",
+      arguments: { session_id: sessionId, settings },
+    });
+  }
+
+  async function sessionText(sessionId: string): Promise<string> {
+    const got = await harness.client.callTool({
+      name: "session_get",
+      arguments: { session_id: sessionId },
+    });
+    return (got.content as { type: string; text: string }[])[0]?.text ?? "";
+  }
+
+  describe("on a server with keys", () => {
+    beforeEach(withKeys);
+
+    it("checks signatures by default", async () => {
+      const created = await create();
+      expect(created.header_validation_available).toBe(true);
+      expect(created.session.settings).toEqual({ header_validation: true });
+    });
+
+    it("takes settings at creation", async () => {
+      const created = await create({ settings: { header_validation: false } });
+      expect(created.session.settings).toEqual({ header_validation: false });
+    });
+
+    it("turns header validation off and on mid-session", async () => {
+      const { session } = await create();
+
+      const off = await update(session.session_id, {
+        header_validation: false,
+      });
+      expect(off.isError).toBeFalsy();
+      expect(off.structuredContent).toMatchObject({
+        settings: { header_validation: false },
+      });
+      expect(await sessionText(session.session_id)).toContain(
+        "signatures: not checked (header_validation off)",
+      );
+
+      const on = await update(session.session_id, { header_validation: true });
+      expect(on.structuredContent).toMatchObject({
+        settings: { header_validation: true },
+      });
+    });
+
+    it("leaves settings it was not given alone", async () => {
+      const { session } = await create({
+        settings: { header_validation: false },
+      });
+      const result = await update(session.session_id, {});
+      expect(result.structuredContent).toMatchObject({
+        settings: { header_validation: false },
+      });
+    });
+  });
+
+  describe("on a server with no keys", () => {
+    it("creates every session with header validation off, and says why", async () => {
+      const created = await create({ settings: { header_validation: true } });
+
+      expect(created.header_validation_available).toBe(false);
+      expect(created.session.settings).toEqual({ header_validation: false });
+      expect(await sessionText(created.session.session_id)).toContain(
+        "this server has no signing keys",
+      );
+    });
+
+    it("refuses to turn header validation on", async () => {
+      const { session } = await create();
+
+      const result = await update(session.session_id, {
+        header_validation: true,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: "validation_error" },
+      });
+    });
+  });
+
+  it("reports an unknown session as an error result", async () => {
+    const result = await update("does-not-exist", { header_validation: false });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: "not_found" },
+    });
+  });
+});

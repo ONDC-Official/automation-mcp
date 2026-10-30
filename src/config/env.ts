@@ -37,6 +37,12 @@ const optionalUrl = z.preprocess(
   z.url().optional(),
 );
 
+/** An optional string where blank means "not configured", as `optionalUrl`. */
+const optionalString = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.string().min(1).optional(),
+);
+
 /** The public workbench, the default when `UI_BASE_URL` is not set. */
 export const DEFAULT_UI_BASE_URL = "https://workbench.ondc.tech";
 
@@ -186,6 +192,22 @@ const EnvSchema = z
     VALIDATION_MODE: z.enum(["off", "advisory", "enforce"]).default("enforce"),
     /** TTL for a cached verdict. Keyed on the payload's own bytes. */
     VALIDATION_CACHE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(900_000),
+
+    /* ---- Signing (the Authorization header) ---- */
+    /** Our registered subscriber id. Set with the two below, or not at all. */
+    WORKBENCH_SUBSCRIBER_ID: optionalString,
+    /** Our `unique_key_id` in the registry. */
+    UKID: optionalString,
+    /** Base64 Ed25519 private key, 32-byte seed or 64-byte expanded; keep it in a secret store. */
+    SIGN_PRIVATE_KEY: optionalString,
+    /** Registry participants' keys are looked up in, e.g. `https://registry.example.com/v2.0/`. */
+    IN_HOUSE_REGISTRY: optionalUrl,
+    /** How long a public key fetched from the registry is cached. */
+    SIGNING_KEY_CACHE_TTL_MS: z.coerce
       .number()
       .int()
       .positive()
@@ -542,6 +564,44 @@ const EnvSchema = z
       });
     }
   })
+  // Half an identity cannot sign anything; say so at boot, not on the first lookup.
+  .refine(
+    (env) => {
+      const set = [
+        env.WORKBENCH_SUBSCRIBER_ID,
+        env.UKID,
+        env.SIGN_PRIVATE_KEY,
+      ].filter((value) => value !== undefined).length;
+      return set === 0 || set === 3;
+    },
+    {
+      message:
+        "WORKBENCH_SUBSCRIBER_ID, UKID and SIGN_PRIVATE_KEY must be set together",
+      path: ["WORKBENCH_SUBSCRIBER_ID"],
+    },
+  )
+  .refine(
+    (env) =>
+      env.SIGN_PRIVATE_KEY === undefined ||
+      [32, 64].includes(Buffer.from(env.SIGN_PRIVATE_KEY, "base64").length),
+    {
+      message:
+        "SIGN_PRIVATE_KEY must be a base64 Ed25519 key of 32 or 64 bytes",
+      path: ["SIGN_PRIVATE_KEY"],
+    },
+  )
+  // A v2.0 lookup is itself signed. Without an identity every lookup fails, and
+  // since an unreachable registry fails open, every signature would pass unchecked.
+  .refine(
+    (env) =>
+      env.IN_HOUSE_REGISTRY === undefined ||
+      env.WORKBENCH_SUBSCRIBER_ID !== undefined,
+    {
+      message:
+        "IN_HOUSE_REGISTRY requires WORKBENCH_SUBSCRIBER_ID, UKID and SIGN_PRIVATE_KEY",
+      path: ["IN_HOUSE_REGISTRY"],
+    },
+  )
   // `jwt` mode is useless without somewhere to fetch keys and something to
   // check them against. Catch it at boot, not on the first 401.
   .refine(

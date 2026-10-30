@@ -87,11 +87,14 @@ export class SenderService {
   readonly #signer: RequestSigner;
   readonly #dispatcher: Dispatcher | undefined;
   readonly #metrics: Metrics | undefined;
+  /** Whether outbound calls carry an `Authorization` header at all. */
+  readonly signs: boolean;
 
   constructor(options: SenderServiceOptions) {
     this.#logger = options.logger;
     this.#timeoutMs = options.timeoutMs;
     this.#signer = options.signer ?? new NoopSigner();
+    this.signs = options.signer !== undefined;
     this.#dispatcher = options.dispatcher;
     this.#metrics = options.metrics;
   }
@@ -155,7 +158,12 @@ export class SenderService {
         `${url} answered ${String(response.statusCode)} but the body never arrived: ${
           error instanceof Error ? error.message : String(error)
         }`,
-        { url, action, delivery: "uncertain", http_status: response.statusCode },
+        {
+          url,
+          action,
+          delivery: "uncertain",
+          http_status: response.statusCode,
+        },
       );
     }
 
@@ -208,9 +216,7 @@ export class SenderService {
  * wrong guess the other way is a duplicate protocol call on a real
  * participant's wire, which nothing can take back.
  */
-export function classifyDelivery(
-  error: unknown,
-): "unreachable" | "uncertain" {
+export function classifyDelivery(error: unknown): "unreachable" | "uncertain" {
   const codes = new Set<string>();
   for (let cause: unknown = error, depth = 0; cause && depth < 5; depth++) {
     const code = (cause as { code?: unknown }).code;

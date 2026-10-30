@@ -10,10 +10,14 @@ import {
 } from "@/modules/catalog/catalog.service.js";
 import type { ExpectationScope } from "@/modules/record/record.schema.js";
 import type { SessionRepository } from "@/modules/session/session.repository.js";
-import type {
-  CreateSessionInput,
-  CreateSessionOutput,
-  Session,
+import {
+  DEFAULT_SESSION_SETTINGS,
+  settingsOf,
+  type CreateSessionInput,
+  type CreateSessionOutput,
+  type Session,
+  type SessionSettings,
+  type SessionSettingsPatch,
 } from "@/modules/session/session.schema.js";
 
 /**
@@ -59,6 +63,12 @@ export interface SessionServiceOptions {
    */
   viewerUrl?: (sessionId: string) => string | undefined;
   /**
+   * Whether this server can verify signatures at all — false when it has no
+   * registry to fetch keys from. Then every session has `header_validation`
+   * off and it cannot be turned on. Defaults to false.
+   */
+  headerValidationAvailable?: boolean;
+  /**
    * Optional, and absent in most unit tests. Nothing about a session depends on
    * it — a run must behave identically whether or not anybody is counting.
    */
@@ -89,6 +99,7 @@ export class SessionService {
   readonly #metrics: Metrics | undefined;
   readonly #mirror: SessionMirror | undefined;
   readonly #viewerUrl: ((sessionId: string) => string | undefined) | undefined;
+  readonly #headerValidationAvailable: boolean;
 
   constructor(options: SessionServiceOptions) {
     this.#repository = options.repository;
@@ -100,6 +111,13 @@ export class SessionService {
     this.#metrics = options.metrics;
     this.#mirror = options.mirror;
     this.#viewerUrl = options.viewerUrl;
+    this.#headerValidationAvailable =
+      options.headerValidationAvailable ?? false;
+  }
+
+  /** Whether `header_validation` can be on in any session on this server. */
+  get headerValidationAvailable(): boolean {
+    return this.#headerValidationAvailable;
   }
 
   /**
@@ -167,6 +185,10 @@ export class SessionService {
       // would have meant silent traffic on a real participant's wire.
       auto_advance: input.auto_advance ?? interactionMode === "llm_auto",
       callback_url: advertisedUri(base, build, mockRole),
+      settings: this.#effective({
+        ...DEFAULT_SESSION_SETTINGS,
+        ...input.settings,
+      }),
     };
 
     await this.#repository.save(session, this.#ttl);
@@ -203,9 +225,52 @@ export class SessionService {
     return {
       session,
       ...(viewerUrl !== undefined ? { viewer_url: viewerUrl } : {}),
+      header_validation_available: this.#headerValidationAvailable,
       flows,
       total: flows.length,
     };
+  }
+
+  /**
+   * Change some of a session's settings; the rest keep their value.
+   *
+   * Saved for the session's remaining lifetime, so changing a setting never
+   * extends when the session expires.
+   */
+  async updateSettings(
+    sessionId: string,
+    patch: SessionSettingsPatch,
+    now: Date = new Date(),
+  ): Promise<SessionSettings> {
+    const session = await this.requireSession(sessionId);
+    const remainingMs = Date.parse(session.expires_at) - now.getTime();
+    if (remainingMs <= 0) {
+      throw new NotFoundError("session", sessionId, {
+        hint: "Sessions expire. Call session_create to start a new one.",
+      });
+    }
+
+    if (patch.header_validation === true && !this.#headerValidationAvailable) {
+      throw new ValidationError(
+        "header_validation cannot be turned on: this server has no signing " +
+          "keys configured (IN_HOUSE_REGISTRY and our ONDC identity), so it " +
+          "cannot verify a participant's signature.",
+      );
+    }
+    const settings = { ...settingsOf(session), ...patch };
+    await this.#repository.save({ ...session, settings }, remainingMs);
+    this.#logger.info(
+      { session_id: sessionId, settings },
+      "session settings changed",
+    );
+    return settings;
+  }
+
+  /** Settings as they can actually apply on this server. */
+  #effective(settings: SessionSettings): SessionSettings {
+    return this.#headerValidationAvailable
+      ? settings
+      : { ...settings, header_validation: false };
   }
 
   /**
