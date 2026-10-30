@@ -4,9 +4,9 @@ import { keyPair } from "@/test/signing-keys.js";
 
 const { seed } = keyPair();
 const IDENTITY = {
-  ONDC_SUBSCRIBER_ID: "mock.example",
-  ONDC_UNIQUE_KEY_ID: "k1",
-  ONDC_SIGNING_PRIVATE_KEY: seed,
+  WORKBENCH_SUBSCRIBER_ID: "mock.example",
+  UKID: "k1",
+  SIGN_PRIVATE_KEY: seed,
 };
 
 /** `parseConfig` exits the process on bad config, so the exit is stubbed to read the message. */
@@ -39,23 +39,23 @@ function boot(env: Record<string, string>) {
 describe("signing config", () => {
   it("boots with nothing configured", () => {
     const config = boot({});
-    expect(config.ONDC_SUBSCRIBER_ID).toBeUndefined();
+    expect(config.WORKBENCH_SUBSCRIBER_ID).toBeUndefined();
     expect(config.SIGNING_KEY_CACHE_TTL_MS).toBe(900_000);
   });
 
   it("boots with a full identity and a registry", () => {
     const config = boot({
       ...IDENTITY,
-      ONDC_REGISTRY_URL: "https://staging.registry.ondc.org/v2.0/",
+      IN_HOUSE_REGISTRY: "https://registry.example.com/v2.0/",
     });
-    expect(config.ONDC_UNIQUE_KEY_ID).toBe("k1");
+    expect(config.UKID).toBe("k1");
   });
 
   it("refuses half an identity", () => {
     expect(
       bootError({
-        ONDC_SUBSCRIBER_ID: "mock.example",
-        ONDC_UNIQUE_KEY_ID: "k1",
+        WORKBENCH_SUBSCRIBER_ID: "mock.example",
+        UKID: "k1",
       }),
     ).toContain("must be set together");
   });
@@ -63,28 +63,28 @@ describe("signing config", () => {
   it("refuses a registry without an identity to sign lookups with", () => {
     expect(
       bootError({
-        ONDC_REGISTRY_URL: "https://staging.registry.ondc.org/v2.0/",
+        IN_HOUSE_REGISTRY: "https://registry.example.com/v2.0/",
       }),
-    ).toContain("ONDC_REGISTRY_URL requires");
+    ).toContain("IN_HOUSE_REGISTRY requires");
   });
 
   it("refuses a private key that is neither 32 nor 64 bytes", () => {
     expect(
       bootError({
         ...IDENTITY,
-        ONDC_SIGNING_PRIVATE_KEY: Buffer.alloc(16).toString("base64"),
+        SIGN_PRIVATE_KEY: Buffer.alloc(16).toString("base64"),
       }),
     ).toContain("32 or 64 bytes");
   });
 
   it("treats blank values as unset", () => {
     const config = boot({
-      ONDC_SUBSCRIBER_ID: "",
-      ONDC_UNIQUE_KEY_ID: "",
-      ONDC_SIGNING_PRIVATE_KEY: "",
-      ONDC_REGISTRY_URL: "",
+      WORKBENCH_SUBSCRIBER_ID: "",
+      UKID: "",
+      SIGN_PRIVATE_KEY: "",
+      IN_HOUSE_REGISTRY: "",
     });
-    expect(config.ONDC_SUBSCRIBER_ID).toBeUndefined();
-    expect(config.ONDC_REGISTRY_URL).toBeUndefined();
+    expect(config.WORKBENCH_SUBSCRIBER_ID).toBeUndefined();
+    expect(config.IN_HOUSE_REGISTRY).toBeUndefined();
   });
 });

@@ -253,7 +253,7 @@ export class SessionService {
     if (patch.header_validation === true && !this.#headerValidationAvailable) {
       throw new ValidationError(
         "header_validation cannot be turned on: this server has no signing " +
-          "keys configured (ONDC_REGISTRY_URL and our ONDC identity), so it " +
+          "keys configured (IN_HOUSE_REGISTRY and our ONDC identity), so it " +
           "cannot verify a participant's signature.",
       );
     }

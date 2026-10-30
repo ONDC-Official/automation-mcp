@@ -114,7 +114,7 @@ export async function refuseSignature(
   const summary =
     (unverified
       ? `Refused ${action} with 401: we could not get the participant's key from the registry (${verdict.reason}). ` +
-        "Their signature may be fine — the lookup that failed is ours: check ONDC_REGISTRY_URL and our ONDC identity, " +
+        "Their signature may be fine — the lookup that failed is ours: check IN_HOUSE_REGISTRY and our ONDC identity, " +
         "or turn header_validation off with session_update_settings to carry on unverified. "
       : `Refused ${action} with 401: ${verdict.reason}. ` +
         "Tell the person you are testing for what failed, " +

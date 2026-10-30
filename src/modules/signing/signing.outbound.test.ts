@@ -19,9 +19,9 @@ import { keyPair } from "@/test/signing-keys.js";
 const NP = "https://np.example.com";
 const ours = keyPair();
 const IDENTITY = {
-  ONDC_SUBSCRIBER_ID: "workbench.ondc.org",
-  ONDC_UNIQUE_KEY_ID: "wb-key",
-  ONDC_SIGNING_PRIVATE_KEY: ours.seed,
+  WORKBENCH_SUBSCRIBER_ID: "workbench.ondc.org",
+  UKID: "wb-key",
+  SIGN_PRIVATE_KEY: ours.seed,
 };
 
 let container: Container | undefined;

@@ -507,20 +507,20 @@ export async function createContainer(
   // Signing. Keys fetched from the registry live in the catalog cache: derived,
   // re-fetchable, and read inside the ACK window.
   const identity =
-    config.ONDC_SUBSCRIBER_ID !== undefined &&
-    config.ONDC_UNIQUE_KEY_ID !== undefined &&
-    config.ONDC_SIGNING_PRIVATE_KEY !== undefined
+    config.WORKBENCH_SUBSCRIBER_ID !== undefined &&
+    config.UKID !== undefined &&
+    config.SIGN_PRIVATE_KEY !== undefined
       ? {
-          subscriberId: config.ONDC_SUBSCRIBER_ID,
-          uniqueKeyId: config.ONDC_UNIQUE_KEY_ID,
-          privateKey: config.ONDC_SIGNING_PRIVATE_KEY,
+          subscriberId: config.WORKBENCH_SUBSCRIBER_ID,
+          uniqueKeyId: config.UKID,
+          privateKey: config.SIGN_PRIVATE_KEY,
         }
       : undefined;
   const registryGateway =
     options.registryGateway ??
-    (config.ONDC_REGISTRY_URL !== undefined && identity !== undefined
+    (config.IN_HOUSE_REGISTRY !== undefined && identity !== undefined
       ? new HttpRegistryGateway({
-          baseUrl: config.ONDC_REGISTRY_URL,
+          baseUrl: config.IN_HOUSE_REGISTRY,
           identity,
           timeoutMs: config.VALIDATION_TIMEOUT_MS,
           dispatcher: httpAgent,
@@ -546,7 +546,7 @@ export async function createContainer(
   if (!signing.canVerify) {
     // Every session is forced to header_validation off; say why at boot.
     logger.warn(
-      "no ONDC_REGISTRY_URL: participants' signatures cannot be verified, " +
+      "no IN_HOUSE_REGISTRY: participants' signatures cannot be verified, " +
         "so header validation is off for every session",
     );
   }

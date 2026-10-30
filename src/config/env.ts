@@ -199,13 +199,13 @@ const EnvSchema = z
 
     /* ---- Signing (the Authorization header) ---- */
     /** Our registered subscriber id. Set with the two below, or not at all. */
-    ONDC_SUBSCRIBER_ID: optionalString,
+    WORKBENCH_SUBSCRIBER_ID: optionalString,
     /** Our `unique_key_id` in the registry. */
-    ONDC_UNIQUE_KEY_ID: optionalString,
+    UKID: optionalString,
     /** Base64 Ed25519 private key, 32-byte seed or 64-byte expanded; keep it in a secret store. */
-    ONDC_SIGNING_PRIVATE_KEY: optionalString,
-    /** Registry participants' keys are looked up in, e.g. `https://staging.registry.ondc.org/v2.0/`. */
-    ONDC_REGISTRY_URL: optionalUrl,
+    SIGN_PRIVATE_KEY: optionalString,
+    /** Registry participants' keys are looked up in, e.g. `https://registry.example.com/v2.0/`. */
+    IN_HOUSE_REGISTRY: optionalUrl,
     /** How long a public key fetched from the registry is cached. */
     SIGNING_KEY_CACHE_TTL_MS: z.coerce
       .number()
@@ -568,40 +568,38 @@ const EnvSchema = z
   .refine(
     (env) => {
       const set = [
-        env.ONDC_SUBSCRIBER_ID,
-        env.ONDC_UNIQUE_KEY_ID,
-        env.ONDC_SIGNING_PRIVATE_KEY,
+        env.WORKBENCH_SUBSCRIBER_ID,
+        env.UKID,
+        env.SIGN_PRIVATE_KEY,
       ].filter((value) => value !== undefined).length;
       return set === 0 || set === 3;
     },
     {
       message:
-        "ONDC_SUBSCRIBER_ID, ONDC_UNIQUE_KEY_ID and ONDC_SIGNING_PRIVATE_KEY must be set together",
-      path: ["ONDC_SUBSCRIBER_ID"],
+        "WORKBENCH_SUBSCRIBER_ID, UKID and SIGN_PRIVATE_KEY must be set together",
+      path: ["WORKBENCH_SUBSCRIBER_ID"],
     },
   )
   .refine(
     (env) =>
-      env.ONDC_SIGNING_PRIVATE_KEY === undefined ||
-      [32, 64].includes(
-        Buffer.from(env.ONDC_SIGNING_PRIVATE_KEY, "base64").length,
-      ),
+      env.SIGN_PRIVATE_KEY === undefined ||
+      [32, 64].includes(Buffer.from(env.SIGN_PRIVATE_KEY, "base64").length),
     {
       message:
-        "ONDC_SIGNING_PRIVATE_KEY must be a base64 Ed25519 key of 32 or 64 bytes",
-      path: ["ONDC_SIGNING_PRIVATE_KEY"],
+        "SIGN_PRIVATE_KEY must be a base64 Ed25519 key of 32 or 64 bytes",
+      path: ["SIGN_PRIVATE_KEY"],
     },
   )
   // A v2.0 lookup is itself signed. Without an identity every lookup fails, and
   // since an unreachable registry fails open, every signature would pass unchecked.
   .refine(
     (env) =>
-      env.ONDC_REGISTRY_URL === undefined ||
-      env.ONDC_SUBSCRIBER_ID !== undefined,
+      env.IN_HOUSE_REGISTRY === undefined ||
+      env.WORKBENCH_SUBSCRIBER_ID !== undefined,
     {
       message:
-        "ONDC_REGISTRY_URL requires ONDC_SUBSCRIBER_ID, ONDC_UNIQUE_KEY_ID and ONDC_SIGNING_PRIVATE_KEY",
-      path: ["ONDC_REGISTRY_URL"],
+        "IN_HOUSE_REGISTRY requires WORKBENCH_SUBSCRIBER_ID, UKID and SIGN_PRIVATE_KEY",
+      path: ["IN_HOUSE_REGISTRY"],
     },
   )
   // `jwt` mode is useless without somewhere to fetch keys and something to
