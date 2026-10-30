@@ -7,7 +7,7 @@ The design goal is horizontal scalability. The 2026-07-28 transport is
 stateless — no `Mcp-Session-Id`, no `initialize` handshake, no long-lived GET
 stream — so any replica can answer any request behind a plain round-robin load
 balancer. `src/app.test.ts` proves it: one instance lists the tools, a second
-instance with no shared state executes the call.
+instance with no shared state executes the call
 
 ```bash
 npm install
