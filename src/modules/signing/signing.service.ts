@@ -102,6 +102,22 @@ export class SigningService {
     return `Signature realm="${this.#realm}",headers="(created) (expires) digest"`;
   }
 
+  /** Can we fetch our own key from the registry right now? Throws if not. */
+  async checkRegistry(
+    subscriberId: string,
+    uniqueKeyId: string,
+  ): Promise<void> {
+    const result = await this.#keys.lookup(subscriberId, uniqueKeyId, {
+      fresh: true,
+    });
+    if (result.status === "not_found") throw new Error("our key not found");
+    // A fixed message: the real reason can name the registry's host, and
+    // /ready is public.
+    if (result.status === "unavailable") {
+      throw new Error("registry unavailable");
+    }
+  }
+
   async verifyInbound(args: {
     /** The `Authorization` header as received. */
     header: string | undefined;

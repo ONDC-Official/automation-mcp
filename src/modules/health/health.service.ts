@@ -7,7 +7,7 @@ import type { HealthCheck } from "@/container.js";
 
 export interface DependencyReport {
   readonly name: string;
-  readonly status: "up" | "down";
+  readonly status: "up" | "down" | "disabled";
   readonly durationMs: number;
   readonly error?: string;
   /** Reported so a `down` that did not degrade the verdict explains itself. */
@@ -42,7 +42,7 @@ async function runCheck(
     if (result === false) throw new Error("check reported unhealthy");
     return {
       name: check.name,
-      status: "up",
+      status: result === "disabled" ? "disabled" : "up",
       durationMs: Math.round(performance.now() - started),
       ...optional,
     };
@@ -73,7 +73,9 @@ export class HealthService {
    */
   async readiness(): Promise<ReadinessReport> {
     const checks = await Promise.all(
-      this.checks.map((check) => runCheck(check, this.timeoutMs)),
+      this.checks.map((check) =>
+        runCheck(check, check.timeoutMs ?? this.timeoutMs),
+      ),
     );
 
     return {

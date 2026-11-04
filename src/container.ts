@@ -102,8 +102,13 @@ import { SdkRequestSigner } from "@/modules/signing/signing.signer.js";
 /** A named liveness/readiness probe for one dependency. */
 export interface HealthCheck {
   readonly name: string;
-  /** Resolve for healthy; throw or resolve `false` for unhealthy. */
-  check(): Promise<boolean | void>;
+  /**
+   * Resolve for healthy; throw or resolve `false` for unhealthy; resolve
+   * `"disabled"` when this server is not set up to use the dependency.
+   */
+  check(): Promise<boolean | void | "disabled">;
+  /** This check's own time limit, when the default does not suit it. */
+  readonly timeoutMs?: number;
   /**
    * Whether this dependency being down should stop traffic reaching us.
    *
@@ -902,6 +907,22 @@ export async function createContainer(
       name: "validation-service",
       optional: true,
       check: () => validationGateway.ping(),
+    },
+    {
+      // Optional for the same reason: a session can carry on with
+      // header_validation off, so this must not cost the instance its traffic.
+      name: "header-validation",
+      optional: true,
+      // Above the lookup's own limit, so a slow registry reads "registry
+      // unavailable" rather than a generic timeout.
+      timeoutMs: config.VALIDATION_TIMEOUT_MS + 1_000,
+      check: async () => {
+        if (identity === undefined || !signing.canVerify) return "disabled";
+        await signing.checkRegistry(
+          identity.subscriberId,
+          identity.uniqueKeyId,
+        );
+      },
     },
   ];
 

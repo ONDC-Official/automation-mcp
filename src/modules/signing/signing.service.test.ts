@@ -56,6 +56,56 @@ async function verify(signing: SigningService, seed: string) {
   });
 }
 
+describe("SigningService — checkRegistry", () => {
+  it("passes when the registry returns our key", async () => {
+    const signing = service(
+      registry([{ status: "found", publicKey: keyPair().publicKey }]),
+    );
+
+    await expect(signing.checkRegistry("mock.example", "k1")).resolves.toBe(
+      undefined,
+    );
+  });
+
+  it("fails when the registry does not have our key", async () => {
+    const signing = service(registry([{ status: "not_found" }]));
+
+    await expect(signing.checkRegistry("mock.example", "k1")).rejects.toThrow(
+      "our key not found",
+    );
+  });
+
+  it("never repeats the registry's own reason, which can name its host", async () => {
+    const signing = service(
+      registry([
+        {
+          status: "unavailable",
+          reason: "registry unreachable: registry.internal:443",
+        },
+      ]),
+    );
+
+    await expect(signing.checkRegistry("mock.example", "k1")).rejects.toThrow(
+      /^registry unavailable$/,
+    );
+  });
+
+  it("asks the registry every time rather than trusting a cached key", async () => {
+    const gateway = registry([
+      { status: "found", publicKey: keyPair().publicKey },
+      { status: "unavailable", reason: "down" },
+    ]);
+    const signing = service(gateway);
+
+    await signing.checkRegistry("mock.example", "k1");
+
+    await expect(signing.checkRegistry("mock.example", "k1")).rejects.toThrow(
+      "registry unavailable",
+    );
+    expect(gateway.calls).toBe(2);
+  });
+});
+
 describe("SigningService — a rotated key", () => {
   it("accepts a participant that rotated after its old key was cached", async () => {
     const oldKey = keyPair();

@@ -4,10 +4,15 @@ import { buildHttpApp, type App } from "@/app.js";
 import { parseConfig, type Config } from "@/config/env.js";
 import { createContainer, type Container } from "@/container.js";
 import type { ConfigServiceGateway } from "@/modules/catalog/catalog.gateway.js";
+import type {
+  LookupResult,
+  RegistryGateway,
+} from "@/modules/signing/signing.gateway.js";
 import {
   createFakeConfigServiceGateway,
   createFakeValidationGateway,
 } from "@/test/fakes.js";
+import { keyPair } from "@/test/signing-keys.js";
 
 /**
  * HTTP-level tests through `app.inject()` — the full stack (security hooks,
@@ -100,11 +105,16 @@ function mcpHeaders(method: string, name?: string): Record<string, string> {
 let app: App;
 let container: Container;
 
-async function boot(config: Config, gateway?: ConfigServiceGateway) {
+async function boot(
+  config: Config,
+  gateway?: ConfigServiceGateway,
+  registryGateway?: RegistryGateway,
+) {
   container = await createContainer(config, {
     // Never let a readiness probe reach the real config-service.
     configServiceGateway: gateway ?? createFakeConfigServiceGateway(),
     validationGateway: createFakeValidationGateway(),
+    ...(registryGateway !== undefined ? { registryGateway } : {}),
   });
   app = await buildHttpApp(container, config);
   await app.ready();
@@ -157,6 +167,72 @@ describe("readiness when a dependency is down", () => {
     }>();
     expect(body.status).toBe("degraded");
     expect(body.checks[0]?.error).toContain("connection refused");
+  });
+});
+
+describe("the header-validation readiness check", () => {
+  const identity = {
+    WORKBENCH_SUBSCRIBER_ID: "mock.example",
+    UKID: "k1",
+    SIGN_PRIVATE_KEY: keyPair().seed,
+  };
+
+  async function readiness() {
+    const response = await app.inject({ method: "GET", url: "/ready" });
+    const body = response.json<{
+      status: string;
+      checks: { name: string; status: string; error?: string }[];
+    }>();
+    return {
+      statusCode: response.statusCode,
+      overall: body.status,
+      check: body.checks.find((check) => check.name === "header-validation"),
+    };
+  }
+
+  function registryAnswering(answer: LookupResult): RegistryGateway {
+    return { lookup: () => Promise.resolve(answer) };
+  }
+
+  it("is disabled with no registry configured", async () => {
+    await boot(testConfig());
+
+    expect(await readiness()).toMatchObject({
+      statusCode: 200,
+      overall: "ready",
+      check: { status: "disabled" },
+    });
+  });
+
+  it("is up when the registry returns our key", async () => {
+    await boot(
+      testConfig(identity),
+      undefined,
+      registryAnswering({ status: "found", publicKey: keyPair().publicKey }),
+    );
+
+    expect(await readiness()).toMatchObject({
+      statusCode: 200,
+      overall: "ready",
+      check: { status: "up" },
+    });
+  });
+
+  it("is down without costing the server its traffic", async () => {
+    await boot(
+      testConfig(identity),
+      undefined,
+      registryAnswering({
+        status: "unavailable",
+        reason: "connection refused",
+      }),
+    );
+
+    expect(await readiness()).toMatchObject({
+      statusCode: 200,
+      overall: "ready",
+      check: { status: "down", error: "registry unavailable" },
+    });
   });
 });
 
