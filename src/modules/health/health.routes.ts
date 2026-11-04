@@ -17,7 +17,7 @@ const LivenessResponse = z.object({
 
 const DependencyReport = z.object({
   name: z.string(),
-  status: z.enum(["up", "down"]),
+  status: z.enum(["up", "down", "disabled"]),
   durationMs: z.number(),
   error: z.string().optional(),
   // Present only on dependencies whose absence degrades function rather than
